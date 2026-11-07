@@ -1,0 +1,2 @@
+# Everything the solution needs lives in submission/requirements.txt
+-r submission/requirements.txt
