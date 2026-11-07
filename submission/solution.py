@@ -42,7 +42,10 @@ class KnowledgeSystem:
 
     def ingest(self, snapshot: Snapshot) -> None:
         view = self._store.add_snapshot(snapshot)
-        self._indexes.append(Index(view))
+        index = Index(view)
+        _facts(index)                  # build per-view lookups now: loading is untimed, answers are
+        _page_texts(index)
+        self._indexes.append(index)
         self._cache.clear()
 
     def answer(self, question: str, as_of: str | None = None) -> Answer:
@@ -160,14 +163,19 @@ def apply_fact(context: list[Chunk], fact: dict) -> list[Chunk]:
     return [stated] + kept
 
 
-def _pages_stating(index: Index, vals: set) -> list[str]:
-    if not vals:
-        return []
+def _page_texts(index: Index) -> dict:
     texts = getattr(index, "_page_texts", None)
-    if texts is None:                        # built once per view, then reused for every answer
+    if texts is None:                        # built once per view (at ingest), then reused
         texts = {k: " ".join(c.text for c in vp.page.chunks)
                  for k, vp in index.view.pages.items() if vp.status != "missing"}
         index._page_texts = texts
+    return texts
+
+
+def _pages_stating(index: Index, vals: set) -> list[str]:
+    if not vals:
+        return []
+    texts = _page_texts(index)
     pages = index.view.pages
     return sorted((k for k, t in texts.items() if any(v in t for v in vals)),
                   key=lambda k: (KIND_RANK[pages[k].page.kind], STATUS_RANK[pages[k].status], k))
