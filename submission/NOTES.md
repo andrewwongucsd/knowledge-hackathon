@@ -1,0 +1,77 @@
+# Notes: a knowledge system that knows what's true *now*
+
+> **For grading, set `ANTHROPIC_API_KEY`.** On the public questions it raises the final score from 0.699 to 0.79 (3 runs), at about $0.016 per 40 questions. Without a key the system still runs and answers extractively.
+
+`solution.py` → `build()` returns an object with exactly `ingest`, `answer` and `conflicts`, using the shapes in `harness/contract.py`. Retrieval and conflict detection are stdlib Python. One Claude call per question writes the answer from evidence that has already been filtered, and deterministic guards check it.
+
+## Run it (from the kit root)
+
+```bash
+python3.11 -m venv .venv && .venv/bin/pip install -r requirements.txt
+export ANTHROPIC_API_KEY=...        # recommended, paid
+.venv/bin/python harness/run_eval.py --submission submission --eval eval/public_eval.jsonl
+.venv/bin/python -m unittest discover -s submission/tests       # no key, no snapshots needed
+```
+
+## API keys
+
+- **`ANTHROPIC_API_KEY`** (recommended, paid Anthropic API): one call per question to `claude-haiku-5-5` with thinking off (`KH_MODEL` overrides it); repeats are cached.
+- **Without a key,** or with `KH_NO_LLM=1`, each answer is the best current table row or sentence, verbatim.
+- **No other keys, and no network calls besides that API.** The snapshots are the only data source.
+
+## How "current" is decided
+
+1. **Answer from the site as it stood on the date asked.** Each snapshot becomes a view: the newest copy of every URL seen up to that date. A page that left a later crawl is kept and marked removed. A date before the first snapshot gets "I don't know".
+2. **Only compare values that describe the same fact:** same product, term, tier (balance, loan amount, model year) and kind of number (rate vs APY vs APR). Standard vs jumbo and personal vs business are different facts. A fee's condition ("within six months of closing") is not a term.
+3. **When sources disagree, the winner is, in order:**
+   1. the newer *effective* date on a rate table;
+   2. the newer *publish* date for articles;
+   3. a page re-fetched in that crawl over a copy carried forward from an earlier one;
+   4. rate and product pages and fee schedules over articles, promotions and calculators;
+   5. the value most pages agree on.
+
+   An undated passing mention never beats a dated statement.
+4. **Offers whose stated end date has passed are never used.**
+5. **Losing values are removed from the evidence before the answer is written** (stale rows, older counts), so they can't be repeated.
+6. **If the site doesn't state what was asked,** the answer is "That isn't listed on our website… please contact us", with no digits. For a fee or a count, every specific thing the question names (a place, a service) must appear in the evidence.
+
+## How it works
+
+**Ingest** splits pages into table rows (with header, section and effective date), fee lines and paragraphs. PDF conversions are cleaned first: HTML entities are decoded and placeholder `ColN` headers dropped. Each page's type, publish date and offer end dates are recorded. Ingest takes about 6s for all five snapshots.
+
+**Answer** runs BM25 over the view, applying the question's qualifiers (term, model year, amount, jumbo or business, branch, kind of value). Wrong-tier rows are dropped, and the system declines before any LLM call if nothing supports the question. The model sees the evidence with each page's type and dates, plus the neighbouring paragraphs and the best paragraphs a per-page cap left out. For "what … do you offer" questions it also sees business and other product lines. It returns structured JSON (no sampling parameters, thinking off, 8s timeout, ≤ 1 retry) with a ≤ 15-word reason written first.
+
+Guards run on the reply: every number must appear in the evidence; no meta-talk; no links to deep pages missing from the snapshot; and any failure falls back to the extractive answer.
+
+**Conflicts** are deterministic, from the newest view:
+- the same product, term and tier priced differently on two pages;
+- counts in boilerplate repeated on 5 or more pages;
+- "the Nth time" ordinals;
+- rates quoted in prose.
+
+Each comes with its winner and reason. An LLM reviewer was tried and removed: it discarded stale statements still on the site.
+
+## Results (measured on this code)
+
+| Run | Result |
+|---|---|
+| Kit selftest (`--snapshots harness/selftest/snapshots --eval harness/selftest/eval.jsonl --conflicts-gold harness/selftest/conflicts_gold.json`) | No key and with key: accuracy 1.0, conflicts F1 1.0, final 1.0 |
+| Public eval, no key (`KH_NO_LLM=1`) | Accuracy 0.699 (starter: 0.093), p95 0.01s, 0 stale values |
+| Public eval, with key, 3 runs | Accuracy 0.790 each; final 0.785 / 0.790 / 0.790; p95 1.5–2.6s; 0 stale values; 0 errors |
+| Same questions over the 3 runs | 38 of 40 all right or giving the same numbers each time |
+| Fee schedule check (local questions written from the fee PDF: 15 fees at 3 dates, 4 unlisted) | No key 49/49; with key 46/49 |
+| Fresh clone, no snapshots | 0 errors |
+
+Three public questions flip between right and wrong from run to run on byte-identical evidence. An earlier round on the same evidence for them scored final 0.806.
+
+**Model choice.** On identical code (previous revision), Haiku 5.5 with thinking off scored final 0.806 against Opus 5.5's 0.773, at 1/40 of the cost. Opus can't turn thinking off, so its answers take more than 2s. The default was picked by a rule fixed before the runs.
+
+**Still missed, and why it is left:** answers on pages sharing no words with the question (keyword search can't reach them), one expected answer using an older figure than newest-wins gives, one ambiguous product reading, and one question the scorer can't award. Matching these by hand would hard-code the practice set.
+
+## Limitations
+
+- LLM answers vary between runs; a reworded question gets a fresh call.
+- p95 sits near 2s with a key, so a slow network costs some of the speed score.
+- Without a key, list and multi-part questions score partially.
+- Prose conflicts are limited to counts, ordinals and quoted rates; contradictions only *across* old snapshots are not listed.
+- The public runs need the kit's `snapshots_zip/`, which by request is not in this repo.
