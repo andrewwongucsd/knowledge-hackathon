@@ -23,9 +23,11 @@ except ImportError:                    # standalone (tests): find the kit's harn
                                 if (d / "harness" / "contract.py").exists())))
     from contract import Answer, Conflict, Snapshot, Source
 
-from conflicts import find_conflicts   # noqa: E402
-from ingest import KIND_RANK, STATUS_RANK, Store   # noqa: E402
-from retrieve import Index, parse_query, select   # noqa: E402
+from collections import Counter        # noqa: E402
+
+from conflicts import find_conflicts, statement_conflicts   # noqa: E402
+from ingest import KIND_RANK, STATUS_RANK, Chunk, Store, url_key   # noqa: E402
+from retrieve import Index, parse_query, select, tokenize   # noqa: E402
 from synth import REFUSAL, Synthesizer  # noqa: E402
 
 
@@ -70,8 +72,17 @@ def _respond(index: Index | None, synth: Synthesizer, question: str) -> Answer:
     view = index.view
     q = parse_query(question)
     ev = select(index, q)
+    if LINK_Q.search(question):                       # "what link should I use…": the site's own link
+        link = pick_link(ev.context or ev.chunks, view, q)
+        if link:
+            vp = view.pages[url_key(link)]
+            return Answer(text=f"You can find that at {link}.", confident=True,
+                          sources=[Source(url=vp.page.url, snapshot_id=vp.snapshot_id)])
     if not ev.chunks or (q.attribute and not ev.supported):
         return Answer(text=REFUSAL, confident=False)
+    fact = match_fact(_facts(index), q, index)
+    if fact:
+        ev.context = apply_fact(ev.context or ev.chunks, fact)
     text, cited, confident, note = synth.compose(question, q, ev, view)
     if not confident:
         return Answer(text=REFUSAL, confident=False)
@@ -98,6 +109,55 @@ def _respond(index: Index | None, synth: Synthesizer, question: str) -> Answer:
         seen.add(key)
         sources.append(Source(url=vp.page.url, snapshot_id=vp.snapshot_id, quote=quote))
     return Answer(text=text, sources=sources, confident=True, conflict_note=note or None)
+
+
+LINK_Q = re.compile(r"\b(link|url|web ?page|website address)\b", re.I)
+LINK_RE = re.compile(r"([^()\n]{0,80})\(([a-z0-9.-]+\.[a-z]{2,}/[^)\s]*)\)")
+LINK_WORDS = set(tokenize("link url use see find page web webpage website address where visit"))
+FACT_RARE = 0.01        # a question word on under 1% of chunks names the fact asked about
+
+
+def pick_link(context: list[Chunk], view, q) -> str | None:
+    """The link the site's own text gives for what was asked: the most-cited link in the evidence
+    whose anchor text shares a word with the question and whose page is live in this snapshot.
+    Dead or retired links (pages the crawl never found, or that left it) can't be picked."""
+    subject = set(q.tokens) - LINK_WORDS
+    votes: Counter = Counter()
+    for c in context:
+        for m in LINK_RE.finditer(c.text):
+            key = url_key(m.group(2))
+            vp = view.pages.get(key)
+            if vp is not None and vp.status != "missing" and set(tokenize(m.group(1))) & subject:
+                votes[m.group(2).rstrip("/")] += 1
+    return votes.most_common(1)[0][0] if votes else None
+
+
+def _facts(index: Index) -> list[dict]:
+    facts = getattr(index, "_facts", None)
+    if facts is None:                        # built once per view
+        facts = [f for f in statement_conflicts(index.view) if f.get("_win_sentence")]
+        index._facts = facts
+    return facts
+
+
+def match_fact(facts: list[dict], q, index: Index) -> dict | None:
+    """A repeated statement the question asks about: it shares a rare word with the fact's topic."""
+    limit = FACT_RARE * max(1, len(index.chunks))
+    best = None
+    for f in facts:
+        rare = [t for t in set(q.tokens) & set(tokenize(f["topic"])) if len(index.postings.get(t, ())) < limit]
+        if rare and (best is None or len(rare) > best[0]):
+            best = (len(rare), f)
+    return best[1] if best else None
+
+
+def apply_fact(context: list[Chunk], fact: dict) -> list[Chunk]:
+    """The winning statement goes first; evidence repeating a value it beat is removed (rule 5)."""
+    beaten = [re.compile(rf"\b{re.escape(v)}\b", re.I) for v in fact["_losers"]]
+    kept = [c for c in context if not any(p.search(c.text) for p in beaten)]
+    win = fact["_win_chunk"]
+    stated = Chunk(-1, win.key, win.kind, fact["_win_sentence"], fact["_win_sentence"], section=win.section)
+    return [stated] + kept
 
 
 def _pages_stating(index: Index, vals: set) -> list[str]:

@@ -153,6 +153,7 @@ def statement_conflicts(view: View) -> list[dict]:
       * rates quoted in prose on product/promo pages ("6-month certificate APY 2.95%")."""
     facts: dict = defaultdict(lambda: defaultdict(list))     # key -> value -> [chunk]
     shown: dict = {}                                        # key -> readable topic (first wording seen)
+    said: dict = {}                                         # (key, value, chunk id) -> the sentence
     template_pages: dict = defaultdict(set)
     sentences = []
     for vp in view.pages.values():
@@ -173,16 +174,20 @@ def statement_conflicts(view: View) -> list[dict]:
                 continue
             key = ("count", " ".join(_stem(w) for w in lead + re.findall(r"[a-z]+", noun) if w not in STOP))
             facts[key][f"{n} {noun}"].append(c)
+            said.setdefault((key, f"{n} {noun}", c.id), sent.strip())
             shown.setdefault(key, f'Number of {noun}: "{" ".join((before + "N " + noun).split())}"')
         for ordinal, rest in ORD_RE.findall(sent):
             key = ("ordinal", " ".join(_stem(w) for w in re.findall(r"[a-z]+", rest.lower())))
             facts[key][ordinal.lower()].append(c)
+            said.setdefault((key, ordinal.lower(), c.id), sent.strip())
             shown.setdefault(key, f'How many times {rest}: "the Nth time {rest}"')
         if c.kind in ("product", "promo", "document"):
             for m in PROSE_RATE_RE.finditer(sent):
                 words = " ".join(_stem(w) for w in re.findall(r"[a-z0-9]+", m.group(1).lower()) if w not in STOP)
                 if re.search(r"\d", words) and re.search(r"apy|apr|rat|dividend", words):
-                    facts[("rate", words)][m.group(2).replace(" ", "")].append(c)
+                    value = m.group(2).replace(" ", "")
+                    facts[("rate", words)][value].append(c)
+                    said.setdefault((("rate", words), value, c.id), sent.strip())
                     shown.setdefault(("rate", words), f"Quoted rate: {' '.join(m.group(1).split())}")
     out = []
     for (kind, key), by_value in facts.items():
@@ -209,6 +214,10 @@ def statement_conflicts(view: View) -> list[dict]:
             "resolution": win_val,
             "reason": reason,
             "_strength": 2 if expired else 1,
+            # private, for answers: the winning statement and the values it beat
+            "_win_chunk": win,
+            "_win_sentence": said.get(((kind, key), win_val, win.id), ""),
+            "_losers": [v for v in by_value if v != win_val],
         })
     return out
 
@@ -219,6 +228,4 @@ def find_conflicts(view: View) -> list[dict]:
     are exactly what this method is meant to report (see NOTES.md)."""
     found = table_conflicts(view) + statement_conflicts(view)
     found.sort(key=lambda f: -f["_strength"])               # most certain first (matching is greedy)
-    for f in found:
-        f.pop("_strength", None)
-    return found
+    return [{k: v for k, v in f.items() if not k.startswith("_")} for f in found]

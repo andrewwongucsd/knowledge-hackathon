@@ -99,6 +99,36 @@ class Guardrails(unittest.TestCase):
         self.assertEqual(hits, [])
 
 
+class Edges(unittest.TestCase):
+    """Link picker and fact edge, on synthetic pages (no site data)."""
+
+    def test_link_picker_takes_the_live_link_the_text_gives(self):
+        from types import SimpleNamespace as NS
+        from ingest import Chunk
+        from solution import pick_link
+        view = NS(pages={"example.com/rates": NS(status="fresh"), "example.com/old-rates": NS(status="missing")})
+        text = ("Compare certificate rates (example.com/rates). See certificate rates (example.com/rates). "
+                "Old certificate rates (example.com/old-rates). Certificate archive (example.com/gone).")
+        ctx = [Chunk(1, "example.com/a", "product", text, text)]
+        self.assertEqual(pick_link(ctx, view, parse_query("What link shows certificate rates?")), "example.com/rates")
+        self.assertIsNone(pick_link(ctx, view, parse_query("What link shows mortgage payoffs?")))
+
+    def test_fact_edge_puts_the_winner_first_and_drops_beaten_values(self):
+        from types import SimpleNamespace as NS
+        from ingest import Chunk
+        from solution import apply_fact, match_fact
+        win = Chunk(7, "example.com/news-3", "article", "This was the fifth time Acme recognized the bank.", "")
+        fact = {"topic": "How many times Acme recognized: the Nth time", "_losers": ["fourth"],
+                "_win_chunk": win, "_win_sentence": win.text}
+        index = NS(chunks=[None] * 1000, postings={"acm": [(0, 1)]})
+        self.assertIs(match_fact([fact], parse_query("What recognition has the bank received from Acme?"), index), fact)
+        self.assertIsNone(match_fact([fact], parse_query("What are the lobby hours?"), index))
+        old = Chunk(2, "example.com/news-2", "article", "It was the fourth time Acme recognized the bank.", "")
+        other = Chunk(3, "example.com/about", "product", "We serve members in three states.", "")
+        out = apply_fact([old, other], fact)
+        self.assertEqual([c.text for c in out], [win.text, other.text])
+
+
 class Contract(unittest.TestCase):
     def test_exactly_the_three_contract_methods(self):
         own = {n for n, v in vars(type(build())).items() if callable(v) and not n.startswith("__")}
