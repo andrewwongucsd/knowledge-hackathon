@@ -1,1 +1,2 @@
-anthropic==2.6.0
+# The SDK needs Python 3.10+. On 3.9 it is skipped and the solution runs its no-key path.
+anthropic==2.6.0; python_version >= "3.10"

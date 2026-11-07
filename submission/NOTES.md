@@ -18,6 +18,7 @@ export ANTHROPIC_API_KEY=...        # recommended, paid
 - **`ANTHROPIC_API_KEY`** (recommended, paid Anthropic API): one call per question to `claude-haiku-5-5` with thinking off (`KH_MODEL` overrides it); repeats are cached.
 - **Without a key,** or with `KH_NO_LLM=1`, each answer is the best current table row or sentence, verbatim.
 - **No other keys, and no network calls besides that API.** The snapshots are the only data source.
+- **Python:** graded on 3.11. On 3.9 the SDK (which needs 3.10+) is skipped and the no-key path runs.
 
 ## How "current" is decided
 
