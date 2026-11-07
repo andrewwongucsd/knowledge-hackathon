@@ -24,7 +24,7 @@ except ImportError:                    # standalone (tests): find the kit's harn
     from contract import Answer, Conflict, Snapshot, Source
 
 from conflicts import find_conflicts   # noqa: E402
-from ingest import Store               # noqa: E402
+from ingest import KIND_RANK, STATUS_RANK, Store   # noqa: E402
 from retrieve import Index, parse_query, select   # noqa: E402
 from synth import REFUSAL, Synthesizer  # noqa: E402
 
@@ -61,7 +61,7 @@ class KnowledgeSystem:
                          resolution=str(f["resolution"]), reason=str(f["reason"])) for f in found]
 
 
-MAX_SOURCES = 6     # pages that state the values given; the same press release often has 3 URL variants
+MAX_SOURCES = 8     # pages that state the values given; the same press release often has 3 URL variants
 
 
 def _respond(index: Index | None, synth: Synthesizer, question: str) -> Answer:
@@ -88,7 +88,29 @@ def _respond(index: Index | None, synth: Synthesizer, question: str) -> Answer:
                 continue
             seen.add(key)
             sources.append(Source(url=vp.page.url, snapshot_id=vp.snapshot_id, quote=c.text[:240]))
+    # Then any other live page on the site that states one of those values (the routing number, a
+    # phone number, a time), official product pages first.
+    for key in _pages_stating(index, vals):
+        if key in seen or len(sources) >= MAX_SOURCES:
+            continue
+        vp = view.pages[key]
+        quote = next((c.text[:240] for c in vp.page.chunks if any(v in c.text for v in vals)), None)
+        seen.add(key)
+        sources.append(Source(url=vp.page.url, snapshot_id=vp.snapshot_id, quote=quote))
     return Answer(text=text, sources=sources, confident=True, conflict_note=note or None)
+
+
+def _pages_stating(index: Index, vals: set) -> list[str]:
+    if not vals:
+        return []
+    texts = getattr(index, "_page_texts", None)
+    if texts is None:                        # built once per view, then reused for every answer
+        texts = {k: " ".join(c.text for c in vp.page.chunks)
+                 for k, vp in index.view.pages.items() if vp.status != "missing"}
+        index._page_texts = texts
+    pages = index.view.pages
+    return sorted((k for k, t in texts.items() if any(v in t for v in vals)),
+                  key=lambda k: (KIND_RANK[pages[k].page.kind], STATUS_RANK[pages[k].status], k))
 
 
 def build() -> KnowledgeSystem:

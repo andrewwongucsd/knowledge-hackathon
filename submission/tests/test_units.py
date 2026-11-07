@@ -151,6 +151,12 @@ class Selftest(unittest.TestCase):
         self.assertFalse(a.confident)
         self.assertFalse(numbers(a.text))
 
+    def test_cites_every_live_page_stating_the_value_but_never_a_removed_one(self):
+        from solution import _pages_stating
+        ix = self.ks._indexes[-1]
+        self.assertTrue(any("certificates" in k for k in _pages_stating(ix, {"3.50%"})))
+        self.assertEqual(_pages_stating(ix, {"$2.50"}), [])     # only on a page the latest crawl dropped
+
     def test_fee_question_about_something_never_listed_declines(self):
         a = self.ks.answer("How much is a lost debit card replacement in Springfield?")   # rare word absent
         self.assertFalse(a.confident)

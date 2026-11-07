@@ -1,6 +1,6 @@
 # Notes: a knowledge system that knows what's true *now*
 
-> **For grading, set `ANTHROPIC_API_KEY`.** On the public questions it raises the final score from 0.699 to 0.79 (3 runs), at about $0.016 per 40 questions. Without a key the system still runs and answers extractively.
+> **For grading, set `ANTHROPIC_API_KEY`.** On the public questions it raises the final score from 0.706 to 0.81 (3 runs), at about $0.016 per 40 questions. Without a key the system still runs and answers extractively.
 
 `solution.py` → `build()` returns an object with exactly `ingest`, `answer` and `conflicts`, using the shapes in `harness/contract.py`. Retrieval and conflict detection are stdlib Python. One Claude call per question writes the answer from evidence that has already been filtered, and deterministic guards check it.
 
@@ -57,17 +57,17 @@ Each comes with its winner and reason. An LLM reviewer was tried and removed: it
 | Run | Result |
 |---|---|
 | Kit selftest (`--snapshots harness/selftest/snapshots --eval harness/selftest/eval.jsonl --conflicts-gold harness/selftest/conflicts_gold.json`) | No key and with key: accuracy 1.0, conflicts F1 1.0, final 1.0 |
-| Public eval, no key (`KH_NO_LLM=1`) | Accuracy 0.699 (starter: 0.093), p95 0.01s, 0 stale values |
-| Public eval, with key, 3 runs | Accuracy 0.790 each; final 0.785 / 0.790 / 0.790; p95 1.5–2.6s; 0 stale values; 0 errors |
-| Same questions over the 3 runs | 38 of 40 all right or giving the same numbers each time |
-| Fee schedule check (local questions written from the fee PDF: 15 fees at 3 dates, 4 unlisted) | No key 49/49; with key 46/49 |
+| Public eval, no key (`KH_NO_LLM=1`) | Accuracy 0.706 (starter: 0.093), p95 0.01s, 0 stale values |
+| Public eval, with key, 3 runs | Accuracy 0.810 each; final 0.809 / 0.810 / 0.810; p95 1.6–2.1s; 0 stale values; 0 errors |
+| Same questions over the 3 runs | 37 of 40 all right or giving the same numbers each time |
+| Fee schedule check (local questions written from the fee PDF: 15 fees at 3 dates, 4 unlisted) | No key 49/49; with key 47/49 |
 | Fresh clone, no snapshots | 0 errors |
 
-Three public questions flip between right and wrong from run to run on byte-identical evidence. An earlier round on the same evidence for them scored final 0.806.
+**Per pillar.** Accuracy 0.81: the rubric caps it at 0.969 (one practice question has no required facts; only `--judge` can award it), and the misses below cap it near 0.88 without hard-coding. Speed 1.0 in 5 of the last 6 runs. Consistency 1.0 on the public set (rewordings can only be checked with repeat runs). Conflicts 1.0 on the selftest; the real answer key is hidden.
 
-**Model choice.** On identical code (previous revision), Haiku 5.5 with thinking off scored final 0.806 against Opus 5.5's 0.773, at 1/40 of the cost. Opus can't turn thinking off, so its answers take more than 2s. The default was picked by a rule fixed before the runs.
+**Model choice.** On identical code (an earlier revision), Haiku 5.5 with thinking off scored final 0.806 against Opus 5.5's 0.773, at 1/40 of the cost. Opus can't turn thinking off, so its answers take more than 2s. The default was picked by a rule fixed before the runs.
 
-**Still missed, and why it is left:** answers on pages sharing no words with the question (keyword search can't reach them), one expected answer using an older figure than newest-wins gives, one ambiguous product reading, and one question the scorer can't award. Matching these by hand would hard-code the practice set.
+**Still missed, and why it is left:** answers on pages sharing no words with the question (keyword search can't reach them); one expected answer using an older figure than newest-wins gives; a newest article that also repeats older years; one question whose expected steps aren't on the site; and one question the scorer can't award. Prompt rules for yes/no answers, links and "same or different" were tried and removed (none helped in 2 of 3 runs). Matching these by hand would hard-code the practice set.
 
 ## Limitations
 
