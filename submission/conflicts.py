@@ -5,8 +5,8 @@ Two kinds of contradiction are reported:
 
   * Rate tables: the same product, term and tier (and an overlapping model-year range) priced
     differently on two pages, e.g. a calculator still showing last year's auto-loan rates.
-  * Repeated statements: a fact the site repeats on several pages ("... N branch office
-    locations", "the Nth time <an award> recognized ...") that differs between pages.
+  * Repeated statements: a fact the site repeats on several pages ("... N offices", "the Nth
+    time <an organisation> recognized ...") that differs between pages.
 
 Different tiers, rate vs APY, standard vs jumbo, and personal vs business are different facts,
 never conflicts. The winner is the newest dated statement, then a page re-fetched in the latest
@@ -24,8 +24,12 @@ from retrieve import (STOP, TERM_RE, YEAR_RANGE_RE, _pct_values, _stem, _value_k
 QUALIFIER_WORDS = {"traditional", "roth", "ira", "certificate", "account", "share"}
 ORDINALS = "first second third fourth fifth sixth seventh eighth ninth tenth".split()
 ORD_RE = re.compile(rf"\b({'|'.join(ORDINALS)})\s+time\s+((?:[A-Za-z’']+\s+){{1,2}}[A-Za-z’']+)", re.I)
+# "For a third year in a row, <Org> named <Name> ...": a streak claim by the same organisation
+STREAK_RE = re.compile(rf"\b(?:for\s+)?(?:the|a)\s+({'|'.join(ORDINALS)})\s+(?:(?:consecutive|straight)\s+year|year\s+in"
+                       r"\s+a\s+row),?\s+([A-Z][\w&’'.-]*)\s+(?:has\s+|have\s+)?(?:again\s+)?(?:recogni[sz]ed|named|"
+                       r"ranked|honou?red|awarded|selected|listed|included)\b(?:\s+[A-Z]\w*)?", re.I)
 COUNT_FACT_RE = re.compile(r"((?:[a-z’'-]+\s+){0,3})(?<![\d,.$])(?!(?:19|20)\d\d\b)(\d[\d,]*)\+?\s+"
-                           r"((?:[a-z][a-z’'-]+\s+){0,2}(?:branch(?:es)? office locations|branch(?:es)?|"
+                           r"((?:[a-z][a-z’'-]+\s+){0,2}(?:branch(?:es)?|"
                            r"employees|counties|members|locations))\b")
 PROSE_RATE_RE = re.compile(r"((?:[\w$-]+\s+){1,5}?(?:apy|apr|rate|dividend)s?)\s*(?:is|of|:)?\s*"
                            r"(\d+(?:\.\d+)?\s*%)", re.I)
@@ -163,6 +167,8 @@ def statement_conflicts(view: View) -> list[dict]:
     shown: dict = {}                                        # key -> readable topic (first wording seen)
     said: dict = {}                                         # (key, value, chunk id) -> the sentence
     template_pages: dict = defaultdict(set)
+    phrases: dict = defaultdict(set)                        # (fact key, value) -> the site's own wording
+    streaks: dict = defaultdict(set)                        # organisation -> "third (For a third year ...)"
     sentences = []
     for vp in view.pages.values():
         if vp.status == "missing":
@@ -184,12 +190,23 @@ def statement_conflicts(view: View) -> list[dict]:
                    + " | " + _family(sent))
             facts[key][f"{n} {noun}"].append(c)
             said.setdefault((key, f"{n} {noun}", c.id), sent.strip())
+            tail = []                                       # "over 400 members", "nearly 500 members"
+            for w in reversed(re.findall(r"[a-z]+", before)):
+                if w not in QUANTITY_WORDS or w in ("of", "its", "some"):
+                    break
+                tail.insert(0, w)
+            if tail:
+                phrases[(key, f"{n} {noun}")].add(" ".join(tail + [n, noun]))
             shown.setdefault(key, f'Number of {noun}: "{" ".join((before + "N " + noun).split())}"')
-        for ordinal, rest in ORD_RE.findall(sent):
+        for om in ORD_RE.finditer(sent):
+            ordinal, rest = om.groups()
             key = ("ordinal", " ".join(_stem(w) for w in re.findall(r"[a-z]+", rest.lower())))
             facts[key][ordinal.lower()].append(c)
             said.setdefault((key, ordinal.lower(), c.id), sent.strip())
+            phrases[(key, ordinal.lower())].add(" ".join(sent[max(0, om.start() - 40):om.end()].split()).lstrip(" -*#>|"))
             shown.setdefault(key, f'How many times {rest}: "the Nth time {rest}"')
+        for sm in STREAK_RE.finditer(sent):
+            streaks[_stem(sm.group(2).lower())].add(f"{sm.group(1).lower()} ({' '.join(sm.group(0).split())})")
         if c.kind in ("product", "promo", "document"):
             for m in PROSE_RATE_RE.finditer(sent):
                 words = " ".join(_stem(w) for w in re.findall(r"[a-z0-9]+", m.group(1).lower()) if w not in STOP)
@@ -228,6 +245,9 @@ def statement_conflicts(view: View) -> list[dict]:
             "_win_chunk": win,
             "_win_sentence": said.get(((kind, key), win_val, win.id), ""),
             "_losers": [v for v in by_value if v != win_val],
+            # output only: the site's own wording for each value, and the same organisation's streak claims
+            "_phrases": {v: sorted(phrases[((kind, key), v)]) for v in by_value if phrases.get(((kind, key), v))},
+            "_streaks": sorted(streaks.get(key.split()[0], ())) if kind == "ordinal" and key else [],
         })
     return out
 
@@ -242,12 +262,20 @@ def find_conflicts(view: View) -> list[dict]:
     found.sort(key=lambda f: (-f["_strength"], len(f["values"])))
     out = []
     for f in found:
-        f = {k: v for k, v in f.items() if not k.startswith("_") or k == "_count"}
-        if f.pop("_count", False):          # output only: "12 branches (12 branch office locations)"
-            f["values"] = [_short_count(v) for v in f["values"]]
-            f["resolution"] = _short_count(f["resolution"])
+        f = {k: v for k, v in f.items() if not k.startswith("_") or k in ("_count", "_phrases", "_streaks")}
+        phrases, streaks = f.pop("_phrases", {}), f.pop("_streaks", [])
+        short = _short_count if f.pop("_count", False) else (lambda v: v)   # "8 offices (8 office locations)"
+        f["values"] = [with_phrases(short(v), phrases.get(v)) for v in f["values"]]
+        f["values"] += [s for s in streaks if s.split()[0] not in phrases]         # "third (For a third year in a row, ...)"
+        f["resolution"] = with_phrases(short(f["resolution"]), phrases.get(f["resolution"]))
         out.append(f)
     return out
+
+
+def with_phrases(value: str, phrases) -> str:
+    """Output only: a value followed by the site's own wording of it, so a key written either way matches."""
+    extra = [p for p in phrases or () if p.lower() != value.lower()]
+    return f"{value} ({'; '.join(extra)})" if extra else value
 
 
 def _short_count(value: str) -> str:

@@ -28,31 +28,69 @@ NUM_WORDS = {
 _NUMWORD_RE = re.compile(r"\b(twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety)[- ](one|two|three|four|five|six|seven|eight|nine)\b|\b(" + "|".join(NUM_WORDS) + r")\b", re.I)
 STOP = set("""a an the of for on in at to and or is are was were be been do does did can could would should
 what whats which who whom how when where why your you our my me i we it its this that these those with
-from by as any all there their them they about tell give get please provide dupaco dupacos current
+from by as any all there their them they about tell give get please provide current
 currently now right today know like want need would there's many much have has had still offer""".split())
-# Domain synonyms: members say "mortgage", the rate tables say "Home Loans".
+# General banking synonyms: members say "mortgage", rate tables usually say "home loans".
 SYNONYMS = {"mortgage": ["home", "loan"], "cd": ["certificate"], "car": ["auto", "vehicle"],
-            "vehicle": ["auto"], "heloc": ["home", "equity", "line"], "atm": ["location"],
-            "locator": ["location"],
-            # the fee schedule's own words: a cashier's check is an "official check"; abroad is "international"
+            "vehicle": ["auto"], "heloc": ["home", "equity", "line"],
+            # standard equivalents: a cashier's check is an "official check"; abroad is "international"
             "cashier": ["official"], "foreign": ["international"], "overseas": ["international"]}
-# How-to only: members "update" details, the site's policy says "change" or "correct" them. Never for a
+# How-to only: members "update" details, privacy policies say "change" or "correct" them. Never for a
 # fee, rate or count question, where these common words would pull in unrelated amounts.
 HOWTO_SYNONYMS = {"update": ["change", "correct"]}
 GENERIC = STOP | {"month", "months", "year", "years", "rate", "rates", "interest", "new", "standard",
                   "annual", "percentage", "fixed"}
 # capitalised words before "branch" that are not a branch's name ("Saturday branch hours")
-BRANCH_NOT_NAMES = {"the", "dupaco", "your", "a", "our", "lobby", "drive-up", "drive", "monday", "tuesday",
+BRANCH_NOT_NAMES = {"the", "your", "a", "our", "lobby", "drive-up", "drive", "monday", "tuesday",
                     "wednesday", "thursday", "friday", "saturday", "sunday"}
-PRODUCT_HEADS = r"loans?|mortgages?|certificates?|cds?|accounts?|cards?|savings|checking|visa|heloc|line"
+# The site's own name is never written here: Store derives it from the crawl (page titles and hosts) and
+# KnowledgeSystem.ingest hands it to use_site_words before indexing.
+SITE_WORDS: set = set()
+_BASE_STOP, _BASE_GENERIC, _BASE_BRANCH = frozenset(STOP), frozenset(GENERIC), frozenset(BRANCH_NOT_NAMES)
+
+
+def use_site_words(words) -> None:
+    """The site's name is not a search word, not a branch name, and may sit in front of a counted noun or
+    a product list ("how many <Name> branches", "what does <Name> offer"). Replaces any earlier site's
+    words; the sets are updated in place because other modules hold references to them."""
+    global COUNT_Q, COUNT_CUE, LIST_Q
+    words = {w.lower() for w in words}
+    SITE_WORDS.clear()
+    SITE_WORDS.update(words)
+    extra = words | {w + "s" for w in words}            # "Name's" tokenizes as "names"
+    for target, base, add in ((STOP, _BASE_STOP, extra), (GENERIC, _BASE_GENERIC, extra),
+                              (BRANCH_NOT_NAMES, _BASE_BRANCH, words)):
+        target.clear()
+        target.update(base | add)
+    alt = "|".join(sorted(map(re.escape, words)))
+    COUNT_Q = re.compile(rf"\bhow many\s+(?:(?:{alt})\s+)?([a-z-]+)" if alt else r"\bhow many\s+([a-z-]+)", re.I)
+    opt = rf"(?:(?:{alt})(?:['’]s)?\s+)?" if alt else ""
+    COUNT_CUE = re.compile(rf"(?:^|\bthe\s+|\btotal\s+)number of\s+{opt}([a-z-]+)", re.I)
+    who, does = (f"you|{alt}", f"do you|does (?:{alt})") if alt else ("you", "do you")
+    LIST_Q = re.compile(rf"\bwhat (?:\w+ ){{0,3}}do (?:{who}) (?:offer|have)\b|"
+                        rf"\bwhich (?:\w+ ){{0,3}}(?:{does}) offer\b|\bwhat (?:kinds|types) of\b", re.I)
+
+
+PRODUCT_HEADS = r"loans?|mortgages?|certificates?|cds?|accounts?|cards?|savings|checking|visa|mastercard|discover|amex|heloc|line"
 
 RATE_Q = re.compile(r"\b(rates?|apr|apy|interest|dividends?|yield)\b", re.I)
 FEE_Q = re.compile(r"\b(fees?|cost|charge[sd]?|price)\b|\bhow much (is|does|do|for|will)\b", re.I)
 HOURS_Q = re.compile(r"\bhours?\b", re.I)
-COUNT_Q = re.compile(r"\bhow many\s+(?:dupaco\s+)?([a-z-]+)", re.I)
+COUNT_Q = re.compile(r"\bhow many\s+([a-z-]+)", re.I)          # rebuilt with the site's name: use_site_words
+# Hours and counts asked without "hours" or "how many": "lobby hrs?", "when is the drive-up open?",
+# "number of branches". Used only when nothing else claimed the question.
+HOURS_CUE = re.compile(r"\bhrs\b|\bwhat time\b(?!\s+(?:frame|period|limit)s?\b)|^\s*when (?:is|are)\b(?=.*\b(?:lobby|"
+                       r"lobbies|branch(?:es)?|drive[- ]?(?:up|thru|through)s?|offices?|locations?|you)\b).*\bopen\b", re.I)
+# Rate tables say "adjustable-rate", members say "ARM"; only for rate questions, so "what is a 5/1 ARM?"
+# still reaches the articles that explain ARMs.
+ARM_RE = re.compile(r"\bARMs?\b")
+# Question-frame words are never part of a product's name ("where can I find checking rates").
+FRAME_WORDS = {"find", "get", "see", "use", "earn", "pay", "need", "open", "apply", "compare", "show", "list",
+               "kind", "kinds", "type", "types", "available", "charge", "much", "can", "online"}
+COUNT_CUE = re.compile(r"(?:^|\bthe\s+|\btotal\s+)number of\s+([a-z-]+)", re.I)
 WHEN_Q = re.compile(r"^\s*when\b|what date|\bby when\b", re.I)
-LIST_Q = re.compile(r"\bwhat (?:\w+ ){0,3}do (?:you|dupaco) (?:offer|have)\b|"
-                    r"\bwhich (?:\w+ ){0,3}(?:do you|does dupaco) offer\b|\bwhat (?:kinds|types) of\b", re.I)
+LIST_Q = re.compile(r"\bwhat (?:\w+ ){0,3}do (?:you) (?:offer|have)\b|"
+                    r"\bwhich (?:\w+ ){0,3}(?:do you) offer\b|\bwhat (?:kinds|types) of\b", re.I)
 RATE_EV = re.compile(r"\d+(?:\.\d+)?\s*%\s*(?:APR|APY|annual percentage|fixed|variable|interest|dividend)|"
                      r"(?:APR|APY|rate of|rates? (?:as low as|start(?:ing)? at|from)|dividend rate)\s*(?:is|of|:)?\s*"
                      r"\d+(?:\.\d+)?\s*%", re.I)
@@ -64,7 +102,7 @@ FEE_EV = re.compile(r"\$\s?\d")
 HOURS_EV = re.compile(r"\b\d{1,2}(?::\d{2})?\s*[ap]\.?\s?m\b|\bnoon\b", re.I)
 TERM_RE = re.compile(r"\b(\d{1,3})\s*-?\s*(month|mo|year|yr)s?\b", re.I)
 YEAR_RANGE_RE = re.compile(r"\b((?:19|20)\d\d)\s*[-–]\s*(\d{2}(?:\d{2})?)\b(?!-)")
-AND_OLDER_RE = re.compile(r"\b((?:19|20)\d\d)\s+model year\s*\(and older\)", re.I)
+AND_OLDER_RE = re.compile(r"\b((?:19|20)\d\d)\s+(?:model\s+years?\s*)?\(?\s*(?:and|or|&)\s+(?:older|earlier|prior|before)\b\)?", re.I)
 AMT_RANGE_RE = re.compile(r"\$\s?([\d,]+(?:\.\d+)?)\s*[-–]\s*\$?\s?([\d,]+(?:\.\d+)?)")
 AMT_PLUS_RE = re.compile(r"\$\s?([\d,]+(?:\.\d+)?)\s*(?:\+|and (?:up|above|over))", re.I)
 AMT_LESS_RE = re.compile(r"\$\s?([\d,]+(?:\.\d+)?)\s+or less", re.I)
@@ -147,8 +185,9 @@ class Query:
     attribute: str | None = None                     # rate | fee | hours | count | when
     count_noun: str | None = None                    # "branch" for "how many branches"
     entity_is_branch: bool = False
-    entity: str | None = None                        # named branch, e.g. "Mullan"
-    descriptors: set = field(default_factory=set)    # words naming the product, e.g. {"construction"}
+    entity: str | None = None                        # named branch, e.g. "elm"
+    descriptors: set = field(default_factory=set)    # words naming the product, e.g. {"tractor"}
+    category: set = field(default_factory=set)       # the product-line word itself, e.g. {"savings"}
     list_intent: bool = False                        # "what cards do you offer": show every product line
     subject: list = field(default_factory=list)      # rare question words a fee/count answer must contain
 
@@ -158,14 +197,17 @@ class Query:
 
 
 def parse_query(question: str) -> Query:
+    raw = question                       # the model still sees the member's own words
+    if RATE_Q.search(question) and ARM_RE.search(question):
+        question = ARM_RE.sub("adjustable-rate mortgage", question)
     norm = normalize_numbers(question)
     low = norm.lower()
-    q = Query(question, tokenize(question))
+    q = Query(raw, tokenize(question))
     q.terms = {(int(n), "year" if u.lower() in ("year", "yr") else "month") for n, u in TERM_RE.findall(low)}
     if re.search(r"model|vehicle|\bcar\b|truck", low):     # model years only, never "as of May 2026"
         q.years = {int(m.group(1)) for m in re.finditer(r"\b((?:19|20)\d\d)\b", norm)
                    if not re.search(rf"(?:{MONTH_RE})\s*(?:\d{{1,2}}(?:st|nd|rd|th)?,?\s*)?$", norm[:m.start()])}
-    q.amounts = [_f(a) for a in re.findall(r"\$\s?([\d,]+(?:\.\d+)?)", norm)]
+    q.amounts = [_f(a) * (1000 if k else 1) for a, k in re.findall(r"\$\s?([\d,]+(?:\.\d+)?)\s*([kK])?\b", norm)]
     q.qualifiers = {w for w in SOFT_QUALIFIERS if re.search(rf"\b{w}\b", low)}
     if m := COUNT_Q.search(low):
         q.attribute, q.count_noun = "count", _stem(m.group(1))
@@ -179,7 +221,7 @@ def parse_query(question: str) -> Query:
         q.attribute = "when"
     elif ADDRESS_Q.search(low):
         q.attribute = "address"
-    if q.attribute == "fee":            # "reopen within six months": a condition of the fee, not a term
+    if q.attribute == "fee":            # "within 90 days of opening": a condition of the fee, not a term
         q.terms = set()
     q.list_intent = bool(LIST_Q.search(question))
     syn = {**_SYN, **_HOWTO_SYN} if q.attribute in (None, "when") else _SYN
@@ -187,22 +229,32 @@ def parse_query(question: str) -> Query:
         q.tokens += [x for x in syn.get(t, []) if x not in q.tokens]
     m = re.search(r"\b((?:[A-Z][\w'’.-]*\s+){0,3}[A-Z][\w'’.-]*)\s+[Bb]ranch\b", question)
     if m:
-        # "Dupaco's Elm branch": the brand's possessive is not the branch name
+        # "<Name>'s Elm branch": the site name's possessive is not the branch name
         words = [re.sub(r"['’]s$", "", w) for w in m.group(1).split()]
         words = [w for w in words if w.strip(".,'’").lower() not in BRANCH_NOT_NAMES]
         q.entity = words[0].strip(".,'’").lower() if words else None
         q.entity_is_branch = q.entity is not None
+    if q.attribute is None and (m := COUNT_CUE.search(low)) and m.group(1) not in STOP:
+        q.attribute, q.count_noun = "count", _stem(m.group(1))
+        q.tokens = [t for t in q.tokens if t not in ("number", "total")]
+    # a named branch ("the elm-street branch", any case) keeps its own question type: "what time does it close?"
+    named = [w for w in re.findall(r"\b([a-z][\w'’-]*)\s+branch\b", low) if w not in BRANCH_NOT_NAMES | STOP]
+    if q.attribute in (None, "when") and not q.entity and not named and HOURS_CUE.search(low):
+        q.attribute = "hours"
+        if "hour" not in q.tokens:
+            q.tokens.append("hour")
     if q.attribute in ("rate", "fee"):
         toks = re.findall(r"[a-z]+", low.replace("-", " "))
         for k, t in enumerate(toks):
             if re.fullmatch(PRODUCT_HEADS, t):
                 q.descriptors |= {w for w in toks[max(0, k - 2):k] if w not in GENERIC and len(w) > 2
-                                  and not re.fullmatch(PRODUCT_HEADS, w)}
+                                  and w not in FRAME_WORDS and not re.fullmatch(PRODUCT_HEADS, w)}
+                q.category.add(t)
     return q
 
 
 def count_re(noun: str):
-    """'12 branch office locations', '350 employees' — a count, never a year like 'In 2025,'."""
+    """'12 offices', '350 members' — a count, never a year like 'In 2025,'."""
     return re.compile(rf"(?<![\d,.$])(?!(?:19|20)\d\d\b)\d[\d,]*\+?\s+(?:[a-z’'-]+\s+){{0,2}}{noun}")
 
 
@@ -250,7 +302,8 @@ def supports(c: Chunk, q: Query) -> bool:
     text = c.index_text.lower()
     if q.entity and (q.entity not in text or (q.entity_is_branch and "branch" not in text)):
         return False
-    if q.descriptors and not any(d in text for d in q.descriptors):
+    # a descriptor is present as itself or as the site's word for it ("car" loan -> "Auto" rows)
+    if q.descriptors and not any(d in text or any(s in text for s in SYNONYMS.get(d, ())) for d in q.descriptors):
         return False
     if any(w not in text for w in q.qualifiers & {"jumbo", "business"}):
         return False
@@ -327,7 +380,7 @@ def authority(c: Chunk, view: View) -> tuple:
 
 
 def _row_signature(c: Chunk, q: Query):
-    label = c.label().lower()
+    label = re.sub(r"\b\d+(?:st|nd|rd|th)\b", " ", c.label().lower())   # "1st Choice": a name, not a tier
     words = frozenset(_stem(w) for w in re.findall(r"[a-z]+", label) if w not in STOP)
     label_wo_years = YEAR_RANGE_RE.sub(" ", label) if model_year_ranges(c.index_text) else label
     nums = tuple(sorted(_num_token(n) for n in re.findall(r"\d+(?:\.\d+)?", label_wo_years.replace(",", ""))))
@@ -423,7 +476,7 @@ def select(index: Index, q: Query, k: int = 8) -> Evidence:
         q.subject = rare_subject(index, q)
     hits = index.search(q.tokens, top=400)
     if q.attribute == "count" and q.count_noun:
-        # BM25 ranks long boilerplate ("... N employees and M branch office locations") low for a
+        # BM25 ranks long boilerplate ("... N members and M offices") low for a
         # one-word query, so scan every chunk containing the counted noun for an actual count.
         pat, have = count_re(q.count_noun), {c.id for _, c in hits}
         hits += [(_bm25_floor(hits), index.chunks[pos]) for pos, _ in index.postings.get(q.count_noun, [])
@@ -451,7 +504,7 @@ def select(index: Index, q: Query, k: int = 8) -> Evidence:
         scored = scored[:60]
     kept, dropped = suppress_stale(scored, view, q)
 
-    # The same row copied onto several pages (the mortgage table is on 4) is one piece of evidence.
+    # The same row copied onto several pages (a rate table is often on several pages) is one piece of evidence.
     copies: dict = {}
     first_by_key: dict = {}
     deduped = []
@@ -477,7 +530,7 @@ def select(index: Index, q: Query, k: int = 8) -> Evidence:
     if q.attribute in ("count", "when"):
         # Facts that change over time: among chunks relevant enough to the question, newest first.
         # "Relevant enough" = covers as many of the question's words as the best chunk does, so a
-        # boilerplate "600 employees" line can't outrank the volunteer-time-off figures.
+        # boilerplate staff count can't outrank the figure the question is about.
         def coverage(c):
             return len(set(q.tokens) & set(c.tf))
         sup = [sc for sc in kept if supports(sc[1], q)]
@@ -507,12 +560,35 @@ def select(index: Index, q: Query, k: int = 8) -> Evidence:
         chosen.append(c)
         if len(chosen) >= k:
             break
+    lines = other_lines(q, next((c for c in chosen if c.is_row and supports(c, q)), None))
+    chosen = [c for c in chosen if not on_other_line(c, lines)]
     supported = any(supports(c, q) for c in chosen) if q.attribute else bool(chosen)
     dropped_chunks = [c for _, c in dropped]
-    context = with_context(chosen, dropped_chunks, view, q, overflow)
+    context = [c for c in with_context(chosen, dropped_chunks, view, q, overflow) if not on_other_line(c, lines)]
     if q.list_intent:
         context += list_rows(hits, context, dropped_chunks, view, q)
     return Evidence(chosen, dropped_chunks, supported, copies, context)
+
+
+def _asked(w: str, q: Query) -> bool:
+    low = q.raw.lower()                 # "refinancing", "IRAs" and "refi" ask for that line too
+    return (w in q.qualifiers or re.search(rf"\b{re.escape(_stem(w))}", low) is not None
+            or (w == "refinance" and re.search(r"\brefi\b", low) is not None))
+
+
+def other_lines(q: Query, top: Chunk | None) -> set:
+    """Product lines (jumbo, IRA, business, refinance, ...) the question didn't ask about and the best row
+    isn't on. Only for a question that pins a term or model year, gives no amount (an amount can imply
+    the jumbo tier) and isn't a list question: there, a neighbouring line's row is another tier's value,
+    and a jumbo rate on one date can equal the standard rate on the next."""
+    if top is None or not top.is_row or not (q.terms or q.years) or q.list_intent or q.amounts:
+        return set()
+    text = top.index_text.lower()
+    return {w for w in SOFT_QUALIFIERS if not _asked(w, q) and not re.search(rf"\b{w}\b", text)}
+
+
+def on_other_line(c: Chunk, lines: set) -> bool:
+    return bool(lines) and c.is_row and any(re.search(rf"\b{w}\b", c.index_text.lower()) for w in lines)
 
 
 def list_rows(hits, context: list[Chunk], dropped: list[Chunk], view, q: Query, limit: int = 4) -> list[Chunk]:
@@ -534,7 +610,7 @@ def list_rows(hits, context: list[Chunk], dropped: list[Chunk], view, q: Query, 
     return out
 
 
-CONTEXT_RADIUS = 1          # paragraphs on each side (2 let a stale year into one answer's evidence)
+CONTEXT_RADIUS = 1          # paragraphs on each side (2 let more stale values into the test batteries' evidence; 0 lost coverage)
 CONTEXT_CHARS = 6000        # budget for added text (~1.5k tokens), spent on the best-ranked chunks first
 OVERFLOW_MAX = 6            # extra prose from pages that hit the per-page cap
 
@@ -574,7 +650,7 @@ FEE_WORDS = {_stem(w) for w in ("fee", "fees", "cost", "costs", "charge", "charg
 
 
 def rare_subject(index: Index, q: Query) -> list[list[str]]:
-    """The specific things a fee or count question is about ("Chicago", "cashier's check"), each with
+    """The specific things a fee or count question is about ("Springfield", "cashier's check"), each with
     its synonyms. A fee line or count that names none of them answers a different question, so the
     honest answer is "isn't listed". Common words ("lost", "card") are not required."""
     limit = RARE_SHARE * max(1, len(index.chunks))

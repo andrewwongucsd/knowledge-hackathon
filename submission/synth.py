@@ -13,7 +13,7 @@ import os
 import re
 
 from ingest import Chunk, View, url_key
-from retrieve import Evidence, Query, qualify, supports, tokenize
+from retrieve import Evidence, Query, on_other_line, other_lines, qualify, supports, tokenize
 
 REFUSAL = "That isn't listed on our website, so I can't confirm it. Please contact us and we can help."
 # The prompt calls the context "excerpts"; a sentence that talks about them instead of the site is dropped.
@@ -21,6 +21,22 @@ BANNED = re.compile(r"\bevidence\b|\bexcerpts?\b|\bdocuments?\b", re.I)
 NUM_RE = re.compile(r"(\d{1,3}(?:,\d{3})+|\d+)(?:\.(\d+))?")
 MODEL = os.getenv("KH_MODEL", "claude-haiku-5-5")
 TIMEOUT_S = float(os.getenv("KH_LLM_TIMEOUT", "8"))
+RETRY_WAIT_MAX_S = 10.0     # a longer server-requested wait is not waited out: each answer must end within 60s
+
+
+def _new_client(**kwargs):
+    """The SDK client, with one retry. A rate-limited reply can ask for a long wait (retry-after) and the
+    SDK sleeps all of it, which would push an answer past the 60s limit. Waits over RETRY_WAIT_MAX_S are
+    skipped instead; the retry then fails fast and the extractive answer is used. Worst case per answer
+    is about 2 x TIMEOUT_S + RETRY_WAIT_MAX_S."""
+    import anthropic
+
+    class _Client(anthropic.Anthropic):
+        def _calculate_retry_timeout(self, *args, **kw):
+            wait = super()._calculate_retry_timeout(*args, **kw)
+            return wait if wait <= RETRY_WAIT_MAX_S else 0.0
+
+    return _Client(timeout=TIMEOUT_S, max_retries=1, **kwargs)
 
 SYSTEM = """You answer a credit union member's question using ONLY the numbered website excerpts provided.
 
@@ -117,11 +133,20 @@ def extractive(q: Query, ev: Evidence, view: View) -> tuple[str, list[Chunk]]:
     if top.is_row:
         # Tiers the question did not pin down (e.g. loan amount for "30-year mortgage") are shown as a
         # range: every row of the same table that matches all qualifiers the question did give.
-        hidden = {d.id for d in ev.dropped}
+        hidden, lines = {d.id for d in ev.dropped}, other_lines(q, top)
         same_table = [c for c in view.pages[top.key].page.chunks if c.is_row and c is not top
                       and c.table_span == top.table_span and c.id not in hidden and supports(c, q)
-                      and qualify(c, q)[0] != "mismatch"]
+                      and qualify(c, q)[0] != "mismatch" and not on_other_line(c, lines)]
         rows = [top] + same_table[:3]
+        own = f"{top.label()} {top.section}".lower()
+        if q.category and not any(re.search(rf"\b{re.escape(w)}\b", own) for w in q.category):
+            # The top row matched a value shared with a different product than the one the question
+            # names ("savings"): also give the named product's own row from the evidence, the plainest
+            # (shortest) name first, so a value coincidence can't crowd out the product asked about.
+            named = [c for c in ev.chunks if c.is_row and c not in rows
+                     and any(re.search(rf"\b{re.escape(w)}\b", f"{c.label()} {c.section}".lower()) for w in q.category)]
+            if named:
+                rows = rows + [min(named, key=lambda c: len(f"{c.label()} {c.section}"))]
         return " ".join(render_row(r) + "." for r in rows), rows
     return best_sentence(top, q), [top]
 
@@ -133,16 +158,14 @@ class Synthesizer:
             and not os.getenv("KH_NO_LLM")
         if self.enabled:                # one-time setup here: build() is untimed, the first answer is not
             try:
-                import anthropic
-                self._client = anthropic.Anthropic(timeout=TIMEOUT_S, max_retries=1)
+                self._client = _new_client()
             except Exception:           # no SDK (e.g. Python 3.9): _llm keeps its lazy path and falls back
                 self._client = None
 
     def _llm(self, question: str, ev: Evidence, view: View) -> dict | None:
         try:
-            if self._client is None:
-                import anthropic                       # lazy: a missing package must not break build()
-                self._client = anthropic.Anthropic(timeout=TIMEOUT_S, max_retries=1)
+            if self._client is None:                   # lazy: a missing package must not break build()
+                self._client = _new_client()
             excerpts = "\n\n".join(f"[{i}] ({describe(c, view)})\n{c.text}" for i, c in enumerate(_llm_chunks(ev), 1))
             resp = self._client.messages.create(
                 model=MODEL,
@@ -201,18 +224,20 @@ def _drop_banned(text: str) -> str:
     return " ".join(s for s in _sentences(text) if not BANNED.search(s)).strip()
 
 
-SITE_LINK_RE = re.compile(r"(?:https?://)?(?:www\.)?dupaco\.com((?:/[A-Za-z0-9_\-.]+){2,})", re.I)
-
-
 def _drop_dead_links(text: str, view: View) -> str:
-    """Drop sentences linking to a multi-level dupaco.com page that is not in this snapshot.
+    """Drop sentences linking to a multi-level page on the site's own host that is not in this snapshot.
 
-    Old articles still link to pages that have since moved (e.g. a retired locator path), and the
-    crawl covers the site's pages, so an uncrawled deep link is a dead one. One-level vanity links
-    (dupaco.com/homeloans) and other hosts are redirects the crawl can't check, so they are kept.
-    """
+    Old articles still link to pages that have since moved, and the crawl covers the site's pages, so an
+    uncrawled deep link is a dead one. One-level vanity links (host/short-name) and other hosts are
+    redirects the crawl can't check, so they are kept. The hosts come from the crawled pages themselves."""
+    hosts = sorted({k.split("/", 1)[0] for k in view.pages})
+    if not hosts:
+        return text
+    site_link = re.compile(r"(?:https?://)?(?:www\.)?(" + "|".join(map(re.escape, hosts)) +
+                           r")((?:/[A-Za-z0-9_\-.]+){2,})", re.I)
+
     def dead(s: str) -> bool:
-        return any(url_key("dupaco.com" + m.group(1).rstrip(".")) not in view.pages for m in SITE_LINK_RE.finditer(s))
+        return any(url_key(m.group(1) + m.group(2).rstrip(".")) not in view.pages for m in site_link.finditer(s))
     return " ".join(s for s in _sentences(text) if not dead(s)).strip()
 
 

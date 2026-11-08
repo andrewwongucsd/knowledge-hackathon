@@ -24,21 +24,22 @@ SELFTEST = ROOT / "harness" / "selftest"
 
 class Parsing(unittest.TestCase):
     def test_footnote_markers_are_stripped_but_values_kept(self):
-        self.assertEqual(strip_footnotes("3.25%1"), "3.25%")
-        self.assertEqual(strip_footnotes("6.10% APR1"), "6.10% APR")
+        self.assertEqual(strip_footnotes("4.44%1"), "4.44%")
+        self.assertEqual(strip_footnotes("9.87% APR2"), "9.87% APR")
         self.assertEqual(strip_footnotes("Annual Percentage Rate (As Low As) 1"), "Annual Percentage Rate (As Low As)")
         self.assertEqual(strip_footnotes("11.00% - 18.00% APR"), "11.00% - 18.00% APR")
 
     def test_url_key_matches_the_scorer(self):
-        for u in ("https://www.dupaco.com/personal/loans/home-loans#rates", "https://www.dupaco.com/",
-                  "https://www.dupaco.com/privacy-policy?campaignId=x"):
+        for u in ("https://www.example.org/borrow/boat-loans#rates", "https://www.example.org/",
+                  "https://www.example.org/privacy?campaignId=x"):
             self.assertEqual(url_key(u), scoring._url_key(u))
 
     def test_model_year_ranges_handle_both_orders_and_open_ends(self):
-        self.assertEqual(model_year_ranges("2024-27 Model Year"), [(2024, 2027)])
-        self.assertEqual(model_year_ranges("Model Year 2026-23"), [(2023, 2026)])
-        self.assertEqual(model_year_ranges("2023–26 Model Year"), [(2023, 2026)])
-        self.assertEqual(model_year_ranges("2016 Model Year (and older)"), [(0, 2016)])
+        self.assertEqual(model_year_ranges("2019-21 Model Year"), [(2019, 2021)])
+        self.assertEqual(model_year_ranges("Model Year 2022-18"), [(2018, 2022)])
+        self.assertEqual(model_year_ranges("2018–22 Model Year"), [(2018, 2022)])
+        self.assertEqual(model_year_ranges("2009 Model Year (and older)"), [(0, 2009)])
+        self.assertEqual(model_year_ranges("2009 Model Year or earlier"), [(0, 2009)])
 
     def test_amount_tiers(self):
         self.assertEqual(amount_ranges("$5,000 – $9,999.99"), [(5000.0, 9999.99)])
@@ -46,11 +47,11 @@ class Parsing(unittest.TestCase):
         self.assertEqual(amount_ranges("$500,000 or less"), [(0.0, 500000.0)])
 
     def test_question_qualifiers(self):
-        q = parse_query("What's the APR for a 60-month auto loan on a 2025 model-year vehicle?")
-        self.assertEqual(q.terms, {(60, "month")})
-        self.assertEqual(q.years, {2025})
+        q = parse_query("What's the APR for a 48-month loan on a 2022 model-year boat?")
+        self.assertEqual(q.terms, {(48, "month")})
+        self.assertEqual(q.years, {2022})
         self.assertEqual(q.attribute, "rate")
-        q = parse_query("What was the rate on the 10-month jumbo special as of May 2026?")
+        q = parse_query("What was the rate on the 14-month jumbo special as of March 2027?")
         self.assertEqual(q.years, set())                     # a date, not a model year
         self.assertIn("jumbo", q.qualifiers)
         q = parse_query("Current APY on a six month share certificate?")
@@ -85,17 +86,67 @@ class Parsing(unittest.TestCase):
 
 
 class Guardrails(unittest.TestCase):
-    """Assignment §7: hard-coding answers to the practice questions is out of bounds. No expected or
-    wrong-answer string from eval/public_eval.jsonl may appear in the submission's code, apart from
-    generic vocabulary that any implementation needs (ordinal words, "noon")."""
-    GENERIC = {"noon", "first", "second", "third", "fourth", "fifth", "sixth", "seventh", "eighth", "ninth", "tenth"}
+    """No hard-coding in our code (assignment §7, and the owner's stricter rule). Nothing learned from the
+    practice set or from this site may appear in any file under submission/ (code, tests, notes):
+      * practice answer and trap values; expected-source paths; 4-word expected-answer phrases;
+      * proper names from the practice questions and answers;
+      * the site's own identity (domain, brand, title suffix): the system derives it from the crawl.
+    Exempt: generic vocabulary any credit-union site uses (ordinals, "noon", street words, card networks,
+    wallet brands, calendar names) and bare years."""
+    EXEMPT = set("noon first second third fourth fifth sixth seventh eighth ninth tenth aprs avenue lane street "
+                 "west share visa rewards platinum google samsung volunteer".split())
+    CALENDAR = set("monday tuesday wednesday thursday friday saturday sunday january february march april may "
+                   "june july august september october november december mon tue wed thu fri sat sun".split())
 
-    def test_no_practice_answers_in_submission_code(self):
+    def _banned(self) -> dict:
+        import re
+        from types import SimpleNamespace
+        from ingest import site_identity
+        from retrieve import _BASE_STOP
         items = [json.loads(l) for l in (ROOT / "eval" / "public_eval.jsonl").read_text().splitlines() if l.strip()]
-        tokens = {t for it in items for k in ("must_include", "must_not_include") for t in it.get(k, [])
-                  if len(t) >= 4 and t.lower() not in self.GENERIC}
-        hits = sorted((p.name, t) for p in (ROOT / "submission").glob("*.py")
-                      for t in tokens if t.lower() in p.read_text().lower())
+        texts = [t for it in items for t in (it["question"], it.get("expected_answer", ""))]
+        lower_words = set(re.findall(r"\b[a-z][a-z'’$-]+\b", " ".join(texts)))
+        banned = {}
+        for it in items:
+            for t in it.get("must_include", []) + it.get("must_not_include", []):
+                if len(t) >= 3 and t.lower() not in self.EXEMPT and not re.fullmatch(r"(?:19|20)\d\d", t):
+                    banned[t.lower()] = f"practice value ({it['id']})"
+            for u in it.get("expected_sources", []):
+                path = url_key(u).partition("/")[2]
+                if len(path) >= 8:
+                    banned[path.lower()] = f"expected source ({it['id']})"
+            words = re.findall(r"[A-Za-z0-9$%.'’-]+", it.get("expected_answer", ""))
+            for i in range(len(words) - 3):
+                gram = [w.lower().strip(".") for w in words[i:i + 4]]
+                if sum(w not in _BASE_STOP for w in gram) >= 3:
+                    banned[" ".join(gram)] = f"expected-answer phrase ({it['id']})"
+        for t in texts:                                  # proper names: capitalised mid-sentence, never lower-case
+            for sentence in re.split(r"(?<=[.?!:;])\s+|\s+-\s+|\(", t):
+                for w in re.findall(r"[A-Za-z][A-Za-z'’$-]*", sentence)[1:]:
+                    w = re.sub(r"['’]s$", "", w)
+                    if (w[0].isupper() and len(w) >= 4 and w.lower() not in lower_words | self.EXEMPT
+                            and not any(part in self.CALENDAR for part in re.split(r"[-–]", w.lower()))):
+                        banned.setdefault(w.lower(), "practice proper name")
+        snaps = sorted((ROOT / "snapshots").glob("0*/manifest.json"))
+        if snaps:                                        # the site's identity, derived the same way ingest does
+            pages = json.loads(snaps[-1].read_text())["pages"]
+            domains, suffix, words = site_identity([SimpleNamespace(url=p.get("url"), title=p.get("title"))
+                                                    for p in pages])
+            for x in domains | words | ({suffix} if suffix else set()):
+                banned[x.lower()] = "site identity"
+        return banned
+
+    def test_no_practice_or_site_knowledge_in_our_files(self):
+        import re
+        banned = self._banned()
+        self.assertGreater(len(banned), 100)             # the guard really has something to look for
+        files = [p for p in (ROOT / "submission").rglob("*")
+                 if p.is_file() and p.suffix in (".py", ".md", ".txt", ".json") and "__pycache__" not in p.parts]
+        hits = []
+        for p in files:
+            text = " ".join(p.read_text(errors="ignore").lower().split())
+            hits += [(str(p.relative_to(ROOT)), t, why) for t, why in banned.items()
+                     if re.search(rf"(?<![\w.]){re.escape(t)}(?![\w])", text)]
         self.assertEqual(hits, [])
 
 
@@ -117,13 +168,13 @@ class Edges(unittest.TestCase):
         from types import SimpleNamespace as NS
         from ingest import Chunk
         from solution import apply_fact, match_fact
-        win = Chunk(7, "example.com/news-3", "article", "This was the fifth time Acme recognized the bank.", "")
-        fact = {"topic": "How many times Acme recognized: the Nth time", "_losers": ["fourth"],
+        win = Chunk(7, "example.com/news-3", "article", "This was the seventh time Acme recognized the bank.", "")
+        fact = {"topic": "How many times Acme recognized: the Nth time", "_losers": ["sixth"],
                 "_win_chunk": win, "_win_sentence": win.text}
         index = NS(chunks=[None] * 1000, postings={"acm": [(0, 1)]})
         self.assertIs(match_fact([fact], parse_query("What recognition has the bank received from Acme?"), index), fact)
         self.assertIsNone(match_fact([fact], parse_query("What are the lobby hours?"), index))
-        old = Chunk(2, "example.com/news-2", "article", "It was the fourth time Acme recognized the bank.", "")
+        old = Chunk(2, "example.com/news-2", "article", "It was the sixth time Acme recognized the bank.", "")
         other = Chunk(3, "example.com/about", "product", "We serve members in three states.", "")
         out = apply_fact([old, other], fact)
         self.assertEqual([c.text for c in out], [win.text, other.text])
@@ -143,13 +194,18 @@ class Rev20(unittest.TestCase):
 
     def test_count_values_also_carry_the_short_noun_and_families_ignore_quantity_words(self):
         from conflicts import _family, _short_count
-        self.assertEqual(_short_count("12 branch office locations"), "12 branches (12 branch office locations)")
-        self.assertEqual(_short_count("600 employees"), "600 employees")
-        self.assertEqual(_family("It has over 600 employees."), _family("It has nearly 700 employees."))
+        self.assertEqual(_short_count("8 office locations"), "8 offices (8 office locations)")
+        self.assertEqual(_short_count("400 members"), "400 members")
+        self.assertEqual(_family("It has over 400 members."), _family("It has nearly 500 members."))
 
     def test_branch_possessive_and_dated_model_years(self):
         self.assertEqual(parse_query("When does the Elm's branch open?").entity, "elm")
-        self.assertEqual(parse_query("What are the lobby hours at Dupaco's Elm Avenue branch?").entity, "elm")
+        from retrieve import use_site_words
+        use_site_words({"example"})                     # a site named "Example" (derived from the crawl at ingest)
+        try:
+            self.assertEqual(parse_query("What are the lobby hours at Example's Elm Avenue branch?").entity, "elm")
+        finally:
+            use_site_words(set())
         q = parse_query("What is the auto loan APR for a 2025 vehicle as of May 15, 2026?")
         self.assertEqual(q.years, {2025})
 
@@ -171,8 +227,96 @@ class Rev20(unittest.TestCase):
         self.assertNotIn(change, parse_query("Is there a fee to update my account information?").tokens)
         self.assertIn(change, parse_query("How do I update my personal information?").tokens)
         self.assertEqual(parse_query("Which APR may 2022 model year cars get for 72 months?").years, {2022})
-        self.assertIsNone(parse_query("What are Dupaco's Saturday branch hours?").entity)
+        from retrieve import use_site_words
+        use_site_words({"example"})
+        try:
+            self.assertIsNone(parse_query("What are Example's Saturday branch hours?").entity)
+        finally:
+            use_site_words(set())
         self.assertEqual(parse_query("Saturday lobby hours at the Elm branch?").entity, "elm")
+
+
+class Rev21(unittest.TestCase):
+    """Rewording robustness and conflict wording (synthetic data only)."""
+
+    def test_hours_and_count_cues(self):
+        self.assertEqual(parse_query("lobby hrs?").attribute, "hours")
+        self.assertEqual(parse_query("When is the drive-up open?").attribute, "hours")
+        self.assertIsNone(parse_query("What time period does the special cover?").attribute)
+        self.assertNotEqual(parse_query("What time does the elm branch close?").attribute, "hours")
+        q = parse_query("Number of branch locations?")
+        self.assertEqual((q.attribute, q.count_noun), ("count", "branch"))
+
+    def test_arm_amounts_frame_words_and_product_synonyms(self):
+        from ingest import Chunk
+        from retrieve import supports
+        q = parse_query("What is the 10/6 ARM rate?")
+        self.assertIn("adjustabl", q.tokens)
+        self.assertEqual(q.raw, "What is the 10/6 ARM rate?")                 # the model sees the member's words
+        self.assertNotIn("adjustabl", parse_query("What is a 5/1 ARM?").tokens)
+        self.assertEqual(parse_query("Rate for a $10k line of credit?").amounts, [10000.0])
+        self.assertNotIn("find", parse_query("Where can I find checking rates?").descriptors)
+        text = "Auto Loans — 60 Months: 5.00% APR"
+        self.assertTrue(supports(Chunk(1, "example.com/rates", "product", text, text), parse_query("What is the car loan rate?")))
+
+    def test_an_ordinal_is_part_of_a_caption(self):
+        md = "1st Choice Savings\n\n| Balance | APY |\n|---|---|\n| $0 - $999 | 0.10% |\n"
+        page = Parser().parse("example.com/rates", "https://example.com/rates", "Rates", md)
+        self.assertIn("1st Choice Savings", next(c for c in page.chunks if c.is_row).index_text)
+
+    def test_other_product_lines_leave_term_questions(self):
+        from types import SimpleNamespace as Row
+        from retrieve import on_other_line, other_lines
+        top = Row(is_row=True, index_text="Share Specials 14 Month Share Special 2.22% APY")
+        lines = other_lines(parse_query("What is the 14-month share special APY?"), top)
+        self.assertIn("jumbo", lines)
+        self.assertTrue(on_other_line(Row(is_row=True, index_text="14 Month Jumbo Share Special 2.32%"), lines))
+        self.assertEqual(other_lines(parse_query("What does the 14-month special pay on $120,000?"), top), set())
+        self.assertNotIn("refinance", other_lines(parse_query("What is the 20-year rate for refinancing?"), top))
+
+    def test_conflict_values_carry_the_sites_wording(self):
+        from conflicts import STREAK_RE, with_phrases
+        self.assertEqual(with_phrases("400 members", ["over 400 members"]), "400 members (over 400 members)")
+        self.assertEqual(with_phrases("seventh", None), "seventh")
+        m = STREAK_RE.search("For a third year in a row, Acme named the bank a top employer.")
+        self.assertEqual((m.group(1), m.group(2)), ("third", "Acme"))
+
+
+class RetryWait(unittest.TestCase):
+    """A rate-limited reply asking for a long wait must not hold an answer past the 60s limit."""
+
+    def _client(self, retry_after: str):
+        try:
+            import httpx2
+            from synth import _new_client
+        except ImportError:                       # no SDK (e.g. Python 3.9): nothing to test
+            self.skipTest("anthropic SDK not installed")
+        calls = []
+
+        def handler(request):
+            calls.append(request)
+            return httpx2.Response(429, headers={"retry-after": retry_after},
+                                   json={"type": "error", "error": {"type": "rate_limit_error", "message": "slow down"}})
+        client = _new_client(api_key="test-key", http_client=httpx2.Client(transport=httpx2.MockTransport(handler)))
+        return client, calls
+
+    def _ask(self, client):
+        import time
+        start = time.monotonic()
+        with self.assertRaises(Exception):
+            client.messages.create(model="claude-haiku-5-5", max_tokens=8,
+                                   messages=[{"role": "user", "content": "hi"}])
+        return time.monotonic() - start
+
+    def test_a_long_retry_after_is_not_waited_out(self):
+        client, calls = self._client("75")
+        self.assertLess(self._ask(client), 3.0)
+        self.assertEqual(len(calls), 2)                 # the one retry still happens, without the wait
+
+    def test_a_short_retry_after_is_still_honoured(self):
+        client, calls = self._client("1")
+        self.assertGreaterEqual(self._ask(client), 0.9)
+        self.assertEqual(len(calls), 2)
 
 
 class Contract(unittest.TestCase):
@@ -190,9 +334,9 @@ class Contract(unittest.TestCase):
         self.assertEqual(_drop_banned("Hours are 9 a.m. to noon. These excerpts disagree."), "Hours are 9 a.m. to noon.")
 
     def test_answers_never_link_to_a_deep_page_missing_from_the_snapshot(self):
-        view = View("05", date(2026, 9, 28), {"dupaco.com/personal/loans/example-loan": None})
-        self.assertEqual(_drop_dead_links("Use dupaco.com/old/retired-page. Or call us.", view), "Or call us.")
-        kept = "See dupaco.com/personal/loans/example-loan. Apply at dupaco.com/offer."   # crawled; vanity
+        view = View("05", date(2026, 9, 28), {"example.org/borrow/sample-loan": None})
+        self.assertEqual(_drop_dead_links("Use example.org/old/retired-page. Or call us.", view), "Or call us.")
+        kept = "See example.org/borrow/sample-loan. Apply at example.org/join."   # crawled; vanity
         self.assertEqual(_drop_dead_links(kept, view), kept)
 
     def test_empty_system_declines_instead_of_raising(self):

@@ -30,7 +30,8 @@ import calendar                        # noqa: E402
 from datetime import date              # noqa: E402
 
 from ingest import KIND_RANK, MONTHS, STATUS_RANK, Chunk, Store, url_key   # noqa: E402
-from retrieve import Index, parse_query, select, tokenize   # noqa: E402
+import retrieve                        # noqa: E402
+from retrieve import Index, parse_query, select, tokenize, use_site_words   # noqa: E402
 from synth import REFUSAL, Synthesizer  # noqa: E402
 
 
@@ -45,6 +46,7 @@ class KnowledgeSystem:
 
     def ingest(self, snapshot: Snapshot) -> None:
         view = self._store.add_snapshot(snapshot)
+        use_site_words(self._store.site_words)      # derived from the crawl; must precede tokenizing
         index = Index(view)
         _facts(index)                  # build per-view lookups now: loading is untimed, answers are
         _page_texts(index)
@@ -54,6 +56,7 @@ class KnowledgeSystem:
         self._cache.clear()
 
     def answer(self, question: str, as_of: str | None = None) -> Answer:
+        _own_site(self._store)
         vi = self._store.view_for(as_of)
         key = (re.sub(r"[^a-z0-9$%.]+", " ", question.lower()).strip(), vi)
         if key not in self._cache:
@@ -66,6 +69,7 @@ class KnowledgeSystem:
         return self._cache[key]
 
     def conflicts(self) -> list[Conflict]:
+        _own_site(self._store)
         if not self._indexes:
             return []
         found = find_conflicts(self._indexes[-1].view)
@@ -74,7 +78,14 @@ class KnowledgeSystem:
                          resolution=str(f["resolution"]), reason=str(f["reason"])) for f in found]
 
 
-MAX_SOURCES = 8     # pages that state the values given; the same press release often has 3 URL variants
+def _own_site(store: Store) -> None:
+    """Read questions with this site's name (derived from its crawl), even if another system in the same
+    process was loaded since."""
+    if retrieve.SITE_WORDS != store.site_words:
+        use_site_words(store.site_words)
+
+
+MAX_SOURCES = 8     # pages that state the values given; the same page is often served under several URL variants
 
 
 def _respond(index: Index | None, synth: Synthesizer, question: str, search: str | None = None) -> Answer:
