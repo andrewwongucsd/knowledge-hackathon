@@ -26,7 +26,10 @@ except ImportError:                    # standalone (tests): find the kit's harn
 from collections import Counter        # noqa: E402
 
 from conflicts import find_conflicts, statement_conflicts   # noqa: E402
-from ingest import KIND_RANK, STATUS_RANK, Chunk, Store, url_key   # noqa: E402
+import calendar                        # noqa: E402
+from datetime import date              # noqa: E402
+
+from ingest import KIND_RANK, MONTHS, STATUS_RANK, Chunk, Store, url_key   # noqa: E402
 from retrieve import Index, parse_query, select, tokenize   # noqa: E402
 from synth import REFUSAL, Synthesizer  # noqa: E402
 
@@ -45,6 +48,8 @@ class KnowledgeSystem:
         index = Index(view)
         _facts(index)                  # build per-view lookups now: loading is untimed, answers are
         _page_texts(index)
+        _glossary(index)
+        _dates_stated(index)
         self._indexes.append(index)
         self._cache.clear()
 
@@ -54,7 +59,10 @@ class KnowledgeSystem:
         if key not in self._cache:
             # vi is None when nothing is ingested or the date is before the first snapshot
             index = self._indexes[vi] if vi is not None else None
-            self._cache[key] = _respond(index, self._synth, question)
+            # A date that only names the snapshot being answered from is not a search word
+            search = strip_temporal(question, lambda d: self._store.view_for(d) == vi,
+                                    _dates_stated(index)) if index else question
+            self._cache[key] = _respond(index, self._synth, question, search)
         return self._cache[key]
 
     def conflicts(self) -> list[Conflict]:
@@ -69,11 +77,11 @@ class KnowledgeSystem:
 MAX_SOURCES = 8     # pages that state the values given; the same press release often has 3 URL variants
 
 
-def _respond(index: Index | None, synth: Synthesizer, question: str) -> Answer:
+def _respond(index: Index | None, synth: Synthesizer, question: str, search: str | None = None) -> Answer:
     if index is None:
         return Answer(text=REFUSAL, confident=False)
     view = index.view
-    q = parse_query(question)
+    q = parse_query(search or question)       # the model still sees the full question
     ev = select(index, q)
     if LINK_Q.search(question):                       # "what link should I use…": the site's own link
         link = pick_link(ev.context or ev.chunks, view, q)
@@ -89,12 +97,17 @@ def _respond(index: Index | None, synth: Synthesizer, question: str) -> Answer:
     text, cited, confident, note = synth.compose(question, q, ev, view)
     if not confident:
         return Answer(text=REFUSAL, confident=False)
+    text, defined_on = gloss(text, _glossary(index))     # a site-defined term -> what the site says it covers
     # Cite the pages actually used, then other evidence pages stating the same values
     # (extra citations cost nothing and the "official" page is often the second copy).
     vals = set(re.findall(r"\d+(?:\.\d+)?\s*%|\$\s?[\d,]+(?:\.\d+)?|\b\d{1,2}(?::\d\d)?\s?[ap]\.m\.|"
                           r"\b\d{3}-\d{3}-\d{4}\b|\b\d{6,}\b", text))   # rates, amounts, times, phones, IDs
     also = [c for c in ev.chunks if c not in cited and vals and any(v in c.text for v in vals)]
     sources, seen = [], set()
+    if defined_on:
+        vp = view.pages[defined_on]
+        sources.append(Source(url=vp.page.url, snapshot_id=vp.snapshot_id))
+        seen.add(defined_on)
     for c in cited + also:
         for key in [c.key] + ev.copies.get(c.id, []):     # identical rows on other pages count too
             vp = view.pages[key]
@@ -112,6 +125,58 @@ def _respond(index: Index | None, synth: Synthesizer, question: str) -> Answer:
         seen.add(key)
         sources.append(Source(url=vp.page.url, snapshot_id=vp.snapshot_id, quote=quote))
     return Answer(text=text, sources=sources, confident=True, conflict_note=note or None)
+
+
+DATE_PHRASE = re.compile(
+    r"\(?\b(?:(?:as of|as at|in|on|during|back in|by|since|before|after)\s+)?"
+    r"((?:%s|sept?|jan|feb|mar|apr|jun|jul|aug|oct|nov|dec)\.?\s+(?:\d{1,2}(?:st|nd|rd|th)?,?\s+)?20\d\d"
+    r"|20\d\d-\d{2}-\d{2}|\d{1,2}/\d{1,2}/20\d\d)\)?" % "|".join(MONTHS), re.I)
+
+
+def _phrase_date(text: str) -> date | None:
+    """'May 2026' (last day of the month), 'May 15, 2026', '2026-05-15' or '5/15/2026'."""
+    t = text.strip().lower()
+    try:
+        if m := re.fullmatch(r"(20\d\d)-(\d{2})-(\d{2})", t):
+            return date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        if m := re.fullmatch(r"(\d{1,2})/(\d{1,2})/(20\d\d)", t):
+            return date(int(m.group(3)), int(m.group(1)), int(m.group(2)))
+        m = re.fullmatch(r"([a-z]+)\.?\s+(?:(\d{1,2})(?:st|nd|rd|th)?,?\s+)?(20\d\d)", t)
+        month = next((n for name, n in MONTHS.items() if m and name.startswith(m.group(1)[:3])), None)
+        if month:
+            year = int(m.group(3))
+            return date(year, month, int(m.group(2)) if m.group(2) else calendar.monthrange(year, month)[1])
+    except ValueError:
+        return None
+    return None
+
+
+_DAY_PRECISE = re.compile(r"\d{1,2}(?:st|nd|rd|th)?,?\s+20|-\d\d-|/")
+
+
+def _dates_stated(index: Index) -> set:
+    """Every date the view's own pages state, as (ISO date, day-precise?). Built once per view at ingest."""
+    st = getattr(index, "_dates", None)
+    if st is None:
+        st = {(d.isoformat(), bool(_DAY_PRECISE.search(m.group(1))))
+              for t in _page_texts(index).values() for m in DATE_PHRASE.finditer(t)
+              if (d := _phrase_date(m.group(1)))}
+        index._dates = st
+    return st
+
+
+def strip_temporal(question: str, same_view, stated=frozenset()) -> str:
+    """Drop date phrases that only point at the snapshot being answered from ('as of September 2026').
+    Dates that are facts in their own right stay as search words: any date the site itself states (a
+    closing date, a deadline, an event), and any date in another snapshot's window."""
+    def drop(m):
+        d = _phrase_date(m.group(1))
+        if not d or not same_view(d.isoformat()):
+            return m.group(0)
+        if (d.isoformat(), bool(_DAY_PRECISE.search(m.group(1)))) in stated:
+            return m.group(0)
+        return " "
+    return re.sub(r"\s{2,}", " ", DATE_PHRASE.sub(drop, question)).strip(" ,")
 
 
 LINK_Q = re.compile(r"\b(link|url|web ?page|website address)\b", re.I)
@@ -161,6 +226,55 @@ def apply_fact(context: list[Chunk], fact: dict) -> list[Chunk]:
     win = fact["_win_chunk"]
     stated = Chunk(-1, win.key, win.kind, fact["_win_sentence"], fact["_win_sentence"], section=win.section)
     return [stated] + kept
+
+
+TERM_DEF = re.compile(r"\b([a-z][a-z’'-]+ [a-z][a-z’'-]+)\s*:\s*-\s", re.I)
+ITEM = re.compile(r"(?:^|\s)-\s*([A-Z][A-Za-z .'’]{1,30}?):\s*(.+?)(?=\s+-\s|$)")
+
+
+def _glossary(index: Index) -> dict:
+    """Terms the site defines as a list ("service area: - Region A: … - Region B: …"), kept only when the
+    identical list appears on at least two live pages and the term has a rare word. term -> (items, page)."""
+    gl = getattr(index, "_gloss", None)
+    if gl is not None:
+        return gl
+    found: dict = {}
+    for key, vp in index.view.pages.items():
+        if vp.status == "missing":
+            continue
+        chunks = vp.page.chunks
+        for j, c in enumerate(chunks):
+            if c.is_row or not (m := TERM_DEF.search(c.text)):
+                continue
+            term = m.group(1).lower()
+            items = ITEM.findall(c.text[m.end() - 2:])
+            for nxt in chunks[j + 1:j + 3]:                    # the list often runs into the next chunks
+                more = ITEM.findall(nxt.text)
+                if not nxt.text.lstrip().startswith("-") or not more:
+                    break
+                items += more
+            items = tuple((n.strip(), v.strip()) for n, v in items)
+            if len(items) >= 2:
+                found.setdefault((term, items), []).append(key)
+    limit = 0.01 * max(1, len(index.chunks))
+    gl = {}
+    for (term, items), keys in found.items():
+        rare = any(len(index.postings.get(t, ())) < limit for t in tokenize(term))
+        if len(set(keys)) >= 2 and rare and term not in gl:
+            best = min(keys, key=lambda k: (KIND_RANK[index.view.pages[k].page.kind], k))
+            gl[term] = (items, best)
+    index._gloss = gl
+    return gl
+
+
+def gloss(text: str, glossary: dict) -> tuple[str, str | None]:
+    """If the answer relies on a site-defined term without saying what it covers, add the site's own
+    definition, verbatim. Returns (text, page key of the definition or None)."""
+    low = text.lower()
+    for term, (items, page) in glossary.items():
+        if term in low and not all(n.lower() in low for n, _ in items):
+            return f"{text} The {term} is: " + "; ".join(f"{n}: {v}" for n, v in items) + ".", page
+    return text, None
 
 
 def _page_texts(index: Index) -> dict:

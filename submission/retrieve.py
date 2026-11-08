@@ -36,8 +36,14 @@ SYNONYMS = {"mortgage": ["home", "loan"], "cd": ["certificate"], "car": ["auto",
             "locator": ["location"],
             # the fee schedule's own words: a cashier's check is an "official check"; abroad is "international"
             "cashier": ["official"], "foreign": ["international"], "overseas": ["international"]}
+# How-to only: members "update" details, the site's policy says "change" or "correct" them. Never for a
+# fee, rate or count question, where these common words would pull in unrelated amounts.
+HOWTO_SYNONYMS = {"update": ["change", "correct"]}
 GENERIC = STOP | {"month", "months", "year", "years", "rate", "rates", "interest", "new", "standard",
                   "annual", "percentage", "fixed"}
+# capitalised words before "branch" that are not a branch's name ("Saturday branch hours")
+BRANCH_NOT_NAMES = {"the", "dupaco", "your", "a", "our", "lobby", "drive-up", "drive", "monday", "tuesday",
+                    "wednesday", "thursday", "friday", "saturday", "sunday"}
 PRODUCT_HEADS = r"loans?|mortgages?|certificates?|cds?|accounts?|cards?|savings|checking|visa|heloc|line"
 
 RATE_Q = re.compile(r"\b(rates?|apr|apy|interest|dividends?|yield)\b", re.I)
@@ -88,6 +94,7 @@ def _stem(w: str) -> str:
 
 
 _SYN = {_stem(k): [_stem(x) for x in v] for k, v in SYNONYMS.items()}
+_HOWTO_SYN = {_stem(k): [_stem(x) for x in v] for k, v in HOWTO_SYNONYMS.items()}
 
 
 def _num_token(t: str) -> str:
@@ -157,7 +164,7 @@ def parse_query(question: str) -> Query:
     q.terms = {(int(n), "year" if u.lower() in ("year", "yr") else "month") for n, u in TERM_RE.findall(low)}
     if re.search(r"model|vehicle|\bcar\b|truck", low):     # model years only, never "as of May 2026"
         q.years = {int(m.group(1)) for m in re.finditer(r"\b((?:19|20)\d\d)\b", norm)
-                   if not re.search(rf"(?:{MONTH_RE})\s*$", norm[:m.start()])}
+                   if not re.search(rf"(?:{MONTH_RE})\s*(?:\d{{1,2}}(?:st|nd|rd|th)?,?\s*)?$", norm[:m.start()])}
     q.amounts = [_f(a) for a in re.findall(r"\$\s?([\d,]+(?:\.\d+)?)", norm)]
     q.qualifiers = {w for w in SOFT_QUALIFIERS if re.search(rf"\b{w}\b", low)}
     if m := COUNT_Q.search(low):
@@ -175,11 +182,14 @@ def parse_query(question: str) -> Query:
     if q.attribute == "fee":            # "reopen within six months": a condition of the fee, not a term
         q.terms = set()
     q.list_intent = bool(LIST_Q.search(question))
+    syn = {**_SYN, **_HOWTO_SYN} if q.attribute in (None, "when") else _SYN
     for t in list(q.tokens):
-        q.tokens += [x for x in _SYN.get(t, []) if x not in q.tokens]
+        q.tokens += [x for x in syn.get(t, []) if x not in q.tokens]
     m = re.search(r"\b((?:[A-Z][\w'’.-]*\s+){0,3}[A-Z][\w'’.-]*)\s+[Bb]ranch\b", question)
     if m:
-        words = [w for w in m.group(1).split() if w.lower() not in ("the", "dupaco", "your", "a")]
+        # "Dupaco's Elm branch": the brand's possessive is not the branch name
+        words = [re.sub(r"['’]s$", "", w) for w in m.group(1).split()]
+        words = [w for w in words if w.strip(".,'’").lower() not in BRANCH_NOT_NAMES]
         q.entity = words[0].strip(".,'’").lower() if words else None
         q.entity_is_branch = q.entity is not None
     if q.attribute in ("rate", "fee"):
@@ -413,7 +423,7 @@ def select(index: Index, q: Query, k: int = 8) -> Evidence:
         q.subject = rare_subject(index, q)
     hits = index.search(q.tokens, top=400)
     if q.attribute == "count" and q.count_noun:
-        # BM25 ranks long boilerplate ("... 650 employees and 22 branch office locations") low for a
+        # BM25 ranks long boilerplate ("... N employees and M branch office locations") low for a
         # one-word query, so scan every chunk containing the counted noun for an actual count.
         pat, have = count_re(q.count_noun), {c.id for _, c in hits}
         hits += [(_bm25_floor(hits), index.chunks[pos]) for pos, _ in index.postings.get(q.count_noun, [])

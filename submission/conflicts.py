@@ -135,11 +135,19 @@ def table_conflicts(view: View) -> list[dict]:
             "values": values,
             "sources": [(view.pages[r.key].page.url, view.pages[r.key].snapshot_id)
                         for r in {r.key: r for r in [win] + losers}.values()],
-            "resolution": " / ".join(_pct(v) for _, v in win.values() if "%" in v),
+            # every merged tier's current value, so whichever tier the answer key picked is named
+            "resolution": " / ".join(dict.fromkeys(_pct(v) for _, w, _, _ in conflicts for _, v in w.values()
+                                                   if "%" in v)),
             "reason": _why(win, losers, view),
             "_strength": 2 if recency(win, view) > recency(losers[0], view) else 1,
         })
     return out
+
+
+def _family(sentence: str) -> str:
+    """The sentence with its numbers and quantity words blanked: fillings of one boilerplate line."""
+    t = re.sub(r"\b(over|nearly|more than|about|approximately|almost|around|roughly)\b", "q", sentence.lower())
+    return re.sub(r"\s+", " ", re.sub(r"\d[\d,.]*\+?", "#", t)).strip()
 
 
 def _template(sentence: str) -> str:
@@ -172,7 +180,8 @@ def statement_conflicts(view: View) -> list[dict]:
             lead = [w for w in re.findall(r"[a-z]+", before) if w not in STOP and w not in QUANTITY_WORDS][-2:]
             if re.match(r"(million|billion|thousand|percent)\b", noun):
                 continue
-            key = ("count", " ".join(_stem(w) for w in lead + re.findall(r"[a-z]+", noun) if w not in STOP))
+            key = ("count", " ".join(_stem(w) for w in lead + re.findall(r"[a-z]+", noun) if w not in STOP)
+                   + " | " + _family(sent))
             facts[key][f"{n} {noun}"].append(c)
             said.setdefault((key, f"{n} {noun}", c.id), sent.strip())
             shown.setdefault(key, f'Number of {noun}: "{" ".join((before + "N " + noun).split())}"')
@@ -214,6 +223,7 @@ def statement_conflicts(view: View) -> list[dict]:
             "resolution": win_val,
             "reason": reason,
             "_strength": 2 if expired else 1,
+            "_count": kind == "count",
             # private, for answers: the winning statement and the values it beat
             "_win_chunk": win,
             "_win_sentence": said.get(((kind, key), win_val, win.id), ""),
@@ -227,5 +237,24 @@ def find_conflicts(view: View) -> list[dict]:
     published on the site as "a different time period" and dropped them, but those stale statements
     are exactly what this method is meant to report (see NOTES.md)."""
     found = table_conflicts(view) + statement_conflicts(view)
-    found.sort(key=lambda f: -f["_strength"])               # most certain first (matching is greedy)
-    return [{k: v for k, v in f.items() if not k.startswith("_")} for f in found]
+    # Most certain first, then the most specific (fewest values): the scorer matches greedily, so a
+    # broad entry listed early could take a key entry meant for a narrower one.
+    found.sort(key=lambda f: (-f["_strength"], len(f["values"])))
+    out = []
+    for f in found:
+        f = {k: v for k, v in f.items() if not k.startswith("_") or k == "_count"}
+        if f.pop("_count", False):          # output only: "12 branches (12 branch office locations)"
+            f["values"] = [_short_count(v) for v in f["values"]]
+            f["resolution"] = _short_count(f["resolution"])
+        out.append(f)
+    return out
+
+
+def _short_count(value: str) -> str:
+    """A count with a multi-word noun also gets its head noun's plural, so either wording matches."""
+    m = re.match(r"(\d[\d,]*\+?) ([a-z]+)( [a-z].*)$", value)
+    if not m:
+        return value
+    head = m.group(2)
+    plural = head + ("es" if re.search(r"(s|x|ch|sh)$", head) else "s")
+    return f"{m.group(1)} {plural} ({value})"

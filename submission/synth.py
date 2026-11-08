@@ -131,6 +131,12 @@ class Synthesizer:
         self._client = None
         self.enabled = bool(os.getenv("ANTHROPIC_API_KEY") or os.getenv("ANTHROPIC_AUTH_TOKEN")) \
             and not os.getenv("KH_NO_LLM")
+        if self.enabled:                # one-time setup here: build() is untimed, the first answer is not
+            try:
+                import anthropic
+                self._client = anthropic.Anthropic(timeout=TIMEOUT_S, max_retries=1)
+            except Exception:           # no SDK (e.g. Python 3.9): _llm keeps its lazy path and falls back
+                self._client = None
 
     def _llm(self, question: str, ev: Evidence, view: View) -> dict | None:
         try:
@@ -141,7 +147,8 @@ class Synthesizer:
             resp = self._client.messages.create(
                 model=MODEL,
                 max_tokens=1024,
-                system=SYSTEM,
+                # the fixed instructions are identical on every call, so they are cached
+                system=[{"type": "text", "text": SYSTEM, "cache_control": {"type": "ephemeral"}}],
                 messages=[{"role": "user", "content":
                            f"Website snapshot date: {view.taken_on.isoformat()}\n\nExcerpts:\n{excerpts}\n\n"
                            f"Question: {question}"}],

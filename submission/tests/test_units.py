@@ -129,6 +129,52 @@ class Edges(unittest.TestCase):
         self.assertEqual([c.text for c in out], [win.text, other.text])
 
 
+class Rev20(unittest.TestCase):
+    """Glossary, conflict output, branch possessives and as-of dates (synthetic data only)."""
+
+    def test_gloss_adds_the_sites_definition_only_when_missing(self):
+        from solution import gloss
+        gl = {"service area": ((("Region A", "Any town"), ("Region B", "North, South")), "example.com/grants")}
+        text, page = gloss("You can join if you live within our service area.", gl)
+        self.assertIn("Region A: Any town; Region B: North, South.", text)
+        self.assertEqual(page, "example.com/grants")
+        same = "Our service area covers Region A and Region B."
+        self.assertEqual(gloss(same, gl), (same, None))
+
+    def test_count_values_also_carry_the_short_noun_and_families_ignore_quantity_words(self):
+        from conflicts import _family, _short_count
+        self.assertEqual(_short_count("12 branch office locations"), "12 branches (12 branch office locations)")
+        self.assertEqual(_short_count("600 employees"), "600 employees")
+        self.assertEqual(_family("It has over 600 employees."), _family("It has nearly 700 employees."))
+
+    def test_branch_possessive_and_dated_model_years(self):
+        self.assertEqual(parse_query("When does the Elm's branch open?").entity, "elm")
+        self.assertEqual(parse_query("What are the lobby hours at Dupaco's Elm Avenue branch?").entity, "elm")
+        q = parse_query("What is the auto loan APR for a 2025 vehicle as of May 15, 2026?")
+        self.assertEqual(q.years, {2025})
+
+    def test_as_of_dates_leave_the_search_but_content_dates_stay(self):
+        from solution import strip_temporal
+        same = lambda d: d >= "2026-09-01"                     # stand-in for "maps to the asked snapshot"
+        self.assertEqual(strip_temporal("What is the APY as of September 2026?", same), "What is the APY ?")
+        for q in ("Did it close on January 15, 2026?", "What happens in July 2026?"):
+            self.assertEqual(strip_temporal(q, same), q)
+        # a deadline the site states stays a search word even when it falls in the answered window
+        stated = {("2026-11-12", True), ("2027-04-30", False)}
+        for q in ("Is it open until Nov. 12, 2026?", "What is due in April 2027?"):
+            self.assertEqual(strip_temporal(q, same, stated), q)
+        self.assertEqual(strip_temporal("What is the APY (October 2026)?", same, stated), "What is the APY ?")
+
+    def test_review_fixes_synonyms_model_years_and_branch_words(self):
+        from retrieve import _stem
+        change = _stem("change")
+        self.assertNotIn(change, parse_query("Is there a fee to update my account information?").tokens)
+        self.assertIn(change, parse_query("How do I update my personal information?").tokens)
+        self.assertEqual(parse_query("Which APR may 2022 model year cars get for 72 months?").years, {2022})
+        self.assertIsNone(parse_query("What are Dupaco's Saturday branch hours?").entity)
+        self.assertEqual(parse_query("Saturday lobby hours at the Elm branch?").entity, "elm")
+
+
 class Contract(unittest.TestCase):
     def test_exactly_the_three_contract_methods(self):
         own = {n for n, v in vars(type(build())).items() if callable(v) and not n.startswith("__")}
