@@ -195,6 +195,7 @@ KIND_EV = re.compile(rf"\b(?:{RATE_KINDS})\b", re.I)
 OFFER_NOUN = re.compile(r"\b(?:specials?|promos?|promotions?)\b"
                         r"(?!\s+(?:intro(?:ductory)?|teaser|rates?|ap[ry]s?|yields?|dividends?|interest)\b)", re.I)
 OFFER_LABEL = re.compile(r"\b(?:specials?|promos?|promotions?)\b", re.I)
+MONEY_MARKET = re.compile(r"\bmoney\s+markets?\b", re.I)
 KIND_RATE_EV = re.compile(rf"\d+(?:\.\d+)?\s*%\s*\d?\s*(?:(?:{RATE_KINDS})\s+)?(?:APR|APY|annual percentage|dividend)|"
                           rf"(?:{RATE_KINDS})\s+(?:\w+\s+){{0,3}}(?:rate|apr|apy)\b[^.]{{0,40}}?\d+(?:\.\d+)?\s*%", re.I)
 NEGATED_QUALIFIER = re.compile(r"\b(?:not|non|excluding|except|other than|besides|without|rather than|instead of)"
@@ -377,6 +378,9 @@ def parse_query(question: str) -> Query:
                 q.descriptors |= {w for w in win if w not in GENERIC and w not in EVALUATIVE and len(w) > 2
                                   and w not in FRAME_WORDS and not re.fullmatch(PRODUCT_HEADS, w)}
                 q.category.add(t)
+    if q.rate_kind and not q.category and MONEY_MARKET.search(low):
+        # an intro or special rate on "the money market": that account is the product asked about
+        q.category, q.descriptors = {"market"}, set(q.descriptors) | {"money"}
     return q
 
 

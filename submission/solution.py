@@ -29,10 +29,10 @@ from conflicts import find_conflicts, statement_conflicts   # noqa: E402
 import calendar                        # noqa: E402
 from datetime import date, timedelta   # noqa: E402
 
-from ingest import KIND_RANK, MONTHS, STATUS_RANK, Chunk, Store, _on_site, url_key   # noqa: E402
+from ingest import KIND_RANK, MONTH_RE, MONTHS, STATUS_RANK, Chunk, Store, _on_site, url_key   # noqa: E402
 import retrieve                        # noqa: E402
-from retrieve import (CHAT_FILLERS, MEMBERSHIP_Q, STOP, Evidence, Index, _stem, parse_query, proper_names,  # noqa: E402
-                      select, tokenize, use_proper_names, use_site_words)
+from retrieve import (CHAT_FILLERS, FRAME_WORDS, GENERIC, MEMBERSHIP_Q, STOP, Evidence, Index, _stem,  # noqa: E402
+                      parse_query, proper_names, select, tokenize, use_proper_names, use_site_words)
 from synth import REFUSAL, Synthesizer  # noqa: E402
 
 
@@ -111,13 +111,19 @@ def _respond(index: Index | None, synth: Synthesizer, question: str, search: str
         return Answer(text=REFUSAL, confident=False)
     view = index.view
     q = parse_query(search or question)       # the model still sees the full question
+    linking = LINK_Q.search(question) is not None
+    joining, _, wanted = joining_info(q) if linking else (False, set(), set())
+    if joining and not wanted and _stem("join") not in q.tokens:
+        q.expansion = q.expansion + [_stem("join")]        # "sign up as a member": the link to join
+        q.tokens = q.tokens + [_stem("join")]
     ev = select(index, q)
-    if LINK_Q.search(question):                       # "what link should I use…": the site's own link
+    if linking:                                       # "what link should I use…": the site's own link
         carried = lambda u: sum(u in t for t in _page_texts(index).values())
         near, wide = ev.context or ev.chunks, [c for _, c in index.search(q.tokens, top=30)]
-        link = pick_link(near, view, q, carried) or pick_link(wide, view, q, carried)
+        joins = _join_chunks(index) if joining else []
+        link = pick_link(near, view, q, carried, joins) or pick_link(wide, view, q, carried, joins)
         if link:
-            vp = link_source(link, near + wide, view)
+            vp = link_source(link, near + wide + joins, view)
             return Answer(text=f"You can find that at {link}.", confident=True,
                           sources=[Source(url=vp.page.url, snapshot_id=vp.snapshot_id)] if vp else [])
     if not ev.chunks or (q.attribute and not ev.supported):
@@ -372,19 +378,128 @@ def strip_temporal(question: str, same_view, stated=frozenset()) -> str:
     return re.sub(r"\s{2,}", " ", DATE_PHRASE.sub(drop, question)).strip(" ,")
 
 
-LINK_Q = re.compile(r"\b(link|url|web ?page|website address)\b", re.I)
+LINK_Q = re.compile(r"\b(link|url|web ?page|website address|web ?address)\b", re.I)
 LINK_RE = re.compile(r"([^()\n]{0,80})\(([a-z0-9.-]+\.[a-z]{2,}(?:/[^)\s]*)?)\)")
 LINK_WORDS = set(tokenize("link url use see find page web webpage website address where visit"))
 MEDIUM_WORDS = set(tokenize("online"))      # how, not what: "join online" asks for the link to join
+# Joining the credit union, in general English. "membership" followed by another noun ("membership meeting",
+# "membership grant") is something else; a member of a kind ("a board member") is not joining either.
+_AFTER_MEMBERSHIP = r"(?=\s*(?:$|[?.!,]|\s+(?:application|form|online|today|now|please|pls|page|site|portal|link|url)\b))"
+JOIN_ACT = re.compile(
+    r"\b(?:(?:apply(?:ing)?|sign(?:ing)?\s+up|register(?:ing)?|enrol+(?:ing)?)\s+(?:for|to)\s+"
+    r"(?:(?:a|an|the|my|\w+['’]s|\w+)\s+)?membership" + _AFTER_MEMBERSHIP +
+    r"|(?:be|become|becoming|sign(?:ing)?\s+up\s+as|register(?:ing)?\s+as|enrol+(?:ing)?\s+as)\s+an?\s+(?:(\w+(?:\s+\w+)?)\s+)?member\b"
+    r"|membership\s+application)", re.I)
+JOIN_BARE = re.compile(r"\bjoin(?:ing)?\b|\bmembership" + _AFTER_MEMBERSHIP, re.I)
+# picking up an application where one left off is continuing it ("complete a new application" is not)
+RESUME = re.compile(r"\b(?:continu\w*|resum\w*|finish\w*|complet\w*\s+(?:my|the|our)\b|pick(?:ing)?\s+"
+                    r"(?:it\s+|this\s+|that\s+)?(?:back\s+)?up|get\s+back\s+to|return\s+to)", re.I)
+JOIN_WORDS = {_stem(w) for w in ("join", "member", "membership", "become")}
+JOIN_ACT_WORDS = JOIN_WORDS | set(tokenize("apply sign up register enrol enroll application"))
+# words that frame a request rather than say what it is about
+FRAME_TALK = set(tokenize("if am so also but didn doesn don isn wasn just then than very really click go send let type enter first "
+                          "lets help used using before after since early late last week end beginning start started "
+                          "middle mid")) | {_stem(w) for w in FRAME_WORDS} | {_stem(w) for w in GENERIC}
+MONTH_WORD = re.compile(rf"^(?:{MONTH_RE})$", re.I)
 FACT_RARE = 0.01        # a question word on under 1% of chunks names the fact asked about
 
 
-def pick_link(context: list[Chunk], view, q, carried=None) -> str | None:
+def joining_info(q) -> tuple[bool, set, set]:
+    """(is the question about joining, the words asked, what else is asked beyond joining). Joining: an action
+    ("apply for membership", "become / sign up as a member", "membership application"), or a bare "join" or
+    "membership" when nothing else is asked. A member of a kind ("a board member") is not joining. "Picking an
+    application back up" asks to continue it."""
+    site = {w.lower() for w in retrieve.SITE_WORDS}
+    phrase, other_member = set(), False
+    for m in JOIN_ACT.finditer(q.raw):
+        phrase |= set(tokenize(m.group(0))) & JOIN_ACT_WORDS
+        if m.group(1) and set(tokenize(m.group(1))) - FRAME_TALK - site:
+            other_member = True
+    subject = set(q.tokens) - LINK_WORDS - CHAT_FILLERS - set(q.expansion)
+    wanted = {w for w in subject - JOIN_WORDS - phrase - MEDIUM_WORDS - FRAME_TALK - site
+              if not w[0].isdigit() and not MONTH_WORD.match(w)}
+    if RESUME.search(q.raw):
+        wanted = (wanted - set(tokenize(" ".join(m.group(0) for m in RESUME.finditer(q.raw))))) | {_stem("continue")}
+    joining = not other_member and (bool(phrase) or (JOIN_BARE.search(q.raw) is not None and not wanted))
+    return joining, subject, wanted
+
+
+def _join_chunks(index: Index) -> list:
+    """The chunks of the site's own pages about joining: live, non-article pages whose title (the site's name
+    aside) is only joining words, such as "Join" or "Membership". Built once per view."""
+    chunks = getattr(index, "_join_chunks", None)
+    if chunks is None:
+        site = {w.lower() for w in retrieve.SITE_WORDS}
+        chunks = []
+        for key, vp in sorted(index.view.pages.items()):
+            title = set(tokenize(vp.page.title or "")) - site
+            if vp.status != "missing" and vp.page.kind != "article" and title and title <= JOIN_WORDS:
+                chunks += vp.page.chunks
+        index._join_chunks = chunks
+    return chunks
+
+
+def _clause(text: str) -> str:
+    """A link's own words: the last clause of the text before it."""
+    return re.split(r"[.!?;:—–|]|\s{2,}|\\\\", text)[-1]
+
+
+def pick_link(context: list[Chunk], view, q, carried=None, joins=()) -> str | None:
+    """The site's own link for what was asked (see _pick_any). A question about joining the credit union also
+    reads the site's pages about joining, and prefers, in order: a link whose own words name more of what else
+    was asked ("Continue my application" for picking one back up), an application portal given by a page about
+    joining, then the usual order. When something else was asked and no link names it, the usual pick stands."""
+    joining, subject, wanted = joining_info(q)
+    if not joining:
+        return _pick_any(context, view, q, carried)
+    join_keys = {c.key for c in joins}
+    hosts = {k.split("/", 1)[0] for k in view.pages}
+    site = {w.lower() for w in retrieve.SITE_WORDS}
+    asked = set(q.tokens) | JOIN_WORDS | wanted
+    pages: dict = {}
+    portals, given_by_join_page, exact, named = set(), set(), set(), {}
+    for c in list(context) + list(joins):
+        for m in LINK_RE.finditer(c.text):
+            link, anchor = m.group(2).rstrip("/"), set(tokenize(m.group(1)))
+            own = set(tokenize(_clause(m.group(1))))
+            vp = view.pages.get(url_key(link))
+            if vp is None:
+                carrier = view.pages.get(c.key)
+                if (link.split("/", 1)[0] in hosts or not _on_site(link, hosts) or carrier is None
+                        or carrier.status == "missing" or carrier.page.kind == "article"
+                        or _stem("join") not in set(tokenize(link)) or not own & (JOIN_WORDS | wanted)):
+                    continue
+                portals.add(link)
+                if c.key in join_keys:
+                    given_by_join_page.add(link)
+            elif vp.status == "missing" or vp.page.kind == "article" or (vp.page.kind == "calculator"
+                                                                         and not _asks_calculator(q)):
+                continue
+            if anchor & (subject | JOIN_WORDS | wanted):
+                pages.setdefault(link, set()).add(c.key)
+                if own - site and own - site <= asked:
+                    exact.add(link)
+                named[link] = max(named.get(link, 0), len(own & wanted))
+    if not pages:
+        return _pick_any(context, view, q, carried)
+    def weight(u):
+        return 0 if not carried else carried(f"({u})") if u in portals else carried(u)
+    best = max(pages, key=lambda u: (named[u], u in given_by_join_page, len(pages[u]), u in exact, weight(u)))
+    if wanted and (named[best] == 0 or (best not in given_by_join_page and named[best] < len(wanted))):
+        return _pick_any(context, view, q, carried)
+    return best
+
+
+def _asks_calculator(q) -> bool:
+    return any(t.startswith("calcul") for t in q.tokens)
+
+
+def _pick_any(context: list[Chunk], view, q, carried=None) -> str | None:
     """The link the site's own text gives for what was asked: the link whose anchor text shares a word with
     the question, given by the most pages of the evidence (then carried by the most pages of the site), whose
     page is live in this snapshot and is not an article (a "which page" question wants the product or tool
     page, not a blog post). Dead or retired links (pages the crawl never found, or that left it) can't be
-    picked.
+    picked, and neither can a calculator unless one was asked for.
 
     A link to one of the site's own hosts that the crawl never fetched (an application portal such as
     join.<site>) can't be checked against a page, so it needs more: a live, non-article page gives it, its
@@ -414,7 +529,8 @@ def pick_link(context: list[Chunk], view, q, carried=None) -> str | None:
                 portals.add(link)
                 if joining and addr & set(tokenize(f"{carrier.page.title or ''} {c.key.split('/', 1)[-1]}")):
                     given_by_own_page.add(link)
-            elif vp.status == "missing" or vp.page.kind == "article":
+            elif vp.status == "missing" or vp.page.kind == "article" or (vp.page.kind == "calculator"
+                                                                         and not _asks_calculator(q)):
                 continue
             if anchor & subject:
                 pages.setdefault(link, set()).add(c.key)

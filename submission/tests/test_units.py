@@ -857,6 +857,69 @@ class Rev32(unittest.TestCase):
             self.assertNotIn("3.15", a.text, q)
 
 
+class Rev33(unittest.TestCase):
+    """Joining link questions, calculators, "web address", money market (synthetic data only)."""
+
+    def test_what_counts_as_joining(self):
+        from solution import joining_info
+        for q in ("What's the link to join?", "link to apply for membership", "URL to become a member?",
+                  "Give me the link to sign up as a new member", "membership application link?",
+                  "I'd like to register as a new member online. What link do I use?"):
+            joining, _, wanted = joining_info(parse_query(q))
+            self.assertTrue(joining, q)
+            self.assertEqual(wanted, set(), q)
+        for q in ("What is the link to become a board member?", "What's the link for the annual membership meeting?",
+                  "link to join the savings challenge", "membership login link", "member services link"):
+            self.assertFalse(joining_info(parse_query(q))[0], q)
+        joining, _, wanted = joining_info(parse_query(
+            "I started my membership application but didn't finish; what link do I use to pick it back up?"))
+        self.assertTrue(joining)
+        self.assertEqual(wanted, {_stem("continue")})
+
+    def _view(self):
+        from types import SimpleNamespace as NS
+        page = lambda key, kind, title: NS(status="fresh", snapshot_id="s1",
+                                           page=NS(kind=kind, key=key, url="https://" + key, title=title))
+        return NS(pages={"example.org/join": page("example.org/join", "product", "Join"),
+                         "example.org/grow-lp": page("example.org/grow-lp", "promo", "Grow your savings"),
+                         "example.org/branches": page("example.org/branches", "product", "Branches"),
+                         "example.org/loans": page("example.org/loans", "product", "Loans"),
+                         "example.org/calculators/loan-payment": page("example.org/calculators/loan-payment",
+                                                                      "calculator", "Payment calculator")})
+
+    def test_a_joining_question_reads_the_join_page(self):
+        from ingest import Chunk
+        from solution import link_source, pick_link
+        ch = lambda i, key, text: Chunk(i, key, "product", text, text)
+        joins = [ch(1, "example.org/join", "Become a member (join.example.org). Continue my application "
+                                            "(join.example.org/login).")]
+        promo = [ch(2, "example.org/grow-lp", "Join online (join.example.org/grow). Join in person (example.org/branches).")]
+        widely = lambda u: 50 if "branches" in u else 3
+        view = self._view()
+        q = parse_query("What's the link to join online?")
+        self.assertEqual(pick_link(promo, view, q, widely, joins), "join.example.org")
+        self.assertEqual(link_source("join.example.org", promo + joins, view).page.key, "example.org/join")
+        resume = parse_query("I started a membership application but didn't finish it; what link picks it back up?")
+        self.assertEqual(pick_link(promo, view, resume, widely, joins), "join.example.org/login")
+
+    def test_a_calculator_is_not_the_link_unless_asked_for(self):
+        from ingest import Chunk
+        from solution import LINK_Q, pick_link
+        text = "Loan payment calculator (example.org/calculators/loan-payment). Make a loan payment (example.org/loans)."
+        ctx = [Chunk(1, "example.org/loans", "product", text, text)]
+        view = self._view()
+        self.assertEqual(pick_link(ctx, view, parse_query("What's the link to make a loan payment?")), "example.org/loans")
+        self.assertEqual(pick_link(ctx, view, parse_query("link to the loan payment calculator")),
+                         "example.org/calculators/loan-payment")
+        self.assertIsNotNone(LINK_Q.search("What's the web address for online banking?"))
+
+    def test_money_market_names_the_product_of_an_intro_question(self):
+        q = parse_query("What's the intro rate on the money market special?")
+        self.assertEqual(q.category, {"market"})
+        self.assertIn("money", q.descriptors)
+        self.assertEqual(parse_query("What are the money market rates?").category, set())
+
+
 class Contract(unittest.TestCase):
     def test_exactly_the_three_contract_methods(self):
         own = {n for n, v in vars(type(build())).items() if callable(v) and not n.startswith("__")}
