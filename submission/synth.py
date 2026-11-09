@@ -11,9 +11,11 @@ from __future__ import annotations
 import json
 import os
 import re
+from datetime import date
 
 from ingest import Chunk, View, url_key
-from retrieve import Evidence, Query, on_other_line, other_lines, qualify, supports, tokenize
+from retrieve import (SOFT_QUALIFIERS, Evidence, Query, _asked, names_line, on_other_line, other_lines, qualify,
+                      supports, terms_in, tokenize)
 
 REFUSAL = "That isn't listed on our website, so I can't confirm it. Please contact us and we can help."
 # The prompt calls the context "excerpts"; a sentence that talks about them instead of the site is dropped.
@@ -138,22 +140,104 @@ def extractive(q: Query, ev: Evidence, view: View) -> tuple[str, list[Chunk]]:
                       and c.table_span == top.table_span and c.id not in hidden and supports(c, q)
                       and qualify(c, q)[0] != "mismatch" and not on_other_line(c, lines)]
         rows = [top] + same_table[:3]
-        own = f"{top.label()} {top.section}".lower()
-        if q.category and not any(re.search(rf"\b{re.escape(w)}\b", own) for w in q.category):
+        if q.category and not _names(top, q.category):
             # The top row matched a value shared with a different product than the one the question
-            # names ("savings"): also give the named product's own row from the evidence, the plainest
-            # (shortest) name first, so a value coincidence can't crowd out the product asked about.
-            named = [c for c in ev.chunks if c.is_row and c not in rows
-                     and any(re.search(rf"\b{re.escape(w)}\b", f"{c.label()} {c.section}".lower()) for w in q.category)]
-            if named:
-                rows = rows + [min(named, key=lambda c: len(f"{c.label()} {c.section}"))]
+            # names ("savings"): also give the named product's own row from the evidence, so a value
+            # coincidence can't crowd out the product asked about.
+            own = named_row(q, ev, rows)
+            if own:
+                rows = rows + [own]
         return " ".join(render_row(r) + "." for r in rows), rows
     return best_sentence(top, q), [top]
+
+
+def _mentions(text: str, words) -> bool:
+    """Any of the words, singular or plural ("loan" names "Auto Loans")."""
+    return any(re.search(rf"\b{re.escape(w[:-1] if w.endswith('s') and not w.endswith('ss') else w)}s?\b", text)
+               for w in words)
+
+
+def _line_words(q: Query) -> set:
+    """"Account" is every product's head word, so it names the line only when nothing more specific does."""
+    return (q.category - {"account", "accounts"}) or q.category
+
+
+def _names(c: Chunk, words) -> bool:
+    return _mentions(f"{c.label()} {c.section}".lower(), words)
+
+
+def _line_rows(q: Query, ev: Evidence, exclude=()) -> list[Chunk]:
+    """Evidence rows of the product line the question names that also fit what it asked (descriptor,
+    term, tier): never another product's row."""
+    words = _line_words(q)
+    return [c for c in ev.chunks if c.is_row and c not in exclude and _names(c, words)
+            and supports(c, q) and qualify(c, q)[0] != "mismatch"]
+
+
+def named_row(q: Query, ev: Evidence, exclude=()) -> Chunk | None:
+    """The plainest (shortest-named) such row. A row whose own name says it comes first: a page heading
+    like "Deposit Rates" covers every product on the page."""
+    named = _line_rows(q, ev, exclude)
+    by_name = [c for c in named if _mentions(c.label().lower(), _line_words(q))]
+    return min(by_name or named, key=lambda c: len(f"{c.label()} {c.section}")) if named else None
+
+
+QUOTED_PCT = re.compile(r"\d+(?:\.\d+)?\s*(?:%|percent\b|apy\b|apr\b)", re.I)
+
+
+def named_row_guard(question: str, q: Query, ev: Evidence, text: str) -> tuple[str, Chunk | None]:
+    """A member who quotes a value for a named product ("does savings pay 1.23%?") gets that product's
+    own value too, even when the value they quote belongs to another product's table."""
+    if not (q.category and QUOTED_PCT.search(question)):
+        return text, None
+    own = named_row(q, ev)
+    if own is None:
+        return text, None
+    head = lambda c: c.label().split(" | ")[0]
+    same = [c for c in ev.chunks if c.is_row and c.key == own.key and c.table_span == own.table_span
+            and head(c) == head(own)] or [own]
+    if {n for c in same for _, v in c.values() if "%" in v for n in numbers(v)} & numbers(text):
+        return text, None                      # the answer already gives that product's own value
+    return f"{text.rstrip()} {render_row(own)}.", own
+
+
+COMPARE_Q = re.compile(r"\b(compar\w*|vs\.?|versus|differ\w*|chang\w*|better|higher|lower|than|which is|should i)\b", re.I)
+SECOND_ASK = re.compile(r"\b(?:and|also|plus)\s+(?:what|when|how|is|are|does|do|the\s+\d)", re.I)
+
+
+def clear_cut(question: str, q: Query, ev: Evidence) -> bool:
+    """A rate question whose pinned term, model year or amount picks out exactly the top evidence row:
+    that row is the answer, so it is given verbatim with no model call (faster, cheaper, and the same
+    text for every wording). Lists, comparisons, changes and rows of an unasked product line still go
+    to the model."""
+    if q.attribute != "rate" or not (q.terms or q.years) or q.list_intent or COMPARE_Q.search(question) \
+            or SECOND_ASK.search(question) or len({w.rstrip("s") for w in _line_words(q)}) > 1:
+        return False
+    pool = [c for c in ev.chunks if supports(c, q)]
+    if not pool or not pool[0].is_row or qualify(pool[0], q)[0] != "match":
+        return False
+    top, low = pool[0], pool[0].index_text.lower()
+    if q.terms and not q.terms <= terms_in(low):              # every asked term is on that row
+        return False
+    if q.category and not (_names(top, _line_words(q)) or names_line(f"{top.label()} {top.section}".lower(), q)):
+        return False                                          # the row belongs to the product asked about
+    return not any(re.search(rf"\b{w}\b", low) for w in SOFT_QUALIFIERS if not _asked(w, q))
+
+
+# After a transport failure (no route, timeout, rate limit, overload) the next questions skip the model
+# instead of each waiting out the same failure; then one call probes again, on a short timeout and with
+# no retry, so a dead network costs one slow answer, not one per probe. A rejected key stops the model.
+COOLDOWN = {"APITimeoutError": 10, "APIConnectionError": 10, "RequestTimeoutError": 10, "GatewayTimeoutError": 10,
+            "RateLimitError": 3, "InternalServerError": 3, "OverloadedError": 3, "ServiceUnavailableError": 3,
+            "AuthenticationError": 10**9, "PermissionDeniedError": 10**9}
+PROBE_TIMEOUT_S = 2.5
 
 
 class Synthesizer:
     def __init__(self):
         self._client = None
+        self._cooldown = 0
+        self._probe = False             # the last call failed in transport: the next one is a probe
         self.enabled = bool(os.getenv("ANTHROPIC_API_KEY") or os.getenv("ANTHROPIC_AUTH_TOKEN")) \
             and not os.getenv("KH_NO_LLM")
         if self.enabled:                # one-time setup here: build() is untimed, the first answer is not
@@ -162,34 +246,46 @@ class Synthesizer:
             except Exception:           # no SDK (e.g. Python 3.9): _llm keeps its lazy path and falls back
                 self._client = None
 
-    def _llm(self, question: str, ev: Evidence, view: View) -> dict | None:
+    def _llm(self, question: str, ev: Evidence, view: View, asked: date | None = None) -> dict | None:
         try:
             if self._client is None:                   # lazy: a missing package must not break build()
                 self._client = _new_client()
             excerpts = "\n\n".join(f"[{i}] ({describe(c, view)})\n{c.text}" for i, c in enumerate(_llm_chunks(ev), 1))
-            resp = self._client.messages.create(
+            # A dated question is answered from the site as it stood that day, i.e. the newest crawl
+            # on or before it; showing the crawl's own (earlier) day reads as "can't confirm".
+            when = asked if asked and asked > view.taken_on else view.taken_on
+            client = self._client
+            if self._probe and hasattr(client, "with_options"):
+                client = client.with_options(timeout=PROBE_TIMEOUT_S, max_retries=0)
+            resp = client.messages.create(
                 model=MODEL,
                 max_tokens=1024,
                 # the fixed instructions are identical on every call, so they are cached
                 system=[{"type": "text", "text": SYSTEM, "cache_control": {"type": "ephemeral"}}],
                 messages=[{"role": "user", "content":
-                           f"Website snapshot date: {view.taken_on.isoformat()}\n\nExcerpts:\n{excerpts}\n\n"
+                           f"Website snapshot date: {when.isoformat()}\n\nExcerpts:\n{excerpts}\n\n"
                            f"Question: {question}"}],
                 output_config={"effort": "low", "format": {"type": "json_schema", "schema": SCHEMA}},
                 **_thinking_off(MODEL),
             )
+            self._probe = False
             if resp.stop_reason == "refusal":
                 return None
             text = next((b.text for b in resp.content if b.type == "text"), "")
             return json.loads(text)
-        except Exception:
+        except Exception as e:
+            self._cooldown = next((COOLDOWN[k.__name__] for k in type(e).__mro__ if k.__name__ in COOLDOWN), 0)
+            self._probe = self._cooldown > 0
             return None
 
-    def compose(self, question: str, q: Query, ev: Evidence, view: View) -> tuple[str, list[Chunk], bool, str]:
+    def compose(self, question: str, q: Query, ev: Evidence, view: View,
+                asked: date | None = None) -> tuple[str, list[Chunk], bool, str]:
         """Returns (text, cited chunks, confident, note)."""
         note = _stale_note(ev, view)
-        if self.enabled:
-            out = self._llm(question, ev, view)
+        cooling = self._cooldown > 0
+        self._cooldown = max(0, self._cooldown - 1)
+        if self.enabled and not cooling and not clear_cut(question, q, ev):
+            out = self._llm(question, ev, view, asked)
             if out is not None:
                 if not out.get("answerable", False):
                     return REFUSAL, [], False, note
@@ -199,8 +295,9 @@ class Synthesizer:
                 if text and numbers(text) <= allowed:
                     ids = [i for i in out.get("evidence_ids", []) if isinstance(i, int) and 1 <= i <= len(shown)]
                     cited = [shown[i - 1] for i in ids] or ev.chunks[:1]
+                    text, own = named_row_guard(question, q, ev, text)
                     llm_note = str(out.get("note") or "").strip()
-                    return text, cited, True, "; ".join(x for x in (llm_note, note) if x)
+                    return text, cited + ([own] if own else []), True, "; ".join(x for x in (llm_note, note) if x)
         text, cited = extractive(q, ev, view)
         return text, cited, text != REFUSAL, note
 

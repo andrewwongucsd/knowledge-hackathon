@@ -120,9 +120,8 @@ def table_conflicts(view: View) -> list[dict]:
                 conflicts.append((newest_year, win, losers, cl))
         if not conflicts:
             continue
-        if any(y for y, *_ in conflicts):            # model-year tables: report the current models only
-            top = max(y for y, *_ in conflicts)
-            conflicts = [c for c in conflicts if c[0] == top]
+        # Every model-year cluster of the term stays in its one entry (a stale calculator often still
+        # shows older model years too); the newest model years' winner leads.
         win = conflicts[0][1]
         losers = [x for _, _, ls, _ in conflicts for x in ls]
         values = sorted({_pct(v) for _, _, _, cl in conflicts for r in cl for _, v in r.values() if "%" in v},
@@ -269,7 +268,18 @@ def find_conflicts(view: View) -> list[dict]:
         f["values"] += [s for s in streaks if s.split()[0] not in phrases]         # "third (For a third year in a row, ...)"
         f["resolution"] = with_phrases(short(f["resolution"]), phrases.get(f["resolution"]))
         out.append(f)
-    return out
+    # The same stale copy behind two product lines (purchase and refinance tables) is one contradiction:
+    # one entry, both topics, so whichever wording a reader uses finds it.
+    merged: dict = {}
+    for f in out:
+        k = (tuple(f["values"]), f["resolution"])
+        if k in merged:
+            m = merged[k]
+            m["topic"] = f"{m['topic']}; {f['topic']}"
+            m["sources"] += [s for s in f["sources"] if s not in m["sources"]]
+        else:
+            merged[k] = f
+    return list(merged.values())
 
 
 def with_phrases(value: str, phrases) -> str:

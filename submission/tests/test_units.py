@@ -127,6 +127,10 @@ class Guardrails(unittest.TestCase):
                     if (w[0].isupper() and len(w) >= 4 and w.lower() not in lower_words | self.EXEMPT
                             and not any(part in self.CALENDAR for part in re.split(r"[-–]", w.lower()))):
                         banned.setdefault(w.lower(), "practice proper name")
+        for t in texts:                                  # dollar amounts the practice set states (tier bounds)
+            for amt in re.findall(r"\d{1,3}(?:,\d{3})+(?:\.\d\d)?|\d+\.\d\d(?=\b)(?!%)", t):
+                if "," in amt and not amt.endswith(",000"):     # tier bounds like 9,999.99; round sums are generic
+                    banned.setdefault(amt, "practice amount")
         snaps = sorted((ROOT / "snapshots").glob("0*/manifest.json"))
         if snaps:                                        # the site's identity, derived the same way ingest does
             pages = json.loads(snaps[-1].read_text())["pages"]
@@ -134,6 +138,27 @@ class Guardrails(unittest.TestCase):
                                                     for p in pages])
             for x in domains | words | ({suffix} if suffix else set()):
                 banned[x.lower()] = "site identity"
+            # the site's own wording: multi-word headings, and counted things its boilerplate repeats
+            from collections import Counter
+            heads, counts = Counter(), Counter()
+            units = {"month", "months", "year", "years", "day", "days", "hour", "hours", "min", "minute", "minutes",
+                     "percent", "mo", "yr", "yrs", "am", "pm", "points", "point", "times", "time"}
+            for p in pages:
+                f = snaps[-1].parent / p.get("file", "")
+                md = f.read_text(errors="ignore") if p.get("file") and f.exists() else ""
+                for h in re.findall(r"^#{1,4}\s+(.+?)\s*$", md, re.M):
+                    w = re.findall(r"[a-z][a-z'’-]+", h.lower())
+                    if len(w) >= 3 and sum(x not in _BASE_STOP for x in w) >= 3:
+                        heads[" ".join(w)] += 1
+                for n, noun in set(re.findall(r"\b(\d[\d,]*)\+?\s+([a-z]+)\b", md.lower())):
+                    if noun not in units and noun not in _BASE_STOP and int(n.replace(",", "") or 0) > 1:
+                        counts[f"{n} {noun}"] += 1
+            for h in heads:
+                if h not in ("annual percentage rate", "annual percentage yield"):    # regulatory terms, every bank's
+                    banned.setdefault(h, "site heading")
+            for c, k in counts.items():
+                if k >= 5:
+                    banned.setdefault(c, "site boilerplate count")
         return banned
 
     def test_no_practice_or_site_knowledge_in_our_files(self):
@@ -317,6 +342,237 @@ class RetryWait(unittest.TestCase):
         client, calls = self._client("1")
         self.assertGreaterEqual(self._ask(client), 0.9)
         self.assertEqual(len(calls), 2)
+
+
+class Rev23(unittest.TestCase):
+    """Dates a question names, and the date the model is told (synthetic snapshots and values)."""
+
+    @staticmethod
+    def _store(*days):
+        from types import SimpleNamespace as NS
+        return NS(views=[NS(taken_on=d) for d in days])
+
+    def test_a_moment_the_question_names_selects_the_site_as_it_stood_then(self):
+        from solution import date_asked
+        st = self._store(date(2030, 1, 10), date(2030, 3, 1), date(2030, 6, 15))
+        for q, want in [("What was the savings APY in February 2030?", "2030-02-28"),
+                        ("As of 1/20/2030, what is the savings APY?", "2030-01-20"),
+                        ("Back in March 2030, what did checking pay?", "2030-03-31"),
+                        ("As of August 2030, what was the APY?", None),          # after the newest crawl
+                        ("What was the APY on 2030-01-10?", "2030-01-10"),
+                        ("What was the APY in December 2029?", None),            # before the first crawl
+                        ("What is the APY in February 2030?", None),             # present tense, soft frame
+                        ("Is the APY still the same as of February 2030?", "2030-02-28"),
+                        ("What was the current APY as of February 2030?", "2030-02-28"),
+                        ("What was the savings APY today (February 2030)?", None),
+                        ("How has the APY moved since February 2030?", None),
+                        ("What was the APY between January 2030 and March 2030?", None),
+                        # the frame is read from the words before the date, with qualifiers
+                        ("What was the APY before March 2030?", "2030-02-28"),
+                        ("What was the APY prior to March 2030?", "2030-02-28"),
+                        ("What was the APY up until March 2030?", "2030-02-28"),
+                        ("What was the APY before the March 3, 2030 change?", "2030-03-02"),
+                        ("What was the APY in mid-February 2030?", "2030-02-15"),
+                        ("What was the APY in early March 2030?", "2030-03-01"),
+                        ("What is the APY as of the end of February 2030?", "2030-02-28"),
+                        ("What is the APY as of last month (February 2030)?", "2030-02-28"),
+                        ("What was the APY on 15 February 2030?", "2030-02-15"),
+                        ("Back on Feb. 20, 2030, what did savings pay?", "2030-02-20"),
+                        ("As at 2/20/2030, what APY did balances of $1,000 to $9,999.99 earn?", "2030-02-20"),
+                        # a change, an article or event: the newest crawl records it
+                        ("What did the APY change to on February 20, 2030?", None),
+                        ("What was the APY effective February 20, 2030?", None),
+                        ("What new APY took effect on February 20, 2030?", None),
+                        ("What did the February 20, 2030 blog post say about savings?", None),
+                        ("What was the news story on February 20, 2030 about?", None),
+                        # a date in a side remark of a present-tense question
+                        ("I opened an account in February 2030. What APY does it pay?", None),
+                        ("My account was opened on Feb. 20, 2030; what APY do new accounts earn?", None),
+                        ("What is the APY? I saw a lower rate in February 2030.", None),
+                        ("I opened an account on February 20, 2030. What APY did I get?", "2030-02-20")]:
+            self.assertEqual(date_asked(q, st), want, q)
+        self.assertIsNone(date_asked("What was the APY in February 2030?", self._store(date(2030, 1, 10))))
+        late = self._store(date(2030, 1, 15), date(2030, 3, 1), date(2030, 6, 15))
+        self.assertEqual(date_asked("What was the APY in early January 2030?", late), "2030-01-15")   # nearest crawl
+        self.assertIsNone(date_asked("What was the APY on January 2, 2030?", late))                  # a day before it
+
+    def test_an_article_published_after_the_pinned_crawl_is_read_from_the_newest(self):
+        from contract import Page, Snapshot
+        rates = "# Savings\n\n| Account | APY |\n|---|---|\n| Basic Savings | {a} |\n"
+        tips = "March 5, 2030\n\n# How to spot a fake caller\n\nHang up and call the number on your card instead.\n"
+        ks = build()
+        ks.ingest(Snapshot("s1", "2030-01-10", [Page("https://example.org/savings", "Savings | Example",
+                                                     rates.format(a="1.10%"), "2030-01-10T09:00:00Z")]))
+        ks.ingest(Snapshot("s2", "2030-06-15", [
+            Page("https://example.org/savings", "Savings | Example", rates.format(a="1.40%"), "2030-06-15T09:00:00Z"),
+            Page("https://example.org/blog/fake-caller", "How to spot a fake caller | Example", tips,
+                 "2030-06-15T09:00:00Z")]))
+        from solution import moment_asked
+        tip = "What tips did you share in March 2030 about a fake caller?"
+        self.assertIsNone(moment_asked(tip, ks._store, ks._indexes))          # the article is only in the newest
+        self.assertEqual(ks.answer(tip).sources[0].snapshot_id, "s2")
+        self.assertEqual(moment_asked("What was the Basic Savings APY in March 2030?", ks._store, ks._indexes),
+                         "2030-03-31")
+        self.assertIn("1.10%", ks.answer("What was the Basic Savings APY in March 2030?").text)
+
+    def test_the_model_is_told_the_day_asked_never_an_earlier_one(self):
+        from types import SimpleNamespace as NS
+        from ingest import Chunk
+        from synth import Synthesizer
+        c = Chunk(1, "example.org/rates", "product", "Basic Savings APY 1.10%.", "")
+        view = NS(taken_on=date(2030, 3, 1), pages={"example.org/rates": NS(
+            page=NS(url="https://example.org/rates", kind="product", publish=None), status="fresh",
+            fetched=date(2030, 3, 1))})
+        sent = []
+
+        class Fake:
+            class messages:
+                @staticmethod
+                def create(**k):
+                    sent.append(k["messages"][0]["content"])
+                    raise RuntimeError("offline")
+        s = Synthesizer()
+        s._client = Fake()
+        for asked, shown in [(date(2030, 3, 20), "2030-03-20"), (None, "2030-03-01"), (date(2030, 2, 1), "2030-03-01")]:
+            self.assertIsNone(s._llm("What is the APY?", NS(context=[c], chunks=[c]), view, asked))
+            self.assertTrue(sent[-1].startswith(f"Website snapshot date: {shown}\n"), sent[-1][:40])
+
+    def test_text_dates_and_as_of_answer_from_the_same_snapshot(self):
+        from contract import Page, Snapshot
+        md = "# Savings\n\n| Account | Dividend Rate | APY |\n|---|---|---|\n| Basic Savings | {r} | {a} |\n"
+        ks = build()
+        for sid, day, r, a in [("s1", "2030-01-10", "1.05%", "1.10%"), ("s2", "2030-06-15", "1.35%", "1.40%")]:
+            ks.ingest(Snapshot(sid, day, [Page("https://example.org/savings", "Savings | Example",
+                                               md.format(r=r, a=a), f"{day}T09:00:00Z")]))
+        self.assertIn("1.40%", ks.answer("What is the Basic Savings APY?").text)
+        for q, as_of in [("What was the Basic Savings APY in March 2030?", None),
+                         ("What was the Basic Savings APY?", "2030-03-01")]:
+            text = ks.answer(q, as_of).text
+            self.assertIn("1.10%", text, q)
+            self.assertNotIn("1.40%", text, q)
+
+    def test_the_answer_cache_is_per_day_shown_to_the_model(self):
+        from contract import Page, Snapshot
+        ks = build()
+        for sid, day in [("s1", "2030-01-10"), ("s2", "2030-06-15")]:
+            ks.ingest(Snapshot(sid, day, [Page("https://example.org/savings", "Savings | Example",
+                                               "# Savings\n\nBasic Savings pays 1.10% APY.\n", f"{day}T09:00:00Z")]))
+        seen = []
+        ks._synth.compose = lambda question, q, ev, view, asked=None: (seen.append(asked), ("ok", [], True, ""))[1]
+        ks._synth.enabled = True
+        for as_of in ("2030-02-01", "2030-03-01", "2030-02-01"):
+            ks.answer("What was the Basic Savings APY?", as_of)
+        self.assertEqual(seen, [date(2030, 2, 1), date(2030, 3, 1)])     # one call per day, repeats cached
+
+
+class Rev23b(unittest.TestCase):
+    """Recall, answer guards, the clear-cut path and the breaker (synthetic data only)."""
+
+    def test_year_terms_are_month_terms_and_negated_lines_are_not_asked(self):
+        from retrieve import LIST_Q, terms_in
+        self.assertEqual(terms_in("a 5-year loan"), terms_in("60 Months"))
+        self.assertEqual(parse_query("What is the 3 year loan rate?").terms, {(36, "month")})
+        q = parse_query("What is the 12-month certificate APY (the regular one, not the jumbo)?")
+        self.assertEqual(q.qualifiers, set())
+        self.assertNotIn("jumbo", q.tokens)
+        self.assertEqual(parse_query("What is the non-jumbo 12-month APY?").qualifiers, set())
+        self.assertEqual(parse_query("What is the jumbo 12-month APY?").qualifiers, {"jumbo"})
+        self.assertTrue(LIST_Q.search("List your credit card rates"))
+        self.assertTrue(parse_query("What are my options for auto loans?").list_intent)
+        self.assertFalse(parse_query("Weighing my options: what is the 12-month certificate APY?").list_intent)
+
+    def test_fact_guard_adds_the_winner_and_never_keeps_a_beaten_value(self):
+        from ingest import Chunk
+        from solution import fact_guard
+        win = Chunk(7, "example.org/news-3", "article", "This was the seventh time Acme recognized the bank.", "")
+        fact = {"resolution": "seventh", "_losers": ["sixth"], "_win_sentence": win.text, "_win_chunk": win}
+        self.assertEqual(fact_guard("Acme named it a top lender.", fact),
+                         ("Acme named it a top lender. " + win.text, win))
+        self.assertEqual(fact_guard("It was the sixth time Acme recognized it.", fact), (win.text, win))
+        self.assertEqual(fact_guard("The seventh time, says Acme.", fact), ("The seventh time, says Acme.", None))
+
+    def test_older_editions_of_the_winning_article_leave_the_evidence(self):
+        from types import SimpleNamespace as NS
+        from ingest import Chunk
+        from solution import apply_fact
+        def page(title, day):
+            return NS(page=NS(title=title, kind="article", publish=date(*day)))
+        view = NS(pages={"example.org/award-3": page("Acme Names the Bank a Top Lender", (2030, 6, 1)),
+                         "example.org/award": page("Acme names the bank a top lender", (2028, 6, 1)),
+                         "example.org/other": page("Branch news", (2027, 1, 1))})
+        win = Chunk(1, "example.org/award-3", "article", "This was the seventh time Acme named the bank.", "")
+        old = Chunk(2, "example.org/award", "article", "Acme ranked the bank in its 2028 list.", "")
+        other = Chunk(3, "example.org/other", "article", "A new branch opened.", "")
+        fact = {"_losers": ["sixth"], "_win_chunk": win, "_win_sentence": win.text}
+        self.assertEqual([c.key for c in apply_fact([old, other], fact, view)], ["example.org/award-3", "example.org/other"])
+        self.assertEqual(len(apply_fact([old, other], fact)), 3)          # no view: only beaten values leave
+
+    def test_a_quoted_value_gets_the_named_products_own_row(self):
+        from types import SimpleNamespace as NS
+        from ingest import Chunk
+        from synth import named_row_guard
+        def row(i, name, apy, section):
+            return Chunk(i, "example.org/rates", "product", f"{name} {apy}", f"{name} {apy}", section=section,
+                         is_row=True, header=["Account", "APY"], cells=[name, apy], value_cols=[1])
+        other = row(1, "Health Savings Account", "0.47%", "Rates · Health Savings Account")
+        plain = row(2, "Basic Savings", "0.13%", "Rates · Basic Savings")
+        cert = row(3, "9 Month Certificate", "2.07%", "Deposit Rates · Certificates")
+        ev = NS(chunks=[other, cert, plain])
+        q = parse_query("Do any savings tiers pay 0.47% APY?")
+        text, own = named_row_guard("Do any savings tiers pay 0.47% APY?", q, ev, "Yes, the HSA pays 0.47% APY.")
+        self.assertIs(own, plain)
+        self.assertIn("0.13%", text)
+        self.assertEqual(named_row_guard("Does savings pay 0.47%?", q, ev, "Basic Savings pays 0.13%.")[1], None)
+        self.assertEqual(named_row_guard("What does savings pay?", q, ev, "It pays 0.47%.")[1], None)   # no value quoted
+
+    def _system(self, client):
+        from contract import Page, Snapshot
+        md = ("# Certificates\n\n| Term | Dividend Rate | APY |\n|---|---|---|\n| 6 Month | 1.87% | 1.91% |\n"
+              "| 12 Month | 2.37% | 2.41% |\n\nWe offer certificates for every goal.\n")
+        ks = build()
+        for sid, day in [("s1", "2030-01-10"), ("s2", "2030-06-15")]:
+            ks.ingest(Snapshot(sid, day, [Page("https://example.org/certificates", "Certificates | Example", md,
+                                               f"{day}T09:00:00Z")]))
+        ks._synth.enabled, ks._synth._client = True, client
+        return ks
+
+    def test_a_clear_cut_rate_question_needs_no_model_call(self):
+        calls = []
+
+        class Fake:
+            class messages:
+                @staticmethod
+                def create(**k):
+                    calls.append(k)
+                    raise RuntimeError("offline")
+        ks = self._system(Fake())
+        a = ks.answer("What is the 12-month certificate APY?")
+        self.assertIn("2.41%", a.text)
+        self.assertNotIn("1.91%", a.text)
+        self.assertEqual(calls, [])
+        ks.answer("Which is better, the 6-month or the 12-month certificate?")     # a comparison goes to the model
+        self.assertEqual(len(calls), 1)
+
+    def test_a_network_failure_pauses_the_model_then_probes_again(self):
+        import time
+
+        class APIConnectionError(Exception):
+            pass
+        calls = []
+
+        class Down:
+            class messages:
+                @staticmethod
+                def create(**k):
+                    calls.append(k)
+                    raise APIConnectionError("no route")
+        ks = self._system(Down())
+        start = time.monotonic()
+        for n in range(12):
+            ks._cache.clear()
+            ks.answer(f"What certificates do you offer for goal {n}?")
+        self.assertLess(time.monotonic() - start, 3.0)
+        self.assertEqual(len(calls), 2)                  # the first call, then one probe after 10 skipped
 
 
 class Contract(unittest.TestCase):

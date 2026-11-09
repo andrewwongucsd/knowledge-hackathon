@@ -27,7 +27,7 @@ from collections import Counter        # noqa: E402
 
 from conflicts import find_conflicts, statement_conflicts   # noqa: E402
 import calendar                        # noqa: E402
-from datetime import date              # noqa: E402
+from datetime import date, timedelta   # noqa: E402
 
 from ingest import KIND_RANK, MONTHS, STATUS_RANK, Chunk, Store, url_key   # noqa: E402
 import retrieve                        # noqa: E402
@@ -57,15 +57,18 @@ class KnowledgeSystem:
 
     def answer(self, question: str, as_of: str | None = None) -> Answer:
         _own_site(self._store)
-        vi = self._store.view_for(as_of)
-        key = (re.sub(r"[^a-z0-9$%.]+", " ", question.lower()).strip(), vi)
+        asked = as_of or moment_asked(question, self._store, self._indexes)   # or the moment it names
+        vi = self._store.view_for(asked)
+        day = _iso(asked)                       # the day the model is told, when later than the crawl
+        shown = day if vi is not None and day and day > self._store.views[vi].taken_on else None
+        key = (re.sub(r"[^a-z0-9$%.]+", " ", question.lower()).strip(), vi, shown)
         if key not in self._cache:
             # vi is None when nothing is ingested or the date is before the first snapshot
             index = self._indexes[vi] if vi is not None else None
             # A date that only names the snapshot being answered from is not a search word
             search = strip_temporal(question, lambda d: self._store.view_for(d) == vi,
                                     _dates_stated(index)) if index else question
-            self._cache[key] = _respond(index, self._synth, question, search)
+            self._cache[key] = _respond(index, self._synth, question, search, _iso(asked))
         return self._cache[key]
 
     def conflicts(self) -> list[Conflict]:
@@ -88,7 +91,8 @@ def _own_site(store: Store) -> None:
 MAX_SOURCES = 8     # pages that state the values given; the same page is often served under several URL variants
 
 
-def _respond(index: Index | None, synth: Synthesizer, question: str, search: str | None = None) -> Answer:
+def _respond(index: Index | None, synth: Synthesizer, question: str, search: str | None = None,
+             asked: date | None = None) -> Answer:
     if index is None:
         return Answer(text=REFUSAL, confident=False)
     view = index.view
@@ -104,10 +108,14 @@ def _respond(index: Index | None, synth: Synthesizer, question: str, search: str
         return Answer(text=REFUSAL, confident=False)
     fact = match_fact(_facts(index), q, index)
     if fact:
-        ev.context = apply_fact(ev.context or ev.chunks, fact)
-    text, cited, confident, note = synth.compose(question, q, ev, view)
+        ev.context = apply_fact(ev.context or ev.chunks, fact, view)
+    text, cited, confident, note = synth.compose(question, q, ev, view, asked)
     if not confident:
         return Answer(text=REFUSAL, confident=False)
+    if fact:
+        text, stated = fact_guard(text, fact)
+        if stated is not None:
+            cited = [stated] + [c for c in cited if c.id != stated.id]
     text, defined_on = gloss(text, _glossary(index))     # a site-defined term -> what the site says it covers
     # Cite the pages actually used, then other evidence pages stating the same values
     # (extra citations cost nothing and the "official" page is often the second copy).
@@ -176,6 +184,108 @@ def _dates_stated(index: Index) -> set:
     return st
 
 
+# A date written in the question picks the snapshot only when it names a moment to read the site at.
+# The frame is read from the words just before the date, the tense from the clause that asks.
+FRAME_RE = re.compile(r"\b(as of|as at|back in|back on|prior to|up until|until|till|before|since|after|by|"
+                      r"from|between|and|to|in|on|during|for|at)\b", re.I)
+PIN_FRAMES = {"as of", "as at", "back in", "back on"}           # the site as it stood then
+BEFORE_FRAMES = {"prior to", "up until", "until", "till", "before"}   # the day before
+BLOCK_FRAMES = {"since", "after", "by", "from", "between", "and", "to"}   # a span or a change, not a moment
+QUALIFIER_RE = re.compile(r"\b(mid|middle|early|start|beginning|late|end)\b", re.I)
+AUX_RE = re.compile(r"\b(used to|is|are|was|were|does|do|did|has|have|had|can|could|will|would|should)\b|"
+                    r"\b(?:what|who|where|when|how|which|that|it|there|here)['’]s\b", re.I)
+PAST_AUX = {"was", "were", "did", "had", "used to"}
+NOW_Q = re.compile(r"\b(now|today|currently|presently|nowadays|anymore|any longer|these days)\b", re.I)
+# A question about a change, or about an article or event, is answered from the newest crawl, which
+# records the change or the article; the date then says when it happened, not when to read the site.
+CHANGE_Q = re.compile(r"\b(chang\w*|rise[sn]?|rising|rose|raise[ds]?|increas\w*|decreas\w*|drop\w*|fell|fall\w*|"
+                      r"lowered|cut|jump\w*|climb\w*|(?:went|go|goes|gone) (?:up|down)|effective|"
+                      r"(?:took|take[ns]?|went into) effect|set (?:on|at|to)|updated?|adjust\w*)\b", re.I)
+EVENT_Q = re.compile(r"\b(posts?|posted|articles?|blogs?|story|stories|news\w*|press|releases?|released|"
+                     r"announc\w*|reports?|reported|publish\w*|episodes?|podcasts?|videos?|webinars?|"
+                     r"seminars?|events?|meetings?)\b", re.I)
+CLAUSE_END = re.compile(r"(?<=[;!?])\s+|(?<=[a-z0-9%)\]][.])\s+(?=[A-Z])")   # never inside 9,999.99 or Sept. 1
+
+
+def date_asked(question: str, store: Store) -> str | None:
+    """When no date is passed, a single moment the question itself names inside the crawl window
+    ("as of May 2026", "what was it on 5/15/2026", "before June 2026") selects the site as it stood then.
+    "As of / back in" always pin; "in / on / during" pin only in a past-tense question that is not about a
+    change or an article or event. Not for questions about now, spans ("since", "between"), dates outside
+    the window, or a date in a side remark of a present-tense question."""
+    q = question.strip()
+    if len(store.views) < 2 or NOW_Q.search(q):
+        return None
+    cuts = [0] + [m.end() for m in CLAUSE_END.finditer(q)] + [len(q)]
+    spans = list(zip(cuts, cuts[1:]))
+    ask = next((s for s in reversed(spans) if "?" in q[s[0]:s[1]]), spans[-1])
+    aux = AUX_RE.search(q[ask[0]:ask[1]])
+    past = bool(aux and aux.group(1) and aux.group(1).lower() in PAST_AUX)
+    found = set()
+    for m in DATE_PHRASE.finditer(q):
+        d = _phrase_date(m.group(1))
+        if d is None:
+            continue
+        before = q[:m.start(1)]
+        tail = " ".join(before.split()[-5:])
+        frames = list(FRAME_RE.finditer(tail))
+        frame = " ".join(frames[-1].group(1).lower().split()) if frames else ""
+        if frame in BLOCK_FRAMES or not (ask[0] <= m.start(1) < ask[1] or past):
+            return None
+        precise = bool(_DAY_PRECISE.search(m.group(1)))
+        if frame not in PIN_FRAMES | BEFORE_FRAMES and (not past or CHANGE_Q.search(q) or EVENT_Q.search(q)):
+            return None
+        if not precise:                          # "mid-May", "early June", "15 May 2026"
+            day = re.search(r"\b(\d{1,2})(?:st|nd|rd|th)?\s*$", before)
+            qual = {w.lower() for w in QUALIFIER_RE.findall(tail[frames[-1].end():] if frames else tail)}
+            if day and 1 <= int(day.group(1)) <= d.day:
+                d = d.replace(day=int(day.group(1)))
+            elif qual & {"mid", "middle"}:
+                d = d.replace(day=15)
+            elif qual & {"early", "start", "beginning"}:
+                d = d.replace(day=1)
+            elif frame in BEFORE_FRAMES:
+                d = d.replace(day=1)
+        if frame in BEFORE_FRAMES:
+            d = d - timedelta(days=1)
+        found.add((d, precise))
+    if len({d for d, _ in found}) != 1:
+        return None
+    d, precise = found.pop()
+    first, last = store.views[0].taken_on, store.views[-1].taken_on
+    if not precise and d < first and (d.year, d.month) == (first.year, first.month):
+        d = first                       # "early May" when the first crawl is mid-May: the nearest reading
+    return d.isoformat() if first <= d < last else None
+
+
+def moment_asked(question: str, store: Store, indexes: list) -> str | None:
+    """date_asked, unless what the question is about is an article the older snapshot doesn't have yet:
+    the newest crawl's top evidence is a page published after that snapshot and by the date named."""
+    d = date_asked(question, store)
+    vi = store.view_for(d) if d else None
+    if vi is None or vi == len(store.views) - 1 or not indexes:
+        return d
+    newest = indexes[-1]
+    ev = select(newest, parse_query(question))
+    if not ev.chunks:
+        return d
+    asked = date.fromisoformat(d)
+    pages = [newest.view.pages[k].page for k in dict.fromkeys(c.key for c in ev.chunks)][:5]
+    # the best evidence (the top three pages when it is prose, not a rate or fee row)
+    best = pages[:1] if ev.chunks[0].is_row else pages[:3]
+    since = store.views[vi].taken_on
+    if any(p.publish and since < p.publish <= asked for p in best) or any(p.publish == asked for p in pages):
+        return None                     # ... or the question names the day one of those articles came out
+    return d
+
+
+def _iso(value: str | None) -> date | None:
+    try:
+        return date.fromisoformat(str(value)[:10]) if value else None
+    except ValueError:
+        return None
+
+
 def strip_temporal(question: str, same_view, stated=frozenset()) -> str:
     """Drop date phrases that only point at the snapshot being answered from ('as of September 2026').
     Dates that are facts in their own right stay as search words: any date the site itself states (a
@@ -224,17 +334,64 @@ def match_fact(facts: list[dict], q, index: Index) -> dict | None:
     limit = FACT_RARE * max(1, len(index.chunks))
     best = None
     for f in facts:
+        # a count is the fact asked about only when the question counts that same thing
+        if re.match(r"\s*\d", f.get("resolution", "")) and not (
+                q.attribute == "count" and q.count_noun and q.count_noun in set(tokenize(f["topic"]))):
+            continue
         rare = [t for t in set(q.tokens) & set(tokenize(f["topic"])) if len(index.postings.get(t, ())) < limit]
         if rare and (best is None or len(rare) > best[0]):
             best = (len(rare), f)
     return best[1] if best else None
 
 
-def apply_fact(context: list[Chunk], fact: dict) -> list[Chunk]:
-    """The winning statement goes first; evidence repeating a value it beat is removed (rule 5)."""
-    beaten = [re.compile(rf"\b{re.escape(v)}\b", re.I) for v in fact["_losers"]]
+def _fact_token(value: str) -> str:
+    m = re.match(r"\s*([\d,]+|[a-z]+)", value.lower())          # "12 branches" -> 12, "third" -> third
+    return m.group(1) if m else ""
+
+
+def _beaten(fact: dict) -> list:
+    """Patterns for the values a repeated statement beat: a count with its noun ("9 offices", "9 office
+    locations", never "9-month"), an ordinal, and the "Nth year in a row" claims it outranks."""
+    pats = []
+    for v in fact["_losers"]:
+        m = re.match(r"\s*([\d,]+)\+?\s+([a-z]+)", v.lower())
+        pats.append(rf"\b{re.escape(m.group(1))}\+?\s+(?:[\w’'-]+\s+){{0,2}}{re.escape(m.group(2)[:5])}" if m
+                    else rf"\b{re.escape(v)}\b")
+    for s in fact.get("_streaks", ()):
+        if m := re.search(r"\b\w+\s+(?:years?\s+in\s+a\s+row|consecutive\s+years?|straight\s+years?)", s, re.I):
+            pats.append(rf"\b{re.escape(m.group(0))}\b")
+    return [re.compile(p, re.I) for p in pats]
+
+
+def fact_guard(text: str, fact: dict) -> tuple[str, Chunk | None]:
+    """A repeated statement the question asks about: its newest value must reach the answer, and a value
+    it beat must not (rule 5). Returns the text and the chunk stating the winner, if it was added."""
+    sentence = fact["_win_sentence"]
+    if any(p.search(text) for p in _beaten(fact)):
+        return sentence, fact["_win_chunk"]
+    win = _fact_token(fact["resolution"])
+    if not win or re.search(rf"\b{re.escape(win)}\b", text, re.I):
+        return text, None
+    return f"{text.rstrip()} {sentence}", fact["_win_chunk"]
+
+
+def apply_fact(context: list[Chunk], fact: dict, view=None) -> list[Chunk]:
+    """The winning statement goes first; evidence repeating a value it beat is removed (rule 5), and so is
+    every older edition of the article that states the winner (a yearly press release re-posted under the
+    same title): its figures are the ones the newer edition replaced."""
+    beaten = _beaten(fact)
     kept = [c for c in context if not any(p.search(c.text) for p in beaten)]
     win = fact["_win_chunk"]
+    if view is not None and win.key in view.pages:
+        wp = view.pages[win.key].page
+        title = " ".join(re.findall(r"\w+", (wp.title or "").lower()))
+
+        def older_edition(c):
+            p = view.pages[c.key].page if c.key in view.pages else None
+            return (p is not None and c.key != win.key and p.kind == "article" and title
+                    and " ".join(re.findall(r"\w+", (p.title or "").lower())) == title
+                    and p.publish and wp.publish and p.publish < wp.publish)
+        kept = [c for c in kept if not older_edition(c)]
     stated = Chunk(-1, win.key, win.kind, fact["_win_sentence"], fact["_win_sentence"], section=win.section)
     return [stated] + kept
 

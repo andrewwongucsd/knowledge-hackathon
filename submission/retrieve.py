@@ -68,9 +68,11 @@ def use_site_words(words) -> None:
     COUNT_CUE = re.compile(rf"(?:^|\bthe\s+|\btotal\s+)number of\s+{opt}([a-z-]+)", re.I)
     who, does = (f"you|{alt}", f"do you|does (?:{alt})") if alt else ("you", "do you")
     LIST_Q = re.compile(rf"\bwhat (?:\w+ ){{0,3}}do (?:{who}) (?:offer|have)\b|"
-                        rf"\bwhich (?:\w+ ){{0,3}}(?:{does}) offer\b|\bwhat (?:kinds|types) of\b", re.I)
+                        rf"\bwhich (?:\w+ ){{0,3}}(?:{does}) offer\b|\bwhat (?:kinds|types) of\b|{LIST_ASK}", re.I)
 
 
+LIST_ASK = r"^\s*(?:please\s+)?(?:list|show me all)\b"     # "list your card rates"
+OPTIONS_Q = re.compile(r"\boptions\b", re.I)
 PRODUCT_HEADS = r"loans?|mortgages?|certificates?|cds?|accounts?|cards?|savings|checking|visa|mastercard|discover|amex|heloc|line"
 
 RATE_Q = re.compile(r"\b(rates?|apr|apy|interest|dividends?|yield)\b", re.I)
@@ -90,7 +92,7 @@ FRAME_WORDS = {"find", "get", "see", "use", "earn", "pay", "need", "open", "appl
 COUNT_CUE = re.compile(r"(?:^|\bthe\s+|\btotal\s+)number of\s+([a-z-]+)", re.I)
 WHEN_Q = re.compile(r"^\s*when\b|what date|\bby when\b", re.I)
 LIST_Q = re.compile(r"\bwhat (?:\w+ ){0,3}do (?:you) (?:offer|have)\b|"
-                    r"\bwhich (?:\w+ ){0,3}(?:do you) offer\b|\bwhat (?:kinds|types) of\b", re.I)
+                    r"\bwhich (?:\w+ ){0,3}(?:do you) offer\b|\bwhat (?:kinds|types) of\b|" + LIST_ASK, re.I)
 RATE_EV = re.compile(r"\d+(?:\.\d+)?\s*%\s*(?:APR|APY|annual percentage|fixed|variable|interest|dividend)|"
                      r"(?:APR|APY|rate of|rates? (?:as low as|start(?:ing)? at|from)|dividend rate)\s*(?:is|of|:)?\s*"
                      r"\d+(?:\.\d+)?\s*%", re.I)
@@ -101,12 +103,38 @@ DATE_EV = re.compile(rf"\b(?:{MONTH_RE})\s+\d{{1,2}},\s+20\d\d\b")
 FEE_EV = re.compile(r"\$\s?\d")
 HOURS_EV = re.compile(r"\b\d{1,2}(?::\d{2})?\s*[ap]\.?\s?m\b|\bnoon\b", re.I)
 TERM_RE = re.compile(r"\b(\d{1,3})\s*-?\s*(month|mo|year|yr)s?\b", re.I)
+
+
+def terms_in(text: str) -> set:
+    """Loan and deposit terms, in months: a "5-year" loan is the "60 Months" row."""
+    return {(int(n) * (12 if u.lower() in ("year", "yr") else 1), "month") for n, u in TERM_RE.findall(text)}
+
+
+def native_terms(text: str) -> set:
+    return {(int(n), "year" if u.lower() in ("year", "yr") else "month") for n, u in TERM_RE.findall(text)}
+
+
+# Head words every product line shares: they never say which line a row belongs to.
+GENERIC_HEADS = {"loan", "loans", "account", "accounts", "card", "cards", "line", "home"}
+LINE_PHRASES = {"mortgage": ("home loan",)}        # standard banking usage: a mortgage is a home loan
+
+
+def names_line(low: str, q) -> bool:
+    """Does this (lower-case) text name the product line the question asks about: one of its descriptor
+    words, or a specific product word ("certificate" for a CD)? A term converted from years to months
+    counts only on such a row, so a "5-year CD" never matches an auto loan's 60-month row."""
+    words = {w for w in set(q.descriptors) | q.category if w not in GENERIC_HEADS}
+    words |= {s for w in list(words) for s in SYNONYMS.get(w, ()) if s not in GENERIC_HEADS}
+    words |= {p for w in q.category for p in LINE_PHRASES.get(w.rstrip("s"), ())}
+    return any(re.search(rf"\b{re.escape(w.rstrip('s'))}s?\b", low) for w in words)
 YEAR_RANGE_RE = re.compile(r"\b((?:19|20)\d\d)\s*[-–]\s*(\d{2}(?:\d{2})?)\b(?!-)")
 AND_OLDER_RE = re.compile(r"\b((?:19|20)\d\d)\s+(?:model\s+years?\s*)?\(?\s*(?:and|or|&)\s+(?:older|earlier|prior|before)\b\)?", re.I)
 AMT_RANGE_RE = re.compile(r"\$\s?([\d,]+(?:\.\d+)?)\s*[-–]\s*\$?\s?([\d,]+(?:\.\d+)?)")
 AMT_PLUS_RE = re.compile(r"\$\s?([\d,]+(?:\.\d+)?)\s*(?:\+|and (?:up|above|over))", re.I)
 AMT_LESS_RE = re.compile(r"\$\s?([\d,]+(?:\.\d+)?)\s+or less", re.I)
 SOFT_QUALIFIERS = ("jumbo", "business", "traditional", "roth", "ira", "refinance", "hsa", "health")
+NEGATED_QUALIFIER = re.compile(r"\b(?:not|non|excluding|except|other than|besides|without|rather than|instead of)"
+                               r"[\s-]+(?:(?:the|a|an|any)\s+)?(%s)\b" % "|".join(SOFT_QUALIFIERS), re.I)
 
 
 def normalize_numbers(text: str) -> str:
@@ -190,6 +218,9 @@ class Query:
     category: set = field(default_factory=set)       # the product-line word itself, e.g. {"savings"}
     list_intent: bool = False                        # "what cards do you offer": show every product line
     subject: list = field(default_factory=list)      # rare question words a fee/count answer must contain
+    native_terms: set = field(default_factory=set)   # terms in the question's own unit, {(5, 'year')}
+    excluded: set = field(default_factory=set)       # lines the question rules out ("not the jumbo")
+    text: str = ""                                   # the question without the lines it rules out
 
     @property
     def numbers(self) -> set:
@@ -200,10 +231,14 @@ def parse_query(question: str) -> Query:
     raw = question                       # the model still sees the member's own words
     if RATE_Q.search(question) and ARM_RE.search(question):
         question = ARM_RE.sub("adjustable-rate mortgage", question)
+    excluded = {m.group(1).lower() for m in NEGATED_QUALIFIER.finditer(question)}
+    question = NEGATED_QUALIFIER.sub(" ", question)     # "not the jumbo": the standard product is asked about
     norm = normalize_numbers(question)
     low = norm.lower()
     q = Query(raw, tokenize(question))
-    q.terms = {(int(n), "year" if u.lower() in ("year", "yr") else "month") for n, u in TERM_RE.findall(low)}
+    q.text, q.excluded = question, excluded
+    q.terms = terms_in(low)
+    q.native_terms = native_terms(low)
     if re.search(r"model|vehicle|\bcar\b|truck", low):     # model years only, never "as of May 2026"
         q.years = {int(m.group(1)) for m in re.finditer(r"\b((?:19|20)\d\d)\b", norm)
                    if not re.search(rf"(?:{MONTH_RE})\s*(?:\d{{1,2}}(?:st|nd|rd|th)?,?\s*)?$", norm[:m.start()])}
@@ -222,8 +257,10 @@ def parse_query(question: str) -> Query:
     elif ADDRESS_Q.search(low):
         q.attribute = "address"
     if q.attribute == "fee":            # "within 90 days of opening": a condition of the fee, not a term
-        q.terms = set()
-    q.list_intent = bool(LIST_Q.search(question))
+        q.terms, q.native_terms = set(), set()
+    # "what are my options": a list, unless a term or model year already pins one row
+    q.list_intent = bool(LIST_Q.search(question)) or (OPTIONS_Q.search(question) is not None
+                                                      and not (q.terms or q.years))
     syn = {**_SYN, **_HOWTO_SYN} if q.attribute in (None, "when") else _SYN
     for t in list(q.tokens):
         q.tokens += [x for x in syn.get(t, []) if x not in q.tokens]
@@ -264,11 +301,11 @@ def qualify(c: Chunk, q: Query) -> tuple[str, float]:
     low = text.lower()
     factor, matched = 1.0, False
     if q.terms:
-        have = {(int(n), "year" if u.lower() in ("year", "yr") else "month") for n, u in TERM_RE.findall(low)}
-        units = {u for _, u in q.terms}
-        same_unit = {t for t in have if t[1] in units}
-        if same_unit:
-            if q.terms & same_unit:
+        units = {u for _, u in q.native_terms}
+        same_unit = {t for t in native_terms(low) if t[1] in units}
+        converted = terms_in(low) if names_line(low, q) else set()
+        if same_unit or converted:
+            if q.native_terms & same_unit or q.terms & converted:
                 factor, matched = factor * 1.6, True
             elif c.is_row:
                 return "mismatch", 0.0
@@ -313,10 +350,9 @@ def supports(c: Chunk, q: Query) -> bool:
             return False
     if q.terms:                         # some line must be about the asked term, not just "a term"
         lines = c.text.split("\n") if not c.is_row else [c.index_text]
+        named = names_line(text, q)
         def has_term(s):
-            found = {(int(n), "year" if u.lower() in ("year", "yr") else "month")
-                     for n, u in TERM_RE.findall(s.lower())}
-            return bool(found & q.terms)
+            return bool(native_terms(s.lower()) & q.native_terms) or (named and bool(terms_in(s.lower()) & q.terms))
         if not any(has_term(s) for s in lines):
             return False
     if q.attribute == "rate":           # published rates live in rate tables or product pages,
@@ -485,6 +521,8 @@ def select(index: Index, q: Query, k: int = 8) -> Evidence:
     for s, c in hits:
         if c.expired_on and c.expired_on < view.taken_on:
             continue
+        if c.is_row and q.excluded and any(re.search(rf"\b{w}\b", f"{c.label()} {c.section}".lower()) for w in q.excluded):
+            continue                    # a line the question rules out
         status, factor = qualify(c, q)
         if status == "mismatch":
             continue
@@ -560,6 +598,16 @@ def select(index: Index, q: Query, k: int = 8) -> Evidence:
         chosen.append(c)
         if len(chosen) >= k:
             break
+    if q.attribute and not any(supports(c, q) for c in chosen):
+        # Nothing in the top k states what was asked: look further down the whole search before declining.
+        gone = {c.id for _, c in dropped}
+        deeper = [c for _, c in hits if c.id not in gone and supports(c, q) and qualify(c, q)[0] != "mismatch"
+                  and not (c.expired_on and c.expired_on < view.taken_on)
+                  and (not q.category or any(_stem(w) in c.tf for w in q.category))   # of the line asked about
+                  and not (c.is_row and any(re.search(rf"\b{w}\b", f"{c.label()} {c.section}".lower())
+                                            for w in q.excluded))]
+        if deeper:
+            chosen = list({c.id: c for c in reversed(deeper)}.values())[::-1][:k]
     lines = other_lines(q, next((c for c in chosen if c.is_row and supports(c, q)), None))
     chosen = [c for c in chosen if not on_other_line(c, lines)]
     supported = any(supports(c, q) for c in chosen) if q.attribute else bool(chosen)
@@ -571,7 +619,7 @@ def select(index: Index, q: Query, k: int = 8) -> Evidence:
 
 
 def _asked(w: str, q: Query) -> bool:
-    low = q.raw.lower()                 # "refinancing", "IRAs" and "refi" ask for that line too
+    low = (q.text or q.raw).lower()     # "refinancing", "IRAs" and "refi" ask for that line too
     return (w in q.qualifiers or re.search(rf"\b{re.escape(_stem(w))}", low) is not None
             or (w == "refinance" and re.search(r"\brefi\b", low) is not None))
 
