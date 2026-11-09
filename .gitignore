@@ -4,6 +4,3 @@ __pycache__/
 .DS_Store
 .env
 snapshots/0*/
-# Supplied website data and assignment PDF: kept locally, never committed
-snapshots_zip/
-Knowledge-Hackathon-Assignment.pdf

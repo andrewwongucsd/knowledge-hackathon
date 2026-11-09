@@ -33,11 +33,15 @@ currently now right today know like want need would there's many much have has h
 # General banking synonyms: members say "mortgage", rate tables usually say "home loans".
 SYNONYMS = {"mortgage": ["home", "loan"], "cd": ["certificate"], "car": ["auto", "vehicle"],
             "vehicle": ["auto"], "heloc": ["home", "equity", "line"],
-            # standard equivalents: a cashier's check is an "official check"; abroad is "international"
+            # standard US banking equivalents: a cashier's check is also called an official check; a wire abroad is international
             "cashier": ["official"], "foreign": ["international"], "overseas": ["international"]}
-# How-to only: members "update" details, privacy policies say "change" or "correct" them. Never for a
-# fee, rate or count question, where these common words would pull in unrelated amounts.
-HOWTO_SYNONYMS = {"update": ["change", "correct"]}
+# How-to only: the verbs for editing something are interchangeable ("update", "change", "edit" ...). Never
+# for a fee, rate or count question, where these common words would pull in unrelated amounts.
+EDIT_VERBS = ("update", "change", "edit", "modify", "correct", "amend")
+HOWTO_SYNONYMS = {v: [w for w in EDIT_VERBS if w != v] for v in EDIT_VERBS}
+# Standard written abbreviations ("my email info", "acct no."): read as the full word.
+ABBREVIATIONS = {"info": "information", "acct": "account", "appt": "appointment", "amt": "amount",
+                 "bal": "balance", "dept": "department", "intl": "international"}
 GENERIC = STOP | {"month", "months", "year", "years", "rate", "rates", "interest", "new", "standard",
                   "annual", "percentage", "fixed"}
 # capitalised words before "branch" that are not a branch's name ("Saturday branch hours")
@@ -79,8 +83,8 @@ RATE_Q = re.compile(r"\b(rates?|apr|apy|interest|dividends?|yield)\b", re.I)
 FEE_Q = re.compile(r"\b(fees?|cost|charge[sd]?|price)\b|\bhow much (is|does|do|for|will)\b", re.I)
 HOURS_Q = re.compile(r"\bhours?\b", re.I)
 COUNT_Q = re.compile(r"\bhow many\s+([a-z-]+)", re.I)          # rebuilt with the site's name: use_site_words
-# Hours and counts asked without "hours" or "how many": "lobby hrs?", "when is the drive-up open?",
-# "number of branches". Used only when nothing else claimed the question.
+# Hours and counts asked without "hours" or "how many": "office hrs pls", "when is the walk-up window open?",
+# "total number of offices". Used only when nothing else claimed the question.
 HOURS_CUE = re.compile(r"\bhrs\b|\bwhat time\b(?!\s+(?:frame|period|limit)s?\b)|^\s*when (?:is|are)\b(?=.*\b(?:lobby|"
                        r"lobbies|branch(?:es)?|drive[- ]?(?:up|thru|through)s?|offices?|locations?|you)\b).*\bopen\b", re.I)
 # Rate tables say "adjustable-rate", members say "ARM"; only for rate questions, so "what is a 5/1 ARM?"
@@ -97,6 +101,11 @@ RATE_EV = re.compile(r"\d+(?:\.\d+)?\s*%\s*(?:APR|APY|annual percentage|fixed|va
                      r"(?:APR|APY|rate of|rates? (?:as low as|start(?:ing)? at|from)|dividend rate)\s*(?:is|of|:)?\s*"
                      r"\d+(?:\.\d+)?\s*%", re.I)
 ADDRESS_Q = re.compile(r"\baddress\b|\bwhere is\b|\blocated\b", re.I)
+# The member editing their own address is a how-to question, not "where is it": an edit verb on "my/our
+# (mailing...) address", or "change of address", and no branch, office or other place named.
+OWN_ADDRESS = re.compile(r"\b(?:updat|chang|edit|correct)\w*\s+(?:my|our)\s+(?:(?:home|mailing|email|e-mail|street|"
+                         r"billing|physical|contact)\s+)?address\b|\bchange of address\b", re.I)
+PLACE_WORDS = re.compile(r"\b(?:branch|branches|location|locations|office|offices|lobby|lobbies)\b", re.I)
 ADDRESS_EV = re.compile(r"\b\d{2,6}\s+(?:[A-Z][\w.'’-]*\s+){1,4}(?:St|Street|Ln|Lane|Ave|Avenue|Dr|Drive|Rd|Road|"
                         r"Blvd|Way|Ct|Pl|Pkwy|Hwy|Highway|Square)\b\.?")
 DATE_EV = re.compile(rf"\b(?:{MONTH_RE})\s+\d{{1,2}},\s+20\d\d\b")
@@ -161,6 +170,7 @@ def _stem(w: str) -> str:
 
 _SYN = {_stem(k): [_stem(x) for x in v] for k, v in SYNONYMS.items()}
 _HOWTO_SYN = {_stem(k): [_stem(x) for x in v] for k, v in HOWTO_SYNONYMS.items()}
+_SYN.update({_stem(k): [_stem(v)] for k, v in ABBREVIATIONS.items()})
 
 
 def _num_token(t: str) -> str:
@@ -169,6 +179,7 @@ def _num_token(t: str) -> str:
 
 def tokenize(text: str) -> list[str]:
     text = normalize_numbers(text.lower()).replace(",", "")
+    text = re.sub(r"(?<=[a-z])\$(?=[a-z])", "s", text)        # a brand spelled with "$" for "s"
     out = []
     for t in re.findall(r"[a-z]+|\d+(?:\.\d+)?", text):
         if t[0].isdigit():
@@ -211,7 +222,7 @@ class Query:
     amounts: list = field(default_factory=list)      # dollar figures in the question
     qualifiers: set = field(default_factory=set)     # jumbo/business/... explicitly asked for
     attribute: str | None = None                     # rate | fee | hours | count | when
-    count_noun: str | None = None                    # "branch" for "how many branches"
+    count_noun: str | None = None                    # "office" for "how many offices"
     entity_is_branch: bool = False
     entity: str | None = None                        # named branch, e.g. "elm"
     descriptors: set = field(default_factory=set)    # words naming the product, e.g. {"tractor"}
@@ -239,7 +250,7 @@ def parse_query(question: str) -> Query:
     q.text, q.excluded = question, excluded
     q.terms = terms_in(low)
     q.native_terms = native_terms(low)
-    if re.search(r"model|vehicle|\bcar\b|truck", low):     # model years only, never "as of May 2026"
+    if re.search(r"model|vehicle|\bcar\b|truck", low):     # model years only, never "as of March 2031"
         q.years = {int(m.group(1)) for m in re.finditer(r"\b((?:19|20)\d\d)\b", norm)
                    if not re.search(rf"(?:{MONTH_RE})\s*(?:\d{{1,2}}(?:st|nd|rd|th)?,?\s*)?$", norm[:m.start()])}
     q.amounts = [_f(a) * (1000 if k else 1) for a, k in re.findall(r"\$\s?([\d,]+(?:\.\d+)?)\s*([kK])?\b", norm)]
@@ -254,9 +265,9 @@ def parse_query(question: str) -> Query:
         q.attribute = "hours"
     elif WHEN_Q.search(low):
         q.attribute = "when"
-    elif ADDRESS_Q.search(low):
+    elif ADDRESS_Q.search(low) and not (OWN_ADDRESS.search(low) and not PLACE_WORDS.search(low)):
         q.attribute = "address"
-    if q.attribute == "fee":            # "within 90 days of opening": a condition of the fee, not a term
+    if q.attribute == "fee":            # "within N days of opening": a condition of the fee, not a term
         q.terms, q.native_terms = set(), set()
     # "what are my options": a list, unless a term or model year already pins one row
     q.list_intent = bool(LIST_Q.search(question)) or (OPTIONS_Q.search(question) is not None

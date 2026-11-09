@@ -15,7 +15,7 @@ import run_eval  # noqa: E402
 import scoring  # noqa: E402
 from contract import Answer, Conflict  # noqa: E402
 from ingest import Parser, View, strip_footnotes, url_key  # noqa: E402
-from retrieve import amount_ranges, model_year_ranges, parse_query  # noqa: E402
+from retrieve import _stem, amount_ranges, model_year_ranges, parse_query  # noqa: E402
 from solution import build  # noqa: E402
 from synth import REFUSAL, _drop_banned, _drop_dead_links, _sentences, numbers, render_row  # noqa: E402
 
@@ -56,8 +56,8 @@ class Parsing(unittest.TestCase):
         self.assertIn("jumbo", q.qualifiers)
         q = parse_query("Current APY on a six month share certificate?")
         self.assertEqual(q.terms, {(6, "month")})
-        q = parse_query("How many branch locations are there?")
-        self.assertEqual((q.attribute, q.count_noun), ("count", "branch"))
+        q = parse_query("How many offices does the bank run?")
+        self.assertEqual((q.attribute, q.count_noun), ("count", _stem("offices")))
         q = parse_query("What are the lobby hours at the Elm Avenue branch?")
         self.assertEqual((q.attribute, q.entity), ("hours", "elm"))
 
@@ -66,8 +66,8 @@ class Parsing(unittest.TestCase):
         self.assertEqual((q.attribute, q.terms), ("fee", set()))
 
     def test_fee_schedule_vocabulary(self):
-        self.assertIn("official", parse_query("What is the cashier's check fee?").tokens)
-        self.assertIn("international", parse_query("How much is a foreign wire?").tokens)
+        self.assertIn("official", parse_query("How much do you charge for a cashier's check?").tokens)
+        self.assertIn("international", parse_query("Do you charge for overseas transfers?").tokens)
 
     def test_list_intent_only_for_catalogue_questions(self):
         self.assertTrue(parse_query("What savings accounts do you offer?").list_intent)
@@ -91,10 +91,10 @@ class Guardrails(unittest.TestCase):
       * practice answer and trap values; expected-source paths; 4-word expected-answer phrases;
       * proper names from the practice questions and answers;
       * the site's own identity (domain, brand, title suffix): the system derives it from the crawl.
-    Exempt: generic vocabulary any credit-union site uses (ordinals, "noon", street words, card networks,
-    wallet brands, calendar names) and bare years."""
-    EXEMPT = set("noon first second third fourth fifth sixth seventh eighth ninth tenth aprs avenue lane street "
-                 "west share visa rewards platinum google samsung volunteer".split())
+    Exempt: generic vocabulary any credit-union site uses (ordinals, "noon", street words, "share", the card
+    network the code names as a product head, calendar names) and bare years."""
+    EXEMPT = set("noon first second third fourth fifth sixth seventh eighth ninth tenth avenue lane street "
+                 "share visa".split())
     CALENDAR = set("monday tuesday wednesday thursday friday saturday sunday january february march april may "
                    "june july august september october november december mon tue wed thu fri sat sun".split())
 
@@ -182,8 +182,11 @@ class Edges(unittest.TestCase):
         from types import SimpleNamespace as NS
         from ingest import Chunk
         from solution import pick_link
-        view = NS(pages={"example.com/rates": NS(status="fresh"), "example.com/old-rates": NS(status="missing")})
-        text = ("Compare certificate rates (example.com/rates). See certificate rates (example.com/rates). "
+        live = lambda kind: NS(status="fresh", page=NS(kind=kind))
+        view = NS(pages={"example.com/rates": live("product"), "example.com/blog/rates-explained": live("article"),
+                         "example.com/old-rates": NS(status="missing", page=NS(kind="product"))})
+        text = ("Compare certificate rates (example.com/rates). Certificate rates explained (example.com/blog/rates-explained). "
+                "Certificate rates, explained again (example.com/blog/rates-explained). "
                 "Old certificate rates (example.com/old-rates). Certificate archive (example.com/gone).")
         ctx = [Chunk(1, "example.com/a", "product", text, text)]
         self.assertEqual(pick_link(ctx, view, parse_query("What link shows certificate rates?")), "example.com/rates")
@@ -193,13 +196,13 @@ class Edges(unittest.TestCase):
         from types import SimpleNamespace as NS
         from ingest import Chunk
         from solution import apply_fact, match_fact
-        win = Chunk(7, "example.com/news-3", "article", "This was the seventh time Acme recognized the bank.", "")
+        win = Chunk(7, "example.com/news-3", "article", "Acme ranked the lender among its best, its seventh time doing so.", "")
         fact = {"topic": "How many times Acme recognized: the Nth time", "_losers": ["sixth"],
                 "_win_chunk": win, "_win_sentence": win.text}
         index = NS(chunks=[None] * 1000, postings={"acm": [(0, 1)]})
-        self.assertIs(match_fact([fact], parse_query("What recognition has the bank received from Acme?"), index), fact)
+        self.assertIs(match_fact([fact], parse_query("Has Acme ever ranked this lender?"), index), fact)
         self.assertIsNone(match_fact([fact], parse_query("What are the lobby hours?"), index))
-        old = Chunk(2, "example.com/news-2", "article", "It was the sixth time Acme recognized the bank.", "")
+        old = Chunk(2, "example.com/news-2", "article", "Acme ranked the lender among its best, its sixth time doing so.", "")
         other = Chunk(3, "example.com/about", "product", "We serve members in three states.", "")
         out = apply_fact([old, other], fact)
         self.assertEqual([c.text for c in out], [win.text, other.text])
@@ -231,27 +234,28 @@ class Rev20(unittest.TestCase):
             self.assertEqual(parse_query("What are the lobby hours at Example's Elm Avenue branch?").entity, "elm")
         finally:
             use_site_words(set())
-        q = parse_query("What is the auto loan APR for a 2025 vehicle as of May 15, 2026?")
-        self.assertEqual(q.years, {2025})
+        q = parse_query("What is the auto loan APR for a 2031 vehicle as of March 3, 2032?")
+        self.assertEqual(q.years, {2031})
 
     def test_as_of_dates_leave_the_search_but_content_dates_stay(self):
         from solution import strip_temporal
-        same = lambda d: d >= "2026-09-01"                     # stand-in for "maps to the asked snapshot"
-        self.assertEqual(strip_temporal("What is the APY as of September 2026?", same), "What is the APY ?")
-        for q in ("Did it close on January 15, 2026?", "What happens in July 2026?"):
+        same = lambda d: d >= "2031-09-01"                     # stand-in for "maps to the asked snapshot"
+        self.assertEqual(strip_temporal("What is the APY as of September 2031?", same), "What is the APY ?")
+        for q in ("Did it close on January 15, 2031?", "What happens in July 2031?"):
             self.assertEqual(strip_temporal(q, same), q)
         # a deadline the site states stays a search word even when it falls in the answered window
-        stated = {("2026-11-12", True), ("2027-04-30", False)}
-        for q in ("Is it open until Nov. 12, 2026?", "What is due in April 2027?"):
+        stated = {("2031-11-12", True), ("2032-04-30", False)}
+        for q in ("Is it open until Nov. 12, 2031?", "What is due in April 2032?"):
             self.assertEqual(strip_temporal(q, same, stated), q)
-        self.assertEqual(strip_temporal("What is the APY (October 2026)?", same, stated), "What is the APY ?")
+        self.assertEqual(strip_temporal("What is the APY (October 2031)?", same, stated), "What is the APY ?")
 
     def test_review_fixes_synonyms_model_years_and_branch_words(self):
         from retrieve import _stem
         change = _stem("change")
-        self.assertNotIn(change, parse_query("Is there a fee to update my account information?").tokens)
-        self.assertIn(change, parse_query("How do I update my personal information?").tokens)
-        self.assertEqual(parse_query("Which APR may 2022 model year cars get for 72 months?").years, {2022})
+        self.assertNotIn(change, parse_query("Is there a charge to edit my profile?").tokens)
+        self.assertIn(change, parse_query("How do I edit my profile?").tokens)
+        self.assertIn(_stem("update"), parse_query("How do I amend my profile?").tokens)
+        self.assertEqual(parse_query("Which APR may 2029 model year cars get for 66 months?").years, {2029})
         from retrieve import use_site_words
         use_site_words({"example"})
         try:
@@ -265,12 +269,12 @@ class Rev21(unittest.TestCase):
     """Rewording robustness and conflict wording (synthetic data only)."""
 
     def test_hours_and_count_cues(self):
-        self.assertEqual(parse_query("lobby hrs?").attribute, "hours")
-        self.assertEqual(parse_query("When is the drive-up open?").attribute, "hours")
+        self.assertEqual(parse_query("office hrs pls?").attribute, "hours")
+        self.assertEqual(parse_query("When is the main office open?").attribute, "hours")
         self.assertIsNone(parse_query("What time period does the special cover?").attribute)
         self.assertNotEqual(parse_query("What time does the elm branch close?").attribute, "hours")
-        q = parse_query("Number of branch locations?")
-        self.assertEqual((q.attribute, q.count_noun), ("count", "branch"))
+        q = parse_query("Total number of offices?")
+        self.assertEqual((q.attribute, q.count_noun), ("count", _stem("offices")))
 
     def test_arm_amounts_frame_words_and_product_synonyms(self):
         from ingest import Chunk
@@ -285,7 +289,7 @@ class Rev21(unittest.TestCase):
         self.assertTrue(supports(Chunk(1, "example.com/rates", "product", text, text), parse_query("What is the car loan rate?")))
 
     def test_an_ordinal_is_part_of_a_caption(self):
-        md = "1st Choice Savings\n\n| Balance | APY |\n|---|---|\n| $0 - $999 | 0.10% |\n"
+        md = "1st Choice Savings\n\n| Balance | APY |\n|---|---|\n| $0 - $999 | 0.07% |\n"
         page = Parser().parse("example.com/rates", "https://example.com/rates", "Rates", md)
         self.assertIn("1st Choice Savings", next(c for c in page.chunks if c.is_row).index_text)
 
@@ -303,8 +307,8 @@ class Rev21(unittest.TestCase):
         from conflicts import STREAK_RE, with_phrases
         self.assertEqual(with_phrases("400 members", ["over 400 members"]), "400 members (over 400 members)")
         self.assertEqual(with_phrases("seventh", None), "seventh")
-        m = STREAK_RE.search("For a third year in a row, Acme named the bank a top employer.")
-        self.assertEqual((m.group(1), m.group(2)), ("third", "Acme"))
+        m = STREAK_RE.search("For the fourth consecutive year, Acme ranked the lender among the best.")
+        self.assertEqual((m.group(1), m.group(2)), ("fourth", "Acme"))
 
 
 class RetryWait(unittest.TestCase):
@@ -458,7 +462,7 @@ class Rev23(unittest.TestCase):
             ks.ingest(Snapshot(sid, day, [Page("https://example.org/savings", "Savings | Example",
                                                "# Savings\n\nBasic Savings pays 1.10% APY.\n", f"{day}T09:00:00Z")]))
         seen = []
-        ks._synth.compose = lambda question, q, ev, view, asked=None: (seen.append(asked), ("ok", [], True, ""))[1]
+        ks._synth.compose = lambda question, q, ev, view, asked=None, **kw: (seen.append(asked), ("ok", [], True, ""))[1]
         ks._synth.enabled = True
         for as_of in ("2030-02-01", "2030-03-01", "2030-02-01"):
             ks.answer("What was the Basic Savings APY?", as_of)
@@ -514,12 +518,12 @@ class Rev23b(unittest.TestCase):
         def row(i, name, apy, section):
             return Chunk(i, "example.org/rates", "product", f"{name} {apy}", f"{name} {apy}", section=section,
                          is_row=True, header=["Account", "APY"], cells=[name, apy], value_cols=[1])
-        other = row(1, "Health Savings Account", "0.47%", "Rates · Health Savings Account")
+        other = row(1, "Premier Money Market Savings", "0.47%", "Rates · Premier Money Market Savings")
         plain = row(2, "Basic Savings", "0.13%", "Rates · Basic Savings")
         cert = row(3, "9 Month Certificate", "2.07%", "Deposit Rates · Certificates")
         ev = NS(chunks=[other, cert, plain])
-        q = parse_query("Do any savings tiers pay 0.47% APY?")
-        text, own = named_row_guard("Do any savings tiers pay 0.47% APY?", q, ev, "Yes, the HSA pays 0.47% APY.")
+        q = parse_query("Is 0.47% APY the best that any savings tier earns?")
+        text, own = named_row_guard("Is 0.47% APY the best that any savings tier earns?", q, ev, "Yes, the money market earns 0.47% APY.")
         self.assertIs(own, plain)
         self.assertIn("0.13%", text)
         self.assertEqual(named_row_guard("Does savings pay 0.47%?", q, ev, "Basic Savings pays 0.13%.")[1], None)
@@ -575,6 +579,33 @@ class Rev23b(unittest.TestCase):
         self.assertEqual(len(calls), 2)                  # the first call, then one probe after 10 skipped
 
 
+class Rev24(unittest.TestCase):
+    """Members' wording and no-key paragraph answers (synthetic data only)."""
+
+    def test_wording_reads_the_way_members_write(self):
+        from retrieve import _stem, tokenize
+        self.assertEqual(tokenize("the Easy$pend card"), tokenize("the Easyspend card"))
+        q = parse_query("Where can I edit my acct info?")
+        self.assertTrue({_stem("information"), _stem("account")} <= set(q.tokens))
+        for own in ("After a move, how do I change my mailing address?", "How do I correct my address?",
+                    "Where do I file a change of address?"):
+            self.assertIsNone(parse_query(own).attribute, own)          # the member editing their own address
+        for place in ("What is the correct address for the Elm branch?", "What is my Elm branch address?",
+                      "Can you tell me my Pine office address?", "What is the address of the Pine office?",
+                      "Where is the main office?"):
+            self.assertEqual(parse_query(place).attribute, "address", place)   # where a place is
+
+    def test_a_how_to_answer_without_the_model_is_the_whole_paragraph(self):
+        from ingest import Chunk
+        from synth import PARAGRAPH_CHARS, best_sentence
+        q = parse_query("How do I update my profile?")
+        self.assertIsNone(q.attribute)
+        steps = "Log in to online banking. Open Settings and choose Profile. Call 555-0100 for help."
+        self.assertEqual(best_sentence(Chunk(1, "example.org/help", "product", steps, steps), q), steps)
+        long = "Open the app and follow the prompts. " * 40
+        self.assertLessEqual(len(best_sentence(Chunk(2, "example.org/help", "product", long, long), q)), PARAGRAPH_CHARS)
+
+
 class Contract(unittest.TestCase):
     def test_exactly_the_three_contract_methods(self):
         own = {n for n, v in vars(type(build())).items() if callable(v) and not n.startswith("__")}
@@ -590,7 +621,7 @@ class Contract(unittest.TestCase):
         self.assertEqual(_drop_banned("Hours are 9 a.m. to noon. These excerpts disagree."), "Hours are 9 a.m. to noon.")
 
     def test_answers_never_link_to_a_deep_page_missing_from_the_snapshot(self):
-        view = View("05", date(2026, 9, 28), {"example.org/borrow/sample-loan": None})
+        view = View("s2", date(2030, 6, 15), {"example.org/borrow/sample-loan": None})
         self.assertEqual(_drop_dead_links("Use example.org/old/retired-page. Or call us.", view), "Or call us.")
         kept = "See example.org/borrow/sample-loan. Apply at example.org/join."   # crawled; vanity
         self.assertEqual(_drop_dead_links(kept, view), kept)

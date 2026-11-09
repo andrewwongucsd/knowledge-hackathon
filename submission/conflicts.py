@@ -15,7 +15,7 @@ crawl, then the more authoritative page type, then the value most pages agree on
 from __future__ import annotations
 
 import re
-from collections import defaultdict
+from collections import Counter, defaultdict
 
 from ingest import KIND_RANK, STATUS_RANK, View
 from retrieve import (STOP, TERM_RE, YEAR_RANGE_RE, _pct_values, _stem, _value_kind, amount_ranges,
@@ -28,9 +28,12 @@ ORD_RE = re.compile(rf"\b({'|'.join(ORDINALS)})\s+time\s+((?:[A-Za-z’']+\s+){{
 STREAK_RE = re.compile(rf"\b(?:for\s+)?(?:the|a)\s+({'|'.join(ORDINALS)})\s+(?:(?:consecutive|straight)\s+year|year\s+in"
                        r"\s+a\s+row),?\s+([A-Z][\w&’'.-]*)\s+(?:has\s+|have\s+)?(?:again\s+)?(?:recogni[sz]ed|named|"
                        r"ranked|honou?red|awarded|selected|listed|included)\b(?:\s+[A-Z]\w*)?", re.I)
+# A count of things: a number, then up to two modifiers and a plural head noun ("N branch office locations").
 COUNT_FACT_RE = re.compile(r"((?:[a-z’'-]+\s+){0,3})(?<![\d,.$])(?!(?:19|20)\d\d\b)(\d[\d,]*)\+?\s+"
-                           r"((?:[a-z][a-z’'-]+\s+){0,2}(?:branch(?:es)?|"
-                           r"employees|counties|members|locations))\b")
+                           r"((?:[a-z][a-z’'-]+\s+){0,2}[a-z][a-z’'-]*(?:[^s\W]s|ies|ches|shes|xes))\b")
+# Measures and amounts, not counted things: "30 minutes", "5 percent", "2 million".
+NOT_COUNTED = {"second", "minute", "hour", "day", "week", "month", "year", "time", "mile", "percent", "point",
+               "dollar", "cent", "million", "billion", "thousand", "hundred", "share", "step", "way", "tip"}
 PROSE_RATE_RE = re.compile(r"((?:[\w$-]+\s+){1,5}?(?:apy|apr|rate|dividend)s?)\s*(?:is|of|:)?\s*"
                            r"(\d+(?:\.\d+)?\s*%)", re.I)
 QUANTITY_WORDS = {"over", "nearly", "more", "than", "about", "approximately", "almost", "around", "roughly",
@@ -135,6 +138,7 @@ def table_conflicts(view: View) -> list[dict]:
         out.append({
             "topic": " ".join(" ".join(x for x in (product, term, label.replace(" | ", " "),
                                                    "/".join(kinds).upper()) if x).split()),
+            "_parts": (product, term, label.replace(" | ", " "), "/".join(kinds).upper()),
             "values": values,
             "sources": [(view.pages[r.key].page.url, view.pages[r.key].snapshot_id)
                         for r in {r.key: r for r in [win] + losers}.values()],
@@ -144,6 +148,13 @@ def table_conflicts(view: View) -> list[dict]:
             "reason": _why(win, losers, view),
             "_strength": 2 if recency(win, view) > recency(losers[0], view) else 1,
         })
+    # Label words that 3 or more entries share ("Fixed", "Months") name the product family, not the fact:
+    # dropping them keeps each topic specific to its own term and tier.
+    common = Counter(w for f in out for w in {w.lower() for w in f["_parts"][2].split()})
+    for f in out:
+        product, term, label, kinds = f.pop("_parts")
+        label = " ".join(w for w in label.split() if common[w.lower()] < 3)
+        f["topic"] = " ".join(" ".join(x for x in (product, term, label, kinds) if x).split())
     return out
 
 
@@ -183,7 +194,8 @@ def statement_conflicts(view: View) -> list[dict]:
         repeated = len(template_pages[_template(sent)]) >= 3
         for before, n, noun in COUNT_FACT_RE.findall(low) if repeated else []:
             lead = [w for w in re.findall(r"[a-z]+", before) if w not in STOP and w not in QUANTITY_WORDS][-2:]
-            if re.match(r"(million|billion|thousand|percent)\b", noun):
+            words = re.findall(r"[a-z]+", noun)
+            if words[0] in STOP or any(_stem(w) in NOT_COUNTED or w in NOT_COUNTED for w in words):
                 continue
             key = ("count", " ".join(_stem(w) for w in lead + re.findall(r"[a-z]+", noun) if w not in STOP)
                    + " | " + _family(sent))

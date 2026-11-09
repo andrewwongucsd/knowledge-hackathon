@@ -31,7 +31,7 @@ from datetime import date, timedelta   # noqa: E402
 
 from ingest import KIND_RANK, MONTHS, STATUS_RANK, Chunk, Store, url_key   # noqa: E402
 import retrieve                        # noqa: E402
-from retrieve import Index, parse_query, select, tokenize, use_site_words   # noqa: E402
+from retrieve import STOP, Index, parse_query, select, tokenize, use_site_words   # noqa: E402
 from synth import REFUSAL, Synthesizer  # noqa: E402
 
 
@@ -99,7 +99,9 @@ def _respond(index: Index | None, synth: Synthesizer, question: str, search: str
     q = parse_query(search or question)       # the model still sees the full question
     ev = select(index, q)
     if LINK_Q.search(question):                       # "what link should I use…": the site's own link
-        link = pick_link(ev.context or ev.chunks, view, q)
+        carried = lambda u: sum(u in t for t in _page_texts(index).values())
+        link = pick_link(ev.context or ev.chunks, view, q, carried) or \
+            pick_link([c for _, c in index.search(q.tokens, top=30)], view, q, carried)
         if link:
             vp = view.pages[url_key(link)]
             return Answer(text=f"You can find that at {link}.", confident=True,
@@ -109,7 +111,8 @@ def _respond(index: Index | None, synth: Synthesizer, question: str, search: str
     fact = match_fact(_facts(index), q, index)
     if fact:
         ev.context = apply_fact(ev.context or ev.chunks, fact, view)
-    text, cited, confident, note = synth.compose(question, q, ev, view, asked)
+    text, cited, confident, note = synth.compose(question, q, ev, view, asked,
+                                                 lookup=lambda text: select(index, parse_query(text)))
     if not confident:
         return Answer(text=REFUSAL, confident=False)
     if fact:
@@ -209,7 +212,7 @@ CLAUSE_END = re.compile(r"(?<=[;!?])\s+|(?<=[a-z0-9%)\]][.])\s+(?=[A-Z])")   # n
 
 def date_asked(question: str, store: Store) -> str | None:
     """When no date is passed, a single moment the question itself names inside the crawl window
-    ("as of May 2026", "what was it on 5/15/2026", "before June 2026") selects the site as it stood then.
+    ("as of March 2031", "what was it on 3/14/2031", "before April 2031") selects the site as it stood then.
     "As of / back in" always pin; "in / on / during" pin only in a past-tense question that is not about a
     change or an article or event. Not for questions about now, spans ("since", "between"), dates outside
     the window, or a date in a side remark of a present-tense question."""
@@ -235,7 +238,7 @@ def date_asked(question: str, store: Store) -> str | None:
         precise = bool(_DAY_PRECISE.search(m.group(1)))
         if frame not in PIN_FRAMES | BEFORE_FRAMES and (not past or CHANGE_Q.search(q) or EVENT_Q.search(q)):
             return None
-        if not precise:                          # "mid-May", "early June", "15 May 2026"
+        if not precise:                          # "mid-March", "early April", "14 March 2031"
             day = re.search(r"\b(\d{1,2})(?:st|nd|rd|th)?\s*$", before)
             qual = {w.lower() for w in QUALIFIER_RE.findall(tail[frames[-1].end():] if frames else tail)}
             if day and 1 <= int(day.group(1)) <= d.day:
@@ -254,7 +257,7 @@ def date_asked(question: str, store: Store) -> str | None:
     d, precise = found.pop()
     first, last = store.views[0].taken_on, store.views[-1].taken_on
     if not precise and d < first and (d.year, d.month) == (first.year, first.month):
-        d = first                       # "early May" when the first crawl is mid-May: the nearest reading
+        d = first                       # "early March" when the first crawl is mid-March: the nearest reading
     return d.isoformat() if first <= d < last else None
 
 
@@ -306,19 +309,24 @@ LINK_WORDS = set(tokenize("link url use see find page web webpage website addres
 FACT_RARE = 0.01        # a question word on under 1% of chunks names the fact asked about
 
 
-def pick_link(context: list[Chunk], view, q) -> str | None:
-    """The link the site's own text gives for what was asked: the most-cited link in the evidence
-    whose anchor text shares a word with the question and whose page is live in this snapshot.
-    Dead or retired links (pages the crawl never found, or that left it) can't be picked."""
+def pick_link(context: list[Chunk], view, q, carried=None) -> str | None:
+    """The link the site's own text gives for what was asked: the link whose anchor text shares a word with
+    the question, given by the most pages of the evidence (then carried by the most pages of the site), whose
+    page is live in this snapshot and is not an article (a "which page" question wants the product or tool
+    page, not a blog post). Dead or retired links (pages the crawl never found, or that left it) can't be
+    picked."""
     subject = set(q.tokens) - LINK_WORDS
-    votes: Counter = Counter()
+    pages: dict = {}
     for c in context:
         for m in LINK_RE.finditer(c.text):
-            key = url_key(m.group(2))
-            vp = view.pages.get(key)
-            if vp is not None and vp.status != "missing" and set(tokenize(m.group(1))) & subject:
-                votes[m.group(2).rstrip("/")] += 1
-    return votes.most_common(1)[0][0] if votes else None
+            vp = view.pages.get(url_key(m.group(2)))
+            if vp is None or vp.status == "missing" or vp.page.kind == "article":
+                continue
+            if set(tokenize(m.group(1))) & subject:
+                pages.setdefault(m.group(2).rstrip("/"), set()).add(c.key)
+    if not pages:
+        return None
+    return max(pages, key=lambda u: (len(pages[u]), carried(u) if carried else 0))
 
 
 def _facts(index: Index) -> list[dict]:
@@ -396,7 +404,7 @@ def apply_fact(context: list[Chunk], fact: dict, view=None) -> list[Chunk]:
     return [stated] + kept
 
 
-TERM_DEF = re.compile(r"\b([a-z][a-z’'-]+ [a-z][a-z’'-]+)\s*:\s*-\s", re.I)
+TERM_DEF = re.compile(r"\b([a-z][a-z’'-]+(?: [a-z][a-z’'-]+){1,2})\s*:\s*-\s", re.I)   # a 2-3 word term
 ITEM = re.compile(r"(?:^|\s)-\s*([A-Z][A-Za-z .'’]{1,30}?):\s*(.+?)(?=\s+-\s|$)")
 
 
@@ -414,7 +422,7 @@ def _glossary(index: Index) -> dict:
         for j, c in enumerate(chunks):
             if c.is_row or not (m := TERM_DEF.search(c.text)):
                 continue
-            term = m.group(1).lower()
+            words = m.group(1).lower().split()
             items = ITEM.findall(c.text[m.end() - 2:])
             for nxt in chunks[j + 1:j + 3]:                    # the list often runs into the next chunks
                 more = ITEM.findall(nxt.text)
@@ -422,13 +430,17 @@ def _glossary(index: Index) -> dict:
                     break
                 items += more
             items = tuple((n.strip(), v.strip()) for n, v in items)
-            if len(items) >= 2:
-                found.setdefault((term, items), []).append(key)
+            if len(items) >= 2:                  # "the bank's service area": the term is a shared ending
+                for n in range(2, len(words) + 1):                 # of at least two words
+                    if words[-n] not in STOP:
+                        found.setdefault((" ".join(words[-n:]), items), []).append(key)
     limit = 0.01 * max(1, len(index.chunks))
     gl = {}
-    for (term, items), keys in found.items():
+    defined = set()
+    for (term, items), keys in sorted(found.items(), key=lambda kv: len(kv[0][0])):   # shortest shared term
         rare = any(len(index.postings.get(t, ())) < limit for t in tokenize(term))
-        if len(set(keys)) >= 2 and rare and term not in gl:
+        if len(set(keys)) >= 2 and rare and term not in gl and items not in defined:
+            defined.add(items)
             best = min(keys, key=lambda k: (KIND_RANK[index.view.pages[k].page.kind], k))
             gl[term] = (items, best)
     index._gloss = gl

@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import os
 import re
+from dataclasses import replace
 from datetime import date
 
 from ingest import Chunk, View, url_key
@@ -105,9 +106,14 @@ def _short_header(h: str) -> str:
     return h
 
 
+PARAGRAPH_CHARS = 500
+
+
 def best_sentence(c: Chunk, q: Query) -> str:
     if q.attribute == "hours":                          # schedules only make sense whole
         return c.text.replace("\n", "; ")[:400]
+    if q.attribute is None:                             # how-to and "what is…": the steps or the description
+        return c.text.replace("\n", " ")[:PARAGRAPH_CHARS]   # span the paragraph, not one sentence of it
     sents = [s.strip() for s in re.split(r"(?<=[.!?])\s+(?=[A-Z0-9*])|\n", c.text) if s.strip()]
     qt = set(q.tokens)
 
@@ -133,7 +139,7 @@ def extractive(q: Query, ev: Evidence, view: View) -> tuple[str, list[Chunk]]:
         return REFUSAL, []
     top = pool[0]
     if top.is_row:
-        # Tiers the question did not pin down (e.g. loan amount for "30-year mortgage") are shown as a
+        # Tiers the question did not pin down (e.g. the loan amount for a "25-year home loan") are shown as a
         # range: every row of the same table that matches all qualifiers the question did give.
         hidden, lines = {d.id for d in ev.dropped}, other_lines(q, top)
         same_table = [c for c in view.pages[top.key].page.chunks if c.is_row and c is not top
@@ -185,11 +191,17 @@ def named_row(q: Query, ev: Evidence, exclude=()) -> Chunk | None:
 QUOTED_PCT = re.compile(r"\d+(?:\.\d+)?\s*(?:%|percent\b|apy\b|apr\b)", re.I)
 
 
-def named_row_guard(question: str, q: Query, ev: Evidence, text: str) -> tuple[str, Chunk | None]:
+def named_row_guard(question: str, q: Query, ev: Evidence, text: str, lookup=None) -> tuple[str, Chunk | None]:
     """A member who quotes a value for a named product ("does savings pay 1.23%?") gets that product's
-    own value too, even when the value they quote belongs to another product's table."""
+    own value too, even when the value they quote belongs to another product's table. The quoted number
+    pulls in the rows that carry it, so `lookup` searches again without it to find the product's own rows."""
     if not (q.category and QUOTED_PCT.search(question)):
         return text, None
+    if lookup is not None:
+        more = lookup(QUOTED_PCT.sub(" ", question))
+        if more is not None and more.chunks:
+            have = {c.id for c in more.chunks}
+            ev = replace(ev, chunks=list(more.chunks) + [c for c in ev.chunks if c.id not in have])
     own = named_row(q, ev)
     if own is None:
         return text, None
@@ -279,7 +291,7 @@ class Synthesizer:
             return None
 
     def compose(self, question: str, q: Query, ev: Evidence, view: View,
-                asked: date | None = None) -> tuple[str, list[Chunk], bool, str]:
+                asked: date | None = None, lookup=None) -> tuple[str, list[Chunk], bool, str]:
         """Returns (text, cited chunks, confident, note)."""
         note = _stale_note(ev, view)
         cooling = self._cooldown > 0
@@ -295,7 +307,7 @@ class Synthesizer:
                 if text and numbers(text) <= allowed:
                     ids = [i for i in out.get("evidence_ids", []) if isinstance(i, int) and 1 <= i <= len(shown)]
                     cited = [shown[i - 1] for i in ids] or ev.chunks[:1]
-                    text, own = named_row_guard(question, q, ev, text)
+                    text, own = named_row_guard(question, q, ev, text, lookup)
                     llm_note = str(out.get("note") or "").strip()
                     return text, cited + ([own] if own else []), True, "; ".join(x for x in (llm_note, note) if x)
         text, cited = extractive(q, ev, view)
