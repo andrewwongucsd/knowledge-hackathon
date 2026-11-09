@@ -31,8 +31,8 @@ from datetime import date, timedelta   # noqa: E402
 
 from ingest import KIND_RANK, MONTHS, STATUS_RANK, Chunk, Store, url_key   # noqa: E402
 import retrieve                        # noqa: E402
-from retrieve import (STOP, Index, parse_query, proper_names, select, tokenize, use_proper_names,   # noqa: E402
-                      use_site_words)
+from retrieve import (STOP, Evidence, Index, parse_query, proper_names, select, tokenize,   # noqa: E402
+                      use_proper_names, use_site_words)
 from synth import REFUSAL, Synthesizer  # noqa: E402
 
 
@@ -52,6 +52,7 @@ class KnowledgeSystem:
         self._store.proper_names = proper_names(index.chunks)   # branch names written in lower case
         use_proper_names(self._store.proper_names)
         _facts(index)                  # build per-view lookups now: loading is untimed, answers are
+        _page_list(index)
         _page_texts(index)
         _glossary(index)
         _dates_stated(index)
@@ -124,8 +125,13 @@ def _respond(index: Index | None, synth: Synthesizer, question: str, search: str
     fact = match_fact(_facts(index), q, index)
     if fact:
         ev.context = apply_fact(ev.context or ev.chunks, fact, view)
+    def second_look(text: str):
+        pages, paths = _page_list(index)
+        keys = [paths[p] for p in map(_path, synth.pick_pages(text, pages)) if p in paths]
+        return _pages_evidence(index, q, keys) if keys else None
     text, cited, confident, note = synth.compose(question, q, ev, view, asked,
-                                                 lookup=lambda text: select(index, parse_query(text)))
+                                                 lookup=lambda text: select(index, parse_query(text)),
+                                                 second_look=second_look)
     if not confident:
         return Answer(text=REFUSAL, confident=False)
     if fact:
@@ -518,6 +524,37 @@ def gloss(text: str, glossary: dict) -> tuple[str, str | None]:
         if term in low and not all(n.lower() in low for n, _ in items):
             return f"{text} The {term} is: " + "; ".join(f"{n}: {v}" for n, v in items) + ".", page
     return text, None
+
+
+def _page_list(index: Index) -> tuple[str, dict]:
+    """The site's own non-article pages as "path | title" lines, and path -> page key. Built once per view."""
+    pl = getattr(index, "_page_list", None)
+    if pl is None:
+        rows, paths = [], {}
+        for key, vp in sorted(index.view.pages.items()):
+            if vp.status == "missing" or vp.page.kind == "article":
+                continue
+            path = _path(key)
+            paths[path] = key
+            rows.append(f"{path} | {vp.page.title or ''}")
+        pl = index._page_list = ("\n".join(rows), paths)
+    return pl
+
+
+def _path(ref: str) -> str:
+    """'https://example.org/a/b/' or 'example.org/a/b' -> '/a/b'."""
+    ref = re.sub(r"^[a-z]+://", "", str(ref).strip().lower())
+    return "/" + ref.split("/", 1)[1].strip("/") if "/" in ref else "/"
+
+
+def _pages_evidence(index: Index, q, keys: list) -> Evidence | None:
+    """Evidence from the pages picked: each page's opening paragraphs, then its best matches."""
+    view, wanted = index.view, set(keys)
+    opening = [c for k in keys for c in view.pages[k].page.chunks[:8]]
+    best = [c for _, c in index.search(q.tokens, top=3000) if c.key in wanted][:8]
+    chunks = [c for c in {c.id: c for c in opening + best}.values()
+              if not (c.expired_on and c.expired_on < view.taken_on)][:16]
+    return Evidence(chunks, [], True, {}, chunks) if chunks else None
 
 
 def _page_texts(index: Index) -> dict:

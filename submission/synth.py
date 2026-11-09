@@ -69,6 +69,17 @@ SCHEMA = {
 }
 
 
+# The second look: when the search results hold no answer to an open question, the model picks pages from
+# the site's own page list (derived from the crawl at ingest), and is asked once more from those pages.
+ROUTE_SYSTEM = """You route a credit union member's question to pages of the credit union's own website. The site's pages are listed below, one per line as "path | title". Return the paths of up to 3 pages most likely to answer the question, best first, copied exactly as listed, or an empty list if none would."""
+ROUTE_SCHEMA = {
+    "type": "object",
+    "properties": {"paths": {"type": "array", "items": {"type": "string"}}},
+    "required": ["paths"],
+    "additionalProperties": False,
+}
+
+
 def numbers(text: str) -> set[float]:
     return {float(m.group(1).replace(",", "") + ("." + m.group(2) if m.group(2) else ""))
             for m in NUM_RE.finditer(text or "")}
@@ -265,7 +276,8 @@ class Synthesizer:
         when = asked if asked and asked > view.taken_on else view.taken_on
         return self._ask(f"Website snapshot date: {when.isoformat()}\n\nExcerpts:\n{excerpts}", question)
 
-    def _ask(self, content: str, question: str) -> dict | None:
+    def _ask(self, content: str, question: str, system: str = SYSTEM, schema: dict = SCHEMA,
+             max_tokens: int = 1024) -> dict | None:
         try:
             if self._client is None:                   # lazy: a missing package must not break build()
                 self._client = _new_client()
@@ -274,11 +286,11 @@ class Synthesizer:
                 client = client.with_options(timeout=PROBE_TIMEOUT_S, max_retries=0)
             resp = client.messages.create(
                 model=MODEL,
-                max_tokens=1024,
+                max_tokens=max_tokens,
                 # the fixed instructions are identical on every call, so they are cached
-                system=[{"type": "text", "text": SYSTEM, "cache_control": {"type": "ephemeral"}}],
+                system=[{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
                 messages=[{"role": "user", "content": f"{content}\n\nQuestion: {question}"}],
-                output_config={"effort": "low", "format": {"type": "json_schema", "schema": SCHEMA}},
+                output_config={"effort": "low", "format": {"type": "json_schema", "schema": schema}},
                 **_thinking_off(MODEL),
             )
             self._probe = False
@@ -331,7 +343,7 @@ class Synthesizer:
         return self._ask(content, question)
 
     def compose(self, question: str, q: Query, ev: Evidence, view: View,
-                asked: date | None = None, lookup=None) -> tuple[str, list[Chunk], bool, str]:
+                asked: date | None = None, lookup=None, second_look=None) -> tuple[str, list[Chunk], bool, str]:
         """Returns (text, cited chunks, confident, note)."""
         note = _stale_note(ev, view)
         cooling = self._cooldown > 0
@@ -340,18 +352,49 @@ class Synthesizer:
             out = self._llm(question, ev, view, asked)
             if out is not None:
                 if not out.get("answerable", False):
+                    again = self._second_look(question, q, view, asked, second_look)
+                    if again is not None:
+                        return again[0], again[1], True, "; ".join(x for x in (again[2], note) if x)
                     return REFUSAL, [], False, note
-                text = _drop_dead_links(_drop_banned(str(out.get("answer", ""))), view)
-                shown = _llm_chunks(ev)                # the exact excerpts the model saw, same numbering
-                allowed = numbers(question) | numbers(" ".join(f"{c.text} {describe(c, view)}" for c in shown))
-                if text and numbers(text) <= allowed:
-                    ids = [i for i in out.get("evidence_ids", []) if isinstance(i, int) and 1 <= i <= len(shown)]
-                    cited = [shown[i - 1] for i in ids] or ev.chunks[:1]
-                    text, own = named_row_guard(question, q, ev, text, lookup)
-                    llm_note = str(out.get("note") or "").strip()
-                    return text, cited + ([own] if own else []), True, "; ".join(x for x in (llm_note, note) if x)
+                accepted = self._accept(question, q, ev, view, out, lookup)
+                if accepted is not None:
+                    text, cited, llm_note = accepted
+                    return text, cited, True, "; ".join(x for x in (llm_note, note) if x)
         text, cited = extractive(q, ev, view)
         return text, cited, text != REFUSAL, note
+
+    def _accept(self, question: str, q: Query, ev: Evidence, view: View, out: dict, lookup=None):
+        """The model's answer if it passes the guards: (text, cited chunks, note), else None."""
+        text = _drop_dead_links(_drop_banned(str(out.get("answer", ""))), view)
+        shown = _llm_chunks(ev)                # the exact excerpts the model saw, same numbering
+        allowed = numbers(question) | numbers(" ".join(f"{c.text} {describe(c, view)}" for c in shown))
+        if not text or not numbers(text) <= allowed:
+            return None
+        ids = [i for i in out.get("evidence_ids", []) if isinstance(i, int) and 1 <= i <= len(shown)]
+        cited = [shown[i - 1] for i in ids] or ev.chunks[:1]
+        text, own = named_row_guard(question, q, ev, text, lookup)
+        return text, cited + ([own] if own else []), str(out.get("note") or "").strip()
+
+    def _second_look(self, question: str, q: Query, view: View, asked, second_look):
+        """The search results held no answer to an open question ("who qualifies for membership?"): the
+        model picks the site's own pages by title, then answers once more from those pages. Never for a
+        rate, fee, hours, count, date or address question, where "not listed" is usually the truth."""
+        if second_look is None or q.attribute is not None:
+            return None
+        ev = second_look(question)
+        if ev is None or not ev.chunks:
+            return None
+        out = self._llm(question, ev, view, asked)
+        if not out or not out.get("answerable", False):
+            return None
+        return self._accept(question, q, ev, view, out)
+
+    def pick_pages(self, question: str, pages: str) -> list[str]:
+        """Up to 3 page paths from the site's own page list ("path | title" lines) for a question."""
+        out = self._ask("Pick the pages.", question, system=ROUTE_SYSTEM + "\n\n" + pages, schema=ROUTE_SCHEMA,
+                        max_tokens=200)
+        paths = out.get("paths", []) if isinstance(out, dict) else []
+        return [p for p in paths if isinstance(p, str)][:3]
 
 
 def _thinking_off(model: str) -> dict:

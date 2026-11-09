@@ -695,6 +695,52 @@ class Rev26(unittest.TestCase):
         self.assertNotIn("2.41%", ks.answer("What is the 12-month certificate APY?").text)
 
 
+class Rev30(unittest.TestCase):
+    """The second look after a decline (synthetic data, fake model client)."""
+
+    def _site(self, replies):
+        import json as _json
+        from types import SimpleNamespace as NS
+        from contract import Page, Snapshot
+        calls = []
+
+        class Fake:
+            class messages:
+                @staticmethod
+                def create(**k):
+                    calls.append(k)
+                    reply = replies[min(len(calls), len(replies)) - 1]
+                    return NS(stop_reason="end_turn", content=[NS(type="text", text=_json.dumps(reply))])
+        ks = build()
+        pages = [("https://example.org/about/sign-up", "Sign Up | Example",
+                  "# Sign Up\n\nYou can sign up if you live or work in the valley service area.\n"),
+                 ("https://example.org/certificates", "Certificates | Example",
+                  "# Certificates\n\n| Term | APY |\n|---|---|\n| 6 Month | 1.91% |\n| 12 Month | 2.41% |\n"),
+                 ("https://example.org/membership-perks", "Perks | Example", "# Perks\n\nMembership perks include free coffee.\n")]
+        ks.ingest(Snapshot("s1", "2030-01-10", [Page(u, t, m, "2030-01-10T09:00:00Z") for u, t, m in pages]))
+        ks._synth.enabled, ks._synth._client = True, Fake()
+        return ks, calls
+
+    def test_an_open_question_gets_a_second_look_at_the_pages_its_title_names(self):
+        declined = {"note": "", "answer": "", "answerable": False, "evidence_ids": []}
+        picked = {"paths": ["/about/sign-up"]}
+        answered = {"note": "", "answer": "You can sign up if you live or work in the valley service area.",
+                    "answerable": True, "evidence_ids": [1]}
+        ks, calls = self._site([declined, picked, answered])
+        a = ks.answer("Who qualifies for membership?")
+        self.assertEqual(len(calls), 3)
+        self.assertIn("valley service area", a.text)
+        self.assertTrue(any("sign-up" in s.url for s in a.sources))
+        self.assertIn("/about/sign-up | Sign Up", calls[1]["system"][0]["text"])
+
+    def test_a_declined_rate_question_gets_no_second_look(self):
+        declined = {"note": "", "answer": "", "answerable": False, "evidence_ids": []}
+        ks, calls = self._site([declined])
+        a = ks.answer("Compare the APY on the 6-month and 12-month certificates.")
+        self.assertEqual(len(calls), 1)
+        self.assertFalse(a.confident)
+
+
 class Contract(unittest.TestCase):
     def test_exactly_the_three_contract_methods(self):
         own = {n for n, v in vars(type(build())).items() if callable(v) and not n.startswith("__")}
