@@ -741,6 +741,77 @@ class Rev30(unittest.TestCase):
         self.assertFalse(a.confident)
 
 
+class Rev31(unittest.TestCase):
+    """Eligibility wording, links to the site's own portals, introductory rates (synthetic data only)."""
+
+    def test_asking_who_can_join_also_searches_for_eligible(self):
+        for q in ("Who can join?", "Can anyone become a member?", "Do I qualify for membership?",
+                  "What are the requirements to join?", "Is membership open to everyone?"):
+            self.assertIn(_stem("eligible"), parse_query(q).expansion, q)
+            self.assertTrue({_stem("eligible"), _stem("join")} <= set(parse_query(q).tokens), q)
+        self.assertEqual(parse_query("Who can join?").expansion, [_stem("eligible")])   # "join" was asked already
+        for q in ("Who can I call about my card?", "Who can help me join?", "Can non-members cash a check?",
+                  "What is the minimum balance requirement for checking?", "How do I join?",
+                  "What is the rate for members who join?"):
+            self.assertEqual(parse_query(q).expansion, [], q)
+
+    def _portal_view(self, kind="product"):
+        from types import SimpleNamespace as NS
+        page = lambda key, kind: NS(status="fresh", snapshot_id="s1", page=NS(kind=kind, key=key, url="https://" + key))
+        return NS(pages={"example.org/members": page("example.org/members", kind),
+                         "example.org/about": page("example.org/about", "product")})
+
+    def test_a_portal_link_needs_its_anchor_to_name_what_was_asked(self):
+        from ingest import Chunk
+        from solution import link_source, pick_link
+        text = "Apply now (apply.example.org). Apply today (go.example.org/track). Elsewhere (apply.other.net)."
+        ctx = [Chunk(1, "example.org/members", "product", text, text)]
+        view = self._portal_view()
+        self.assertEqual(pick_link(ctx, view, parse_query("What's the link to apply?")), "apply.example.org")
+        self.assertEqual(link_source("apply.example.org", ctx, view).page.key, "example.org/members")
+        self.assertIsNone(pick_link(ctx, view, parse_query("What's the link?")))             # nothing asked
+        self.assertIsNone(pick_link(ctx, view, parse_query("What's the link to apply for a loan?")))  # "loan" not named
+        self.assertIsNone(pick_link(ctx, self._portal_view("article"), parse_query("What's the link to apply?")))
+        join = [Chunk(2, "example.org/members", "product", "Join now (join.example.org).", "Join now (join.example.org).")]
+        self.assertEqual(pick_link(join, view, parse_query("What's the link for who can join?")), "join.example.org")
+        self.assertEqual(pick_link(join, view, parse_query("link to join online pls")), "join.example.org")
+
+    def test_dead_link_filter_keeps_the_sites_own_subdomains(self):
+        from types import SimpleNamespace as NS
+        view = NS(pages={"example.org/rates": NS(status="fresh")})
+        out = _drop_dead_links("Open it at join.example.org/products/savings today. See example.org/old/page now.", view)
+        self.assertEqual(out, "Open it at join.example.org/products/savings today.")
+
+    def test_an_intro_rate_question_needs_an_intro_rate(self):
+        from contract import Page, Snapshot
+        self.assertEqual(parse_query("What is the intro APR on the harbor line?").rate_kind, "intro")
+        self.assertEqual(parse_query("What introductory dividend rate does the harbor account pay?").rate_kind, "intro")
+        self.assertIsNone(parse_query("What APR is offered on the harbor line, and is there an introductory rate?").rate_kind)
+        table = "| Product | APR |\n|---|---|\n| Harbor Line Standard | 6.10% |\n"
+        old = "# Harbor Line\n\nHarbor Line intro rate: 1.49% intro APR for 3 months.\n\n" + table
+        ks = build()
+        for sid, day, md in (("s1", "2030-01-10", old), ("s2", "2030-03-10", "# Harbor Line\n\n" + table)):
+            ks.ingest(Snapshot(sid, day, [Page("https://example.org/harbor-line", "Harbor Line | Example", md,
+                                               f"{day}T09:00:00Z")]))
+        self.assertIn("1.49%", ks.answer("What is the intro APR on the harbor line?", "2030-01-31").text)
+        later = ks.answer("What is the intro APR on the harbor line?")
+        self.assertFalse(later.confident)
+        self.assertNotIn("6.10", later.text)
+        self.assertIn("6.10%", ks.answer("What is the APR on the harbor line?").text)
+
+    def test_one_cards_intro_offer_is_not_anothers(self):
+        from contract import Page, Snapshot
+        md = ("# Cards\n\n## Harbor Card\n\nNew cardholder offer: 2.49% intro APR on balance transfers for 6 months.\n\n"
+              "| Card | APR |\n|---|---|\n| Harbor Card | 14.00% |\n| Coral Card | 16.00% |\n")
+        ks = build()
+        ks.ingest(Snapshot("s1", "2030-01-10", [Page("https://example.org/cards", "Cards | Example", md,
+                                                     "2030-01-10T09:00:00Z")]))
+        self.assertIn("2.49%", ks.answer("What is the intro APR on the Harbor card?").text)
+        coral = ks.answer("What is the intro APR on the Coral card?")
+        self.assertFalse(coral.confident)
+        self.assertNotIn("2.49", coral.text)
+
+
 class Contract(unittest.TestCase):
     def test_exactly_the_three_contract_methods(self):
         own = {n for n, v in vars(type(build())).items() if callable(v) and not n.startswith("__")}

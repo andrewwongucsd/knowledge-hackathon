@@ -420,12 +420,13 @@ def _drop_dead_links(text: str, view: View) -> str:
     """Drop sentences linking to a multi-level page on the site's own host that is not in this snapshot.
 
     Old articles still link to pages that have since moved, and the crawl covers the site's pages, so an
-    uncrawled deep link is a dead one. One-level vanity links (host/short-name) and other hosts are
-    redirects the crawl can't check, so they are kept. The hosts come from the crawled pages themselves."""
+    uncrawled deep link is a dead one. One-level vanity links (host/short-name) and other hosts, including
+    the site's own subdomains (join.<host>/...), are redirects the crawl can't check, so they are kept. The
+    hosts come from the crawled pages themselves."""
     hosts = sorted({k.split("/", 1)[0] for k in view.pages})
     if not hosts:
         return text
-    site_link = re.compile(r"(?:https?://)?(?:www\.)?(" + "|".join(map(re.escape, hosts)) +
+    site_link = re.compile(r"(?<![\w.-])(?:https?://)?(?:www\.)?(" + "|".join(map(re.escape, hosts)) +
                            r")((?:/[A-Za-z0-9_\-.]+){2,})", re.I)
 
     def dead(s: str) -> bool:

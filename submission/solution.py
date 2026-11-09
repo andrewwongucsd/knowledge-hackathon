@@ -29,9 +29,9 @@ from conflicts import find_conflicts, statement_conflicts   # noqa: E402
 import calendar                        # noqa: E402
 from datetime import date, timedelta   # noqa: E402
 
-from ingest import KIND_RANK, MONTHS, STATUS_RANK, Chunk, Store, url_key   # noqa: E402
+from ingest import KIND_RANK, MONTHS, STATUS_RANK, Chunk, Store, _on_site, url_key   # noqa: E402
 import retrieve                        # noqa: E402
-from retrieve import (STOP, Evidence, Index, parse_query, proper_names, select, tokenize,   # noqa: E402
+from retrieve import (CHAT_FILLERS, STOP, Evidence, Index, parse_query, proper_names, select, tokenize,   # noqa: E402
                       use_proper_names, use_site_words)
 from synth import REFUSAL, Synthesizer  # noqa: E402
 
@@ -114,12 +114,12 @@ def _respond(index: Index | None, synth: Synthesizer, question: str, search: str
     ev = select(index, q)
     if LINK_Q.search(question):                       # "what link should I use…": the site's own link
         carried = lambda u: sum(u in t for t in _page_texts(index).values())
-        link = pick_link(ev.context or ev.chunks, view, q, carried) or \
-            pick_link([c for _, c in index.search(q.tokens, top=30)], view, q, carried)
+        near, wide = ev.context or ev.chunks, [c for _, c in index.search(q.tokens, top=30)]
+        link = pick_link(near, view, q, carried) or pick_link(wide, view, q, carried)
         if link:
-            vp = view.pages[url_key(link)]
+            vp = link_source(link, near + wide, view)
             return Answer(text=f"You can find that at {link}.", confident=True,
-                          sources=[Source(url=vp.page.url, snapshot_id=vp.snapshot_id)])
+                          sources=[Source(url=vp.page.url, snapshot_id=vp.snapshot_id)] if vp else [])
     if not ev.chunks or (q.attribute and not ev.supported):
         return Answer(text=REFUSAL, confident=False)
     fact = match_fact(_facts(index), q, index)
@@ -373,8 +373,9 @@ def strip_temporal(question: str, same_view, stated=frozenset()) -> str:
 
 
 LINK_Q = re.compile(r"\b(link|url|web ?page|website address)\b", re.I)
-LINK_RE = re.compile(r"([^()\n]{0,80})\(([a-z0-9.-]+\.[a-z]{2,}/[^)\s]*)\)")
+LINK_RE = re.compile(r"([^()\n]{0,80})\(([a-z0-9.-]+\.[a-z]{2,}(?:/[^)\s]*)?)\)")
 LINK_WORDS = set(tokenize("link url use see find page web webpage website address where visit"))
+MEDIUM_WORDS = set(tokenize("online"))      # how, not what: "join online" asks for the link to join
 FACT_RARE = 0.01        # a question word on under 1% of chunks names the fact asked about
 
 
@@ -383,19 +384,47 @@ def pick_link(context: list[Chunk], view, q, carried=None) -> str | None:
     the question, given by the most pages of the evidence (then carried by the most pages of the site), whose
     page is live in this snapshot and is not an article (a "which page" question wants the product or tool
     page, not a blog post). Dead or retired links (pages the crawl never found, or that left it) can't be
-    picked."""
-    subject = set(q.tokens) - LINK_WORDS
+    picked.
+
+    A link to one of the site's own hosts that the crawl never fetched (an application portal such as
+    join.<site>) can't be checked against a page, so it needs more: a live, non-article page gives it, its
+    anchor text names everything asked, and its own host or path shares a word asked (so a click tracker
+    behind "Apply today" is never the answer)."""
+    subject = set(q.tokens) - LINK_WORDS - CHAT_FILLERS - set(q.expansion)
+    cover = subject - MEDIUM_WORDS
+    hosts = {k.split("/", 1)[0] for k in view.pages}
     pages: dict = {}
+    portals = set()
     for c in context:
         for m in LINK_RE.finditer(c.text):
-            vp = view.pages.get(url_key(m.group(2)))
-            if vp is None or vp.status == "missing" or vp.page.kind == "article":
+            link, anchor = m.group(2).rstrip("/"), set(tokenize(m.group(1)))
+            vp = view.pages.get(url_key(link))
+            if vp is None:
+                carrier = view.pages.get(c.key)
+                if (link.split("/", 1)[0] in hosts or not _on_site(link, hosts) or carrier is None
+                        or carrier.status == "missing" or carrier.page.kind == "article"
+                        or not cover or not cover <= anchor or not set(tokenize(link)) & cover):
+                    continue
+                portals.add(link)
+            elif vp.status == "missing" or vp.page.kind == "article":
                 continue
-            if set(tokenize(m.group(1))) & subject:
-                pages.setdefault(m.group(2).rstrip("/"), set()).add(c.key)
+            if anchor & subject:
+                pages.setdefault(link, set()).add(c.key)
     if not pages:
         return None
-    return max(pages, key=lambda u: (len(pages[u]), carried(u) if carried else 0))
+    def weight(u):                 # a portal counts where it is written as a link, not inside longer links
+        return 0 if not carried else carried(f"({u})") if u in portals else carried(u)
+    return max(pages, key=lambda u: (len(pages[u]), weight(u)))
+
+
+def link_source(link: str, context: list[Chunk], view):
+    """The page to cite for a picked link: the page itself, or for a portal the page that gives the link."""
+    vp = view.pages.get(url_key(link))
+    if vp is not None:
+        return vp
+    givers = sorted({c.key for c in context if f"({link})" in c.text or f"({link}/)" in c.text})
+    live = [view.pages[k] for k in givers if k in view.pages and view.pages[k].status != "missing"]
+    return min(live, key=lambda p: (KIND_RANK[p.page.kind], p.page.key), default=None)
 
 
 def _facts(index: Index) -> list[dict]:

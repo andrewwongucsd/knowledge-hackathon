@@ -170,6 +170,27 @@ SOFT_QUALIFIERS = ("jumbo", "business", "traditional", "roth", "ira", "refinance
 SPEC_RE = re.compile(r"(?<![\d/])(\d{1,2})/(\d{1,2})(?![\d/])")
 # "the credit union" names the institution asking about, like the site's own name: never a product or search word.
 INSTITUTION = re.compile(r"\b(?:the|your|this|our|my|a)\s+credit\s+unions?(?:['’]s)?\b", re.I)
+# "Who can join?", "do I qualify for membership?", "requirements to join": asking who may join asks who is
+# eligible, so the search also looks for "eligible" (and "join"). Only for open questions about joining or membership;
+# "who can I call" and "who can help" ask for a contact, not eligibility.
+ELIGIBILITY_Q = re.compile(
+    r"\bwho(?:['’]s|\s+is|\s+are)?\s+(?:can|could|may|allowed\s+to|able\s+to|eligible|qualif(?:y|ies))\b"
+    r"(?!\s+(?:i|we|you|me|us)\b)(?!\s+(?:help|assist|answer|explain|tell|talk|speak|contact|call|reach)\b)"
+    r"|\b(?:can|could|may)\s+(?:anyone|anybody|everyone|everybody)\b"
+    r"|\b(?:am\s+i|are\s+we|is\s+my\s+\w+)\s+(?:able|allowed|eligible)\s+to\b"
+    r"|\bqualif(?:y|ies|ied|ication|ications)\b|\beligibility\b"
+    r"|\b(?:requirements?|criteria)\s+(?:to|for)\b"
+    r"|\bopen\s+to\s+(?:anyone|anybody|everyone|everybody|all|the\s+public)\b|\bwho\b[^?]*\bopen\s+to\b"
+    r"|\bwhat\s+does\s+it\s+take\s+to\b", re.I)
+MEMBERSHIP_Q = re.compile(r"\b(?:join(?:ing)?|membership|(?:be|become|becoming)\s+an?\s+(?:\w+\s+)?member)\b", re.I)
+# An introductory (teaser) rate is its own kind of rate: "the intro APR on X" is not X's standard APR, and an
+# intro offer that has ended leaves nothing to quote.
+RATE_KINDS = r"intro(?:ductory)?|teaser"
+KIND_RATE = re.compile(rf"\b(?:{RATE_KINDS})\s+(?:(?:balance[- ]transfer|dividend|interest|annual percentage)\s+)?"
+                       r"(?:apr|apy|rates?|yield|dividend)\b", re.I)
+KIND_EV = re.compile(rf"\b(?:{RATE_KINDS})\b", re.I)
+KIND_RATE_EV = re.compile(rf"\d+(?:\.\d+)?\s*%\s*\d?\s*(?:(?:{RATE_KINDS})\s+)?(?:APR|APY|annual percentage|dividend)|"
+                          rf"(?:{RATE_KINDS})\s+(?:\w+\s+){{0,3}}(?:rate|apr|apy)\b[^.]{{0,40}}?\d+(?:\.\d+)?\s*%", re.I)
 NEGATED_QUALIFIER = re.compile(r"\b(?:not|non|excluding|except|other than|besides|without|rather than|instead of)"
                                r"[\s-]+(?:(?:the|a|an|any)\s+)?(%s)\b" % "|".join(SOFT_QUALIFIERS), re.I)
 
@@ -261,6 +282,8 @@ class Query:
     excluded: set = field(default_factory=set)       # lines the question rules out ("not the jumbo")
     text: str = ""                                   # the question without the lines it rules out
     specs: set = field(default_factory=set)          # loan-type specs ("7/1"), each must be on the row
+    expansion: list = field(default_factory=list)    # search words the wording implies ("eligible" for "who can join?")
+    rate_kind: str | None = None                     # "intro": every rate asked about is an introductory rate
 
     @property
     def numbers(self) -> set:
@@ -329,6 +352,14 @@ def parse_query(question: str) -> Query:
         q.attribute = "hours"
         if "hour" not in q.tokens:
             q.tokens.append("hour")
+    if q.attribute is None and ELIGIBILITY_Q.search(low) and MEMBERSHIP_Q.search(low):
+        # who may become a member = who is eligible to join
+        q.expansion = [t for t in (_stem("eligible"), _stem("join")) if t not in q.tokens]
+        q.tokens += q.expansion
+    if q.attribute == "rate":
+        kinds = [m.span() for m in KIND_RATE.finditer(low)]
+        if kinds and all(any(a <= s and e <= b for a, b in kinds) for s, e in (m.span() for m in RATE_Q.finditer(low))):
+            q.rate_kind = "intro"
     if q.attribute in ("rate", "fee"):
         toks = re.findall(r"[a-z]+", low.replace("-", " "))
         for k, t in enumerate(toks):
@@ -389,6 +420,14 @@ def qualify(c: Chunk, q: Query) -> tuple[str, float]:
 def supports(c: Chunk, q: Query) -> bool:
     """Does this chunk actually state the attribute asked for, about the entity/product asked about?"""
     text = c.index_text.lower()
+    if q.rate_kind:
+        # an introductory rate: the chunk says "intro", and its own title, heading or row label names the
+        # product asked about (an intro offer on another product mentioned in passing doesn't count)
+        if not KIND_EV.search(text):
+            return False
+        own = c.index_text[:max(0, len(c.index_text) - len(c.text))] + " " + (c.label() if c.is_row else "")
+        if q.category and not names_line(own.lower(), q):
+            return False
     if q.entity and (q.entity not in text or (q.entity_is_branch and "branch" not in text)):
         return False
     # a descriptor is present as itself or as the site's word for it ("car" loan -> "Auto" rows)
@@ -412,7 +451,8 @@ def supports(c: Chunk, q: Query) -> bool:
     if q.attribute == "rate":           # published rates live in rate tables or product pages,
         if c.is_row:                    # not in blog posts or press releases
             return any("%" in v for _, v in c.values())
-        return c.kind != "article" and bool(RATE_EV.search(c.text))
+        # an intro offer is often worded its own way ("1.99% intro APR", "2.90%1 APR")
+        return c.kind != "article" and bool(RATE_EV.search(c.text) or (q.rate_kind and KIND_RATE_EV.search(c.text)))
     if q.attribute == "count":
         return bool(count_re(q.count_noun).search(c.text.lower()))
     if q.attribute == "address":
