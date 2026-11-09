@@ -621,6 +621,10 @@ class Rev26(unittest.TestCase):
         self.assertEqual(asking_clause("Hi there! Quick one: how many offices are open?"), "how many offices are open?")
         self.assertEqual(asking_clause("Hey - what does a bank check cost?"), "what does a bank check cost?")
         self.assertEqual(asking_clause("What is the 9-month APY?"), "What is the 9-month APY?")
+        self.assertEqual(asking_clause("How many offices are open? Asking for my aunt."), "How many offices are open?")
+        self.assertNotIn("aunt", parse_query("How many offices are open? Asking for my aunt.").tokens)
+        from retrieve import CHAT_FILLERS, _stem
+        self.assertTrue({_stem("pls"), _stem("thanks")} <= CHAT_FILLERS)
 
     def test_a_lower_case_branch_name_is_read_from_the_sites_own_proper_names(self):
         from ingest import Chunk

@@ -270,7 +270,8 @@ def parse_query(question: str) -> Query:
     question = NEGATED_QUALIFIER.sub(" ", question)     # "not the jumbo": the standard product is asked about
     norm = normalize_numbers(question)
     low = norm.lower()
-    q = Query(raw, tokenize(question))
+    asked = re.match(r".*\?", question, re.S)           # "...? Asking for a friend." searches the question only
+    q = Query(raw, tokenize(asked.group(0) if asked else question))
     q.text, q.excluded = question, excluded
     q.terms = terms_in(low)
     q.native_terms = native_terms(low)
@@ -769,14 +770,19 @@ RARE_SHARE = 0.005       # a word on under 0.5% of chunks names something specif
 FEE_WORDS = {_stem(w) for w in ("fee", "fees", "cost", "costs", "charge", "charges", "price", "pay")}
 
 
+# Chat shorthand for "please" and "thanks": never a thing the question asks about.
+CHAT_FILLERS = {_stem(w) for w in ("pls", "plz", "thx", "thanks", "thank", "ty", "asap")}
 QUESTION_START = r"(?:how|what|what['’]?s|when|where|which|who|why|is|are|do|does|did|can|could|will|would|should)\b"
 OPENER = re.compile(rf"^(?:(?:[^?.!:]*[!:]|[^?,]*,|[^?]*?\s[-–—]\s)\s*)+?(?={QUESTION_START})", re.I)
 
 
 def asking_clause(text: str) -> str:
     """The question without a leading greeting or aside ("Hi! Quick question: how many ...", "I was
-    wondering, what ..."): openers ending in "!", ":", "," or a spaced dash, up to a question word."""
-    return OPENER.sub("", text)
+    wondering, what ..."): openers ending in "!", ":", "," or a spaced dash, up to a question word; and
+    without anything after its last question mark ("... have? Asking for a friend.")."""
+    text = OPENER.sub("", text)
+    asked = re.match(r".*\?", text, re.S)
+    return asked.group(0) if asked else text
 
 
 def rare_subject(index: Index, q: Query) -> list[list[str]]:
@@ -786,7 +792,7 @@ def rare_subject(index: Index, q: Query) -> list[list[str]]:
     limit = RARE_SHARE * max(1, len(index.chunks))
     out = []
     for t in dict.fromkeys(tokenize(asking_clause(q.raw))):      # a greeting names nothing asked about
-        if t in GENERIC or t in FEE_WORDS or t == q.count_noun or t[0].isdigit():
+        if t in GENERIC or t in FEE_WORDS or t in CHAT_FILLERS or t == q.count_noun or t[0].isdigit():
             continue
         if len(index.postings.get(t, ())) < limit:
             out.append([t] + _SYN.get(t, []))
