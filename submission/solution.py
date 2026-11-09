@@ -31,7 +31,8 @@ from datetime import date, timedelta   # noqa: E402
 
 from ingest import KIND_RANK, MONTHS, STATUS_RANK, Chunk, Store, url_key   # noqa: E402
 import retrieve                        # noqa: E402
-from retrieve import STOP, Index, parse_query, select, tokenize, use_site_words   # noqa: E402
+from retrieve import (STOP, Index, parse_query, proper_names, select, tokenize, use_proper_names,   # noqa: E402
+                      use_site_words)
 from synth import REFUSAL, Synthesizer  # noqa: E402
 
 
@@ -48,6 +49,8 @@ class KnowledgeSystem:
         view = self._store.add_snapshot(snapshot)
         use_site_words(self._store.site_words)      # derived from the crawl; must precede tokenizing
         index = Index(view)
+        self._store.proper_names = proper_names(index.chunks)   # branch names written in lower case
+        use_proper_names(self._store.proper_names)
         _facts(index)                  # build per-view lookups now: loading is untimed, answers are
         _page_texts(index)
         _glossary(index)
@@ -57,6 +60,14 @@ class KnowledgeSystem:
 
     def answer(self, question: str, as_of: str | None = None) -> Answer:
         _own_site(self._store)
+        span = change_span(question, self._store) if as_of is None else None
+        if span:                                 # "how did it change between June and September?"
+            v1, v2 = (self._store.view_for(d.isoformat() if d else None) for d in span)
+            if v1 is not None and v2 is not None and v1 != v2:
+                key = ("change", re.sub(r"[^a-z0-9$%.]+", " ", question.lower()).strip(), v1, v2)
+                if key not in self._cache:
+                    self._cache[key] = _respond_change(self._indexes[v1], self._indexes[v2], self._synth, question)
+                return self._cache[key]
         asked = as_of or moment_asked(question, self._store, self._indexes)   # or the moment it names
         vi = self._store.view_for(asked)
         day = _iso(asked)                       # the day the model is told, when later than the crawl
@@ -86,6 +97,8 @@ def _own_site(store: Store) -> None:
     process was loaded since."""
     if retrieve.SITE_WORDS != store.site_words:
         use_site_words(store.site_words)
+    if retrieve.PROPER_NAMES != getattr(store, "proper_names", set()):
+        use_proper_names(getattr(store, "proper_names", set()))
 
 
 MAX_SOURCES = 8     # pages that state the values given; the same page is often served under several URL variants
@@ -280,6 +293,56 @@ def moment_asked(question: str, store: Store, indexes: list) -> str | None:
     if any(p.publish and since < p.publish <= asked for p in best) or any(p.publish == asked for p in pages):
         return None                     # ... or the question names the day one of those articles came out
     return d
+
+
+# A question about how a value changed over time ("How did X change between June and September 2026?",
+# "Has X gone up since May 2026?") is answered from the site as it stood at each date, both values given
+# with their dates. Both the change wording and a date in the question are needed; otherwise nothing changes.
+CHANGE_ASK = re.compile(
+    r"\bhow (?:did|has|have|had)\b[^?]{0,120}?\bchange[ds]?\b|"
+    r"\b(?:did|has|have|had)\b[^?]{0,120}?\b(?:go(?:ne)? (?:up|down)|went (?:up|down)|increase[ds]?|"
+    r"decrease[ds]?|rise[ns]?|rose|fall(?:en)?|fell|drop(?:ped)?|change[ds]?)\b|"
+    r"\bwhat (?:was|is|were) the change\b", re.I)
+_MONTH = "|".join(MONTHS) + "|sept?|jan|feb|mar|apr|jun|jul|aug|oct|nov|dec"
+MONTH_PAIR = re.compile(rf"\b(?:between|from)\s+({_MONTH})\.?\s+(?:and|to)\s+(?:{_MONTH})\.?\s+"
+                        rf"(?:\d{{1,2}}(?:st|nd|rd|th)?,?\s+)?(20\d\d)", re.I)          # "between May and June 2026"
+SPAN_FROM = re.compile(r"\b(?:since|after|from)\s+(?:\S+\s+){0,2}$", re.I)
+
+
+def change_span(question: str, store: Store) -> tuple | None:
+    """(start, end) dates of a change the question asks about; end None means "now". A month alone means
+    the site as it stood by the end of that month."""
+    if len(store.views) < 2 or not CHANGE_ASK.search(question):
+        return None
+    found = [(m.start(1), d) for m in DATE_PHRASE.finditer(question) if (d := _phrase_date(m.group(1)))]
+    if len(found) < 2 and (mp := MONTH_PAIR.search(question)) and (d := _phrase_date(f"{mp.group(1)} {mp.group(2)}")):
+        found.append((mp.start(1), d))
+    days = sorted({d for _, d in found})
+    if len(days) >= 2:
+        return days[0], days[-1]
+    if len(days) == 1 and SPAN_FROM.search(question[:found[0][0]]):
+        return days[0], None
+    return None
+
+
+def _respond_change(first: Index, last: Index, synth: Synthesizer, question: str) -> Answer:
+    search = strip_temporal(question, lambda d: True)       # the dates name the two moments, not search words
+    parts = []
+    for index in (first, last):
+        q = parse_query(search)
+        parts.append((index.view, q, select(index, q)))
+    if not any(ev.chunks and (not q.attribute or ev.supported) for _, q, ev in parts):
+        return Answer(text=REFUSAL, confident=False)
+    text, cited = synth.compose_change(question, parts)
+    if text == REFUSAL:
+        return Answer(text=REFUSAL, confident=False)
+    sources, seen = [], set()
+    for view, c in cited:
+        vp = view.pages[c.key]
+        if (c.key, vp.snapshot_id) not in seen and len(sources) < MAX_SOURCES:
+            seen.add((c.key, vp.snapshot_id))
+            sources.append(Source(url=vp.page.url, snapshot_id=vp.snapshot_id, quote=c.text[:240]))
+    return Answer(text=text, sources=sources, confident=True)
 
 
 def _iso(value: str | None) -> date | None:

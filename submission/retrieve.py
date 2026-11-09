@@ -51,6 +51,24 @@ BRANCH_NOT_NAMES = {"the", "your", "a", "our", "lobby", "drive-up", "drive", "mo
 # KnowledgeSystem.ingest hands it to use_site_words before indexing.
 SITE_WORDS: set = set()
 _BASE_STOP, _BASE_GENERIC, _BASE_BRANCH = frozenset(STOP), frozenset(GENERIC), frozenset(BRANCH_NOT_NAMES)
+# Words the site only ever writes capitalised mid-sentence ("Elmwood"), never in lower case ("nearest"):
+# its proper names, derived from the crawl at ingest. They let "the elmwood branch" name a branch.
+PROPER_NAMES: set = set()
+
+
+def proper_names(chunks) -> set:
+    cap, low = Counter(), Counter()
+    for c in chunks:
+        for sent in re.split(r"(?<=[.!?])\s+|\n|\s[-–—|•]\s", c.text):
+            for w in re.findall(r"[A-Za-z][\w'’-]*", sent)[1:]:
+                (cap if w[0].isupper() else low)[w.lower()] += 1
+    return {w for w, n in cap.items() if n >= 2 and not low[w] and len(w) > 2
+            and w not in STOP and w not in BRANCH_NOT_NAMES}
+
+
+def use_proper_names(names) -> None:
+    PROPER_NAMES.clear()
+    PROPER_NAMES.update(names)
 
 
 def use_site_words(words) -> None:
@@ -288,6 +306,11 @@ def parse_query(question: str) -> Query:
         words = [w for w in words if w.strip(".,'’").lower() not in BRANCH_NOT_NAMES]
         q.entity = words[0].strip(".,'’").lower() if words else None
         q.entity_is_branch = q.entity is not None
+    if not q.entity and PROPER_NAMES:          # "the elmwood branch", written in lower case
+        m = re.search(r"((?:[a-z][\w'’-]*\s+){1,3})branch\b", question.lower())
+        name = next((w for w in m.group(1).split() if w in PROPER_NAMES), None) if m else None
+        if name:
+            q.entity, q.entity_is_branch = name, True
     if q.attribute is None and (m := COUNT_CUE.search(low)) and m.group(1) not in STOP:
         q.attribute, q.count_noun = "count", _stem(m.group(1))
         q.tokens = [t for t in q.tokens if t not in ("number", "total")]
@@ -537,6 +560,8 @@ def select(index: Index, q: Query, k: int = 8) -> Evidence:
         pat, have = count_re(q.count_noun), {c.id for _, c in hits}
         hits += [(_bm25_floor(hits), index.chunks[pos]) for pos, _ in index.postings.get(q.count_noun, [])
                  if index.chunks[pos].id not in have and pat.search(index.chunks[pos].text.lower())]
+    if q.attribute == "rate" and q.category:
+        hits += product_page_rates(index, q, hits)
     scored = []
     for s, c in hits:
         if c.expired_on and c.expired_on < view.taken_on:
@@ -635,6 +660,11 @@ def select(index: Index, q: Query, k: int = 8) -> Evidence:
     context = [c for c in with_context(chosen, dropped_chunks, view, q, overflow) if not on_other_line(c, lines)]
     if q.list_intent:
         context += list_rows(hits, context, dropped_chunks, view, q)
+    # The model reads rows of a line the question didn't ask for (business, jumbo, ...) last, after the
+    # standard product's own evidence; the extractive answer's evidence is unchanged.
+    other = [c for c in context if c.is_row and any(re.search(rf"\b{w}\b", f"{c.label()} {c.section} {c.key}".lower())
+                                                    for w in SOFT_QUALIFIERS if w not in q.qualifiers)]
+    context = [c for c in context if c not in other] + other
     return Evidence(chosen, dropped_chunks, supported, copies, context)
 
 
@@ -657,6 +687,28 @@ def other_lines(q: Query, top: Chunk | None) -> set:
 
 def on_other_line(c: Chunk, lines: set) -> bool:
     return bool(lines) and c.is_row and any(re.search(rf"\b{w}\b", c.index_text.lower()) for w in lines)
+
+
+def product_page_rates(index: Index, q: Query, hits) -> list:
+    """A product's own page is the authority for its rates. Its rate-stating paragraphs join the candidates
+    even when the member's words ("interest", "charge") rank them below blog posts: product pages whose
+    address names every product word of the question ("credit card" -> /.../credit-cards)."""
+    want = {_stem(w) for w in q.category | q.descriptors}
+    paths = getattr(index, "_paths", None)
+    if paths is None:                        # built once per view
+        paths = {k: set(tokenize(vp.page.url.split("/", 3)[-1])) for k, vp in index.view.pages.items()}
+        index._paths = paths
+    have = {c.id for _, c in hits}
+    floor = hits[min(len(hits) - 1, 29)][0] if hits else 1.0
+    out = []
+    for key, vp in index.view.pages.items():
+        if vp.status == "missing" or vp.page.kind != "product" or not want <= paths[key]:
+            continue
+        for c in vp.page.chunks:
+            if c.id not in have and not c.is_row and RATE_EV.search(c.text):
+                out.append((floor, c))
+                have.add(c.id)
+    return out
 
 
 def list_rows(hits, context: list[Chunk], dropped: list[Chunk], view, q: Query, limit: int = 4) -> list[Chunk]:
@@ -717,13 +769,23 @@ RARE_SHARE = 0.005       # a word on under 0.5% of chunks names something specif
 FEE_WORDS = {_stem(w) for w in ("fee", "fees", "cost", "costs", "charge", "charges", "price", "pay")}
 
 
+QUESTION_START = r"(?:how|what|what['’]?s|when|where|which|who|why|is|are|do|does|did|can|could|will|would|should)\b"
+OPENER = re.compile(rf"^(?:(?:[^?.!:]*[!:]|[^?,]*,|[^?]*?\s[-–—]\s)\s*)+?(?={QUESTION_START})", re.I)
+
+
+def asking_clause(text: str) -> str:
+    """The question without a leading greeting or aside ("Hi! Quick question: how many ...", "I was
+    wondering, what ..."): openers ending in "!", ":", "," or a spaced dash, up to a question word."""
+    return OPENER.sub("", text)
+
+
 def rare_subject(index: Index, q: Query) -> list[list[str]]:
     """The specific things a fee or count question is about ("Springfield", "cashier's check"), each with
     its synonyms. A fee line or count that names none of them answers a different question, so the
     honest answer is "isn't listed". Common words ("lost", "card") are not required."""
     limit = RARE_SHARE * max(1, len(index.chunks))
     out = []
-    for t in dict.fromkeys(tokenize(q.raw)):
+    for t in dict.fromkeys(tokenize(asking_clause(q.raw))):      # a greeting names nothing asked about
         if t in GENERIC or t in FEE_WORDS or t == q.count_noun or t[0].isdigit():
             continue
         if len(index.postings.get(t, ())) < limit:

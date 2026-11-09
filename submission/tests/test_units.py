@@ -612,6 +612,65 @@ class Rev24(unittest.TestCase):
         self.assertLessEqual(len(best_sentence(Chunk(2, "example.org/help", "product", long, long), q)), PARAGRAPH_CHARS)
 
 
+class Rev26(unittest.TestCase):
+    """Openers, lower-case branch names, a product's own page, excerpt order and change questions
+    (synthetic data only)."""
+
+    def test_an_opener_is_not_part_of_the_question(self):
+        from retrieve import asking_clause
+        self.assertEqual(asking_clause("Hi there! Quick one: how many offices are open?"), "how many offices are open?")
+        self.assertEqual(asking_clause("Hey - what does a bank check cost?"), "what does a bank check cost?")
+        self.assertEqual(asking_clause("What is the 9-month APY?"), "What is the 9-month APY?")
+
+    def test_a_lower_case_branch_name_is_read_from_the_sites_own_proper_names(self):
+        from ingest import Chunk
+        from retrieve import proper_names, use_proper_names
+        text = ("We opened our Pinecrest Branch in spring. Members love Pinecrest staff. "
+                "Find your nearest branch online. Visit a nearest office.")
+        names = proper_names([Chunk(1, "example.org/news", "product", text, text)])
+        self.assertIn("pinecrest", names)
+        self.assertNotIn("nearest", names)
+        use_proper_names(names)
+        try:
+            self.assertEqual(parse_query("lobby hours at the pinecrest branch?").entity, "pinecrest")
+            self.assertIsNone(parse_query("where is your nearest branch?").entity)
+        finally:
+            use_proper_names(set())
+
+    def test_a_products_own_page_states_its_rates(self):
+        from types import SimpleNamespace as NS
+        from ingest import Chunk
+        from retrieve import product_page_rates
+        own = Chunk(1, "example.org/personal/widget-cards", "product", "Gold Widget: 9.75% APR.", "")
+        blog = Chunk(2, "example.org/blog/widget-tips", "article", "A widget card at 8.50% APR.", "")
+        page = lambda url, kind, chunks: NS(status="fresh", page=NS(url=url, kind=kind, chunks=chunks))
+        index = NS(view=NS(pages={"example.org/personal/widget-cards": page("https://example.org/personal/widget-cards", "product", [own]),
+                                  "example.org/blog/widget-tips": page("https://example.org/blog/widget-tips", "article", [blog])}))
+        q = parse_query("How much interest do your widget cards charge?")
+        self.assertEqual([c.id for _, c in product_page_rates(index, q, [(5.0, blog)])], [1])
+
+    def _two_crawls(self, client=None):
+        from contract import Page, Snapshot
+        ks = build()
+        for sid, day, rate, apy in [("s1", "2030-01-10", "2.37%", "2.41%"), ("s2", "2030-06-15", "2.57%", "2.61%")]:
+            md = f"# Certificates\n\n| Term | Dividend Rate | APY |\n|---|---|---|\n| 12 Month | {rate} | {apy} |\n"
+            ks.ingest(Snapshot(sid, day, [Page("https://example.org/certificates", "Certificates | Example", md,
+                                               f"{day}T09:00:00Z")]))
+        return ks
+
+    def test_a_change_question_gives_each_date_its_value(self):
+        from solution import change_span
+        ks = self._two_crawls()
+        a = ks.answer("How did the 12-month certificate APY change between January 2030 and June 2030?")
+        self.assertIn("2.41%", a.text)
+        self.assertIn("2.61%", a.text)
+        self.assertEqual(change_span("Has the 12-month APY gone up since January 2030?", ks._store)[0], date(2030, 1, 31))
+        for plain in ("What is the 12-month certificate APY?", "How do I change my address?",
+                      "Can I change my certificate term after opening it in January 2030?"):
+            self.assertIsNone(change_span(plain, ks._store), plain)
+        self.assertNotIn("2.41%", ks.answer("What is the 12-month certificate APY?").text)
+
+
 class Contract(unittest.TestCase):
     def test_exactly_the_three_contract_methods(self):
         own = {n for n, v in vars(type(build())).items() if callable(v) and not n.startswith("__")}

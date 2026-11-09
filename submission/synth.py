@@ -259,13 +259,16 @@ class Synthesizer:
                 self._client = None
 
     def _llm(self, question: str, ev: Evidence, view: View, asked: date | None = None) -> dict | None:
+        excerpts = "\n\n".join(f"[{i}] ({describe(c, view)})\n{c.text}" for i, c in enumerate(_llm_chunks(ev), 1))
+        # A dated question is answered from the site as it stood that day, i.e. the newest crawl
+        # on or before it; showing the crawl's own (earlier) day reads as "can't confirm".
+        when = asked if asked and asked > view.taken_on else view.taken_on
+        return self._ask(f"Website snapshot date: {when.isoformat()}\n\nExcerpts:\n{excerpts}", question)
+
+    def _ask(self, content: str, question: str) -> dict | None:
         try:
             if self._client is None:                   # lazy: a missing package must not break build()
                 self._client = _new_client()
-            excerpts = "\n\n".join(f"[{i}] ({describe(c, view)})\n{c.text}" for i, c in enumerate(_llm_chunks(ev), 1))
-            # A dated question is answered from the site as it stood that day, i.e. the newest crawl
-            # on or before it; showing the crawl's own (earlier) day reads as "can't confirm".
-            when = asked if asked and asked > view.taken_on else view.taken_on
             client = self._client
             if self._probe and hasattr(client, "with_options"):
                 client = client.with_options(timeout=PROBE_TIMEOUT_S, max_retries=0)
@@ -274,9 +277,7 @@ class Synthesizer:
                 max_tokens=1024,
                 # the fixed instructions are identical on every call, so they are cached
                 system=[{"type": "text", "text": SYSTEM, "cache_control": {"type": "ephemeral"}}],
-                messages=[{"role": "user", "content":
-                           f"Website snapshot date: {when.isoformat()}\n\nExcerpts:\n{excerpts}\n\n"
-                           f"Question: {question}"}],
+                messages=[{"role": "user", "content": f"{content}\n\nQuestion: {question}"}],
                 output_config={"effort": "low", "format": {"type": "json_schema", "schema": SCHEMA}},
                 **_thinking_off(MODEL),
             )
@@ -289,6 +290,45 @@ class Synthesizer:
             self._cooldown = next((COOLDOWN[k.__name__] for k in type(e).__mro__ if k.__name__ in COOLDOWN), 0)
             self._probe = self._cooldown > 0
             return None
+
+    def compose_change(self, question: str, parts: list) -> tuple[str, list]:
+        """How a value changed: the site as it stood at each date [(view, query, evidence), ...]. Returns
+        (text, [(view, cited chunk), ...]). Without the model: each date's own answer, with its date."""
+        said, cited = [], []
+        for view, q, ev in parts:
+            text, used = extractive(q, ev, view)
+            if text != REFUSAL:
+                d = view.taken_on
+                said.append(f"As of {d:%B} {d.day}, {d.year}: {text}")
+                cited += [(view, c) for c in used]
+        fallback = " ".join(said) if said else REFUSAL
+        cooling = self._cooldown > 0
+        self._cooldown = max(0, self._cooldown - 1)
+        if self.enabled and not cooling:
+            out = self._llm_change(question, parts)
+            if out is not None:
+                if not out.get("answerable", False):
+                    return REFUSAL, []
+                text = _drop_banned(str(out.get("answer", "")))
+                shown = [(view, c) for view, _, ev in parts for c in _llm_chunks(ev)]
+                allowed = numbers(question) | numbers(" ".join(f"{c.text} {describe(c, view)} {view.taken_on}"
+                                                               for view, c in shown))
+                if text and numbers(text) <= allowed:
+                    ids = [i for i in out.get("evidence_ids", []) if isinstance(i, int) and 1 <= i <= len(shown)]
+                    return _drop_dead_links(text, parts[-1][0]), [shown[i - 1] for i in ids] or cited
+        return fallback, cited
+
+    def _llm_change(self, question: str, parts: list) -> dict | None:
+        blocks, n = [], 0
+        for view, _, ev in parts:
+            lines = []
+            for c in _llm_chunks(ev):
+                n += 1
+                lines.append(f"[{n}] ({describe(c, view)})\n{c.text}")
+            blocks.append(f"The website as it stood on {view.taken_on.isoformat()}:\n\n" + "\n\n".join(lines))
+        content = ("The member asks how something changed over time. Give the value as the website stood on each "
+                   "date below, each with its date, from that date's excerpts only.\n\n" + "\n\n".join(blocks))
+        return self._ask(content, question)
 
     def compose(self, question: str, q: Query, ev: Evidence, view: View,
                 asked: date | None = None, lookup=None) -> tuple[str, list[Chunk], bool, str]:
