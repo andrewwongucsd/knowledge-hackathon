@@ -166,6 +166,10 @@ AMT_RANGE_RE = re.compile(r"\$\s?([\d,]+(?:\.\d+)?)\s*[-–]\s*\$?\s?([\d,]+(?:\
 AMT_PLUS_RE = re.compile(r"\$\s?([\d,]+(?:\.\d+)?)\s*(?:\+|and (?:up|above|over))", re.I)
 AMT_LESS_RE = re.compile(r"\$\s?([\d,]+(?:\.\d+)?)\s+or less", re.I)
 SOFT_QUALIFIERS = ("jumbo", "business", "traditional", "roth", "ira", "refinance", "hsa", "health")
+# A loan-type spec ("7/1", "10/6" adjustable rates): two small numbers, never part of a date.
+SPEC_RE = re.compile(r"(?<![\d/])(\d{1,2})/(\d{1,2})(?![\d/])")
+# "the credit union" names the institution asking about, like the site's own name: never a product or search word.
+INSTITUTION = re.compile(r"\b(?:the|your|this|our|my|a)\s+credit\s+unions?(?:['’]s)?\b", re.I)
 NEGATED_QUALIFIER = re.compile(r"\b(?:not|non|excluding|except|other than|besides|without|rather than|instead of)"
                                r"[\s-]+(?:(?:the|a|an|any)\s+)?(%s)\b" % "|".join(SOFT_QUALIFIERS), re.I)
 
@@ -256,6 +260,7 @@ class Query:
     native_terms: set = field(default_factory=set)   # terms in the question's own unit, {(5, 'year')}
     excluded: set = field(default_factory=set)       # lines the question rules out ("not the jumbo")
     text: str = ""                                   # the question without the lines it rules out
+    specs: set = field(default_factory=set)          # loan-type specs ("7/1"), each must be on the row
 
     @property
     def numbers(self) -> set:
@@ -266,6 +271,7 @@ def parse_query(question: str) -> Query:
     raw = question                       # the model still sees the member's own words
     if RATE_Q.search(question) and ARM_RE.search(question):
         question = ARM_RE.sub("adjustable-rate mortgage", question)
+    question = INSTITUTION.sub(" ", question)
     excluded = {m.group(1).lower() for m in NEGATED_QUALIFIER.finditer(question)}
     question = NEGATED_QUALIFIER.sub(" ", question)     # "not the jumbo": the standard product is asked about
     norm = normalize_numbers(question)
@@ -292,6 +298,8 @@ def parse_query(question: str) -> Query:
         q.attribute = "when"
     elif ADDRESS_Q.search(low) and not (OWN_ADDRESS.search(low) and not PLACE_WORDS.search(low)):
         q.attribute = "address"
+    if q.attribute == "rate":
+        q.specs = {f"{a}/{b}" for a, b in SPEC_RE.findall(question)}
     if q.attribute == "fee":            # "within N days of opening": a condition of the fee, not a term
         q.terms, q.native_terms = set(), set()
     # "what are my options": a list, unless a term or model year already pins one row
@@ -307,8 +315,8 @@ def parse_query(question: str) -> Query:
         words = [w for w in words if w.strip(".,'’").lower() not in BRANCH_NOT_NAMES]
         q.entity = words[0].strip(".,'’").lower() if words else None
         q.entity_is_branch = q.entity is not None
-    if not q.entity and PROPER_NAMES:          # "the elmwood branch", written in lower case
-        m = re.search(r"((?:[a-z][\w'’-]*\s+){1,3})branch\b", question.lower())
+    if not q.entity and PROPER_NAMES:          # "the elmwood branch / location / office", any case
+        m = re.search(r"((?:[a-z][\w'’-]*\s+){1,3})(?:branch|location|office)\b", question.lower())
         name = next((w for w in m.group(1).split() if w in PROPER_NAMES), None) if m else None
         if name:
             q.entity, q.entity_is_branch = name, True
@@ -387,6 +395,8 @@ def supports(c: Chunk, q: Query) -> bool:
     if q.descriptors and not any(d in text or any(s in text for s in SYNONYMS.get(d, ())) for d in q.descriptors):
         return False
     if any(w not in text for w in q.qualifiers & {"jumbo", "business"}):
+        return False
+    if q.specs and not any(sp in text for sp in q.specs):      # "7/1": only a row naming that loan type
         return False
     if q.subject:                       # fee/count: every rare word asked about (or a synonym) is there
         have = c.tf if c.tf else Counter(tokenize(c.index_text))

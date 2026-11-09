@@ -8,7 +8,7 @@
 
 **`ingest`** turns each snapshot into a view: the newest copy of every page seen up to that date (pages that left the crawl marked removed), split into table rows, fee lines and paragraphs with type, publish, effective and offer-end dates.
 
-**`answer`** reads the qualifiers (term: a "5-year" loan is the 60-month row; model year; amount; product line unless ruled out: "not the jumbo"; kind of value) and members' wording: number words, abbreviations ("info"), "$" for "s", "my address" as the member's own. Judging words ("best") and words before a determiner never name a product; a greeting ("Hi! Quick question:"), an aside after the question ("Asking for a friend.") and chat shorthand ("pls") are not part of it; a lower-case branch name is recognised from the site's own proper names. It runs BM25 over the right view, drops other tiers' and lines' rows, and searches the top 400 hits before declining. A rate question always sees its product's own page, and rows of a line it didn't name (business, jumbo) come last.
+**`answer`** reads the qualifiers (term: a "5-year" loan is the 60-month row; model year; amount; product line unless ruled out: "not the jumbo"; kind of value) and members' wording: number words, abbreviations ("info"), "$" for "s", "my address" as the member's own. Judging words ("best") and words before a determiner never name a product; greetings, asides after the question and chat shorthand ("pls") are ignored; a branch name before "branch", "location" or "office", in any case, is read from the site's own proper names; "the credit union" is the institution; a loan type such as "7/1" must be on the row. It runs BM25 over the right view, drops other tiers' and lines' rows, and searches the top 400 hits before declining. A rate question always sees its product's own page, and rows of a line it didn't name (business, jumbo) come last.
 
 A question about how a value changed ("between June and September 2026", "since May 2026") gets the value at each date, from the site as it stood then; it needs both change wording and a date. A rate question whose term or model year picks out one row of the product named gets that row, with no model call. Otherwise Claude answers from the filtered evidence, and guards check that:
 - every number is in the evidence;
@@ -43,7 +43,7 @@ Nothing from the practice questions or this site is in the code or tests: the si
 |---|---|
 | Kit selftest with `--conflicts-gold` | accuracy 1.0, conflicts F1 1.0 |
 | Public 40 | with key 0.946 (p95 1.9s, 0 stale values, 0 errors, about $0.01); no key 0.811 (previous version 0.796) |
-| Battery: the 40 practice questions plus 160 rewordings and 39 dated questions by independent reviewers | with key 0.916 (previous version 0.889), reworded groups consistent 0.85 (0.70); no key 0.767 (0.748); 0 stale values |
+| Battery: the 40 practice questions plus 160 rewordings and 39 dated questions by independent reviewers | with key 0.916 (previous version 0.889), reworded groups consistent 0.85 (0.70); no key 0.772 (0.748); 0 stale values |
 | 32 held-out dated questions checked against the pages | with key 0.984 (previous version 0.922); no key 0.859 (0.797) |
 | 12 "how did it change" questions written from the snapshots | with key 0.90 (previous version 0.08); no key 0.875 (0.29) |
 | Conflicts vs a 21-entry key built independently | pillar 0.716 (previous version 0.687) |
@@ -53,4 +53,4 @@ Nothing from the practice questions or this site is in the code or tests: the si
 - Model answers vary between runs, so reworded questions can disagree.
 - With 40 questions, two slow API replies push p95 past 2s.
 - Contradictions that exist only across old snapshots are not listed.
-- Wording far from the site's ("who qualifies for membership" vs "eligible to join") can still miss the right page; small offline embedding models and model-written page questions were measured and did not fix it.
+- Wording far from the site's ("who qualifies for membership" vs "eligible to join") can miss the right page; small static and transformer embedding models and model-written page questions were measured and did not fix it.

@@ -653,6 +653,26 @@ class Rev26(unittest.TestCase):
         q = parse_query("How much interest do your widget cards charge?")
         self.assertEqual([c.id for _, c in product_page_rates(index, q, [(5.0, blog)])], [1])
 
+    def test_loan_specs_branch_nouns_and_the_institution(self):
+        from ingest import Chunk
+        from retrieve import supports, use_proper_names
+        q = parse_query("What is the rate on a 9/2 adjustable home loan?")
+        self.assertEqual(q.specs, {"9/2"})
+        row = lambda t: Chunk(1, "example.org/rates", "product", t, t)
+        self.assertFalse(supports(row("Home Loans 4/1 adjustable 6.10% APR"), q))
+        self.assertTrue(supports(row("Home Loans 9/2 adjustable 6.40% APR"), q))
+        self.assertEqual(parse_query("What was the APR on 4/30/2031?").specs, set())    # a date, not a spec
+        use_proper_names({"pinecrest"})
+        try:
+            self.assertEqual(parse_query("Hours at the Pinecrest location?").entity, "pinecrest")
+            self.assertEqual(parse_query("Address of the pinecrest office?").entity, "pinecrest")
+            self.assertIsNone(parse_query("What are the Main Office hours?").entity)
+        finally:
+            use_proper_names(set())
+        self.assertNotIn("union", parse_query("What is the credit union's routing number?").tokens)
+        self.assertEqual(parse_query("Do any of the credit union savings tiers pay 0.47% APY?").descriptors, set())
+        self.assertIn("credit", parse_query("What is the credit card APR?").descriptors)
+
     def _two_crawls(self, client=None):
         from contract import Page, Snapshot
         ks = build()
