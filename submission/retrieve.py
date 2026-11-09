@@ -90,6 +90,12 @@ HOURS_CUE = re.compile(r"\bhrs\b|\bwhat time\b(?!\s+(?:frame|period|limit)s?\b)|
 # Rate tables say "adjustable-rate", members say "ARM"; only for rate questions, so "what is a 5/1 ARM?"
 # still reaches the articles that explain ARMs.
 ARM_RE = re.compile(r"\bARMs?\b")
+# A product's name starts after the last determiner or possessive ("the sheet says its certificate"), and
+# words that judge a product ("the best certificate", "a good rate") never name one.
+DETERMINERS = {"the", "a", "an", "its", "your", "our", "my", "their", "his", "her", "this", "that", "these", "those",
+               "any", "each", "every", "some"}
+EVALUATIVE = {"best", "better", "top", "good", "great", "cheapest", "cheaper", "lowest", "lower", "highest", "higher",
+              "competitive", "excellent", "decent", "attractive", "favorable", "nice"}
 # Question-frame words are never part of a product's name ("where can I find checking rates").
 FRAME_WORDS = {"find", "get", "see", "use", "earn", "pay", "need", "open", "apply", "compare", "show", "list",
                "kind", "kinds", "type", "types", "available", "charge", "much", "can", "online"}
@@ -295,7 +301,10 @@ def parse_query(question: str) -> Query:
         toks = re.findall(r"[a-z]+", low.replace("-", " "))
         for k, t in enumerate(toks):
             if re.fullmatch(PRODUCT_HEADS, t):
-                q.descriptors |= {w for w in toks[max(0, k - 2):k] if w not in GENERIC and len(w) > 2
+                win = toks[max(0, k - 2):k]
+                cut = [j for j, w in enumerate(win) if w in DETERMINERS]   # "the sheet says its certificate"
+                win = win[cut[-1] + 1:] if cut else win
+                q.descriptors |= {w for w in win if w not in GENERIC and w not in EVALUATIVE and len(w) > 2
                                   and w not in FRAME_WORDS and not re.fullmatch(PRODUCT_HEADS, w)}
                 q.category.add(t)
     return q

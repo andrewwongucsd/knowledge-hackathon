@@ -595,6 +595,12 @@ class Rev24(unittest.TestCase):
                       "Where is the main office?"):
             self.assertEqual(parse_query(place).attribute, "address", place)   # where a place is
 
+    def test_product_words_skip_judgements_and_stop_at_a_determiner(self):
+        self.assertEqual(parse_query("The memo says its gold certificate APY is what?").descriptors, {"gold"})
+        self.assertEqual(parse_query("What is the best 7-month certificate rate?").descriptors, set())
+        self.assertEqual(parse_query("Cheapest certificate APY for 9 years?").descriptors, set())
+        self.assertEqual(parse_query("What is the best widget loan APR?").descriptors, {"widget"})   # still asked for
+
     def test_a_how_to_answer_without_the_model_is_the_whole_paragraph(self):
         from ingest import Chunk
         from synth import PARAGRAPH_CHARS, best_sentence

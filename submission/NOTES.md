@@ -8,7 +8,7 @@
 
 **`ingest`** turns each snapshot into a view: the newest copy of every page seen up to that date, with pages that left the crawl marked removed. Pages are split into table rows (header, section, effective date), fee lines and paragraphs, with type, publish date and offer end dates.
 
-**`answer`** reads the question's qualifiers: term (a "5-year" loan is the 60-month row), model year, amount, product line (jumbo, business or IRA, unless ruled out: "not the jumbo") and the kind of value asked for. It reads members' wording: number words, standard abbreviations ("info"), a name spelled with "$" for "s", and "my address" as the member's own. It runs BM25 over the right view, drops rows for other tiers or lines, and searches the top 400 hits before declining.
+**`answer`** reads the question's qualifiers: term (a "5-year" loan is the 60-month row), model year, amount, product line (jumbo, business or IRA, unless ruled out: "not the jumbo") and the kind of value asked for. It reads members' wording: number words, standard abbreviations ("info"), a name spelled with "$" for "s", and "my address" as the member's own. Judging words ("best", "top") and words before a determiner ("says its certificate") never name a product. It runs BM25 over the right view, drops other tiers' and lines' rows, and searches the top 400 hits before declining.
 
 A rate question whose term or model year picks out one row of the product named gets that row, with no model call. Otherwise Claude answers from the filtered evidence, and guards check that:
 - every number is in the evidence;
@@ -51,7 +51,7 @@ Nothing from the practice questions or this site is in the code or tests: the si
 | Kit selftest with `--conflicts-gold` | accuracy 1.0, conflicts F1 1.0 |
 | Public 40 | with key 0.946 (p95 1.9s, 0 stale values, 0 errors, about $0.01); no key 0.811 (previous version 0.796) |
 | Battery: the 40 practice questions, 160 rewordings and 39 dated questions written by independent reviewers | with key 0.911 (previous version 0.889), reworded groups consistent 0.825 (0.70); no key 0.765 (0.748); 0 stale values |
-| 32 held-out dated questions checked against the pages | with key 0.922; no key 0.813 (0.797) |
+| 32 held-out dated questions checked against the pages | with key 0.953 (previous version 0.922); no key 0.844 (0.797) |
 | Conflicts vs a 21-entry key built independently | pillar 0.716 (previous version 0.687) |
 
 ## Limitations
