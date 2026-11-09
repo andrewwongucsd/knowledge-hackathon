@@ -757,7 +757,7 @@ class Rev31(unittest.TestCase):
 
     def _portal_view(self, kind="product"):
         from types import SimpleNamespace as NS
-        page = lambda key, kind: NS(status="fresh", snapshot_id="s1", page=NS(kind=kind, key=key, url="https://" + key))
+        page = lambda key, kind: NS(status="fresh", snapshot_id="s1", page=NS(kind=kind, key=key, url="https://" + key, title=""))
         return NS(pages={"example.org/members": page("example.org/members", kind),
                          "example.org/about": page("example.org/about", "product")})
 
@@ -810,6 +810,51 @@ class Rev31(unittest.TestCase):
         coral = ks.answer("What is the intro APR on the Coral card?")
         self.assertFalse(coral.confident)
         self.assertNotIn("2.49", coral.text)
+
+
+class Rev32(unittest.TestCase):
+    """Portal links given by the page about joining; specials the member names (synthetic data only)."""
+
+    def _view(self):
+        from types import SimpleNamespace as NS
+        page = lambda key, kind, title: NS(status="fresh", snapshot_id="s1",
+                                           page=NS(kind=kind, key=key, url="https://" + key, title=title))
+        return NS(pages={"example.org/join": page("example.org/join", "product", "Join"),
+                         "example.org/apply-info": page("example.org/apply-info", "product", "Apply"),
+                         "example.org/grow-lp": page("example.org/grow-lp", "promo", "Grow your savings"),
+                         "example.org/branches": page("example.org/branches", "product", "Branches")})
+
+    def test_the_join_pages_portal_wins_a_tie_for_a_membership_question(self):
+        from ingest import Chunk
+        from solution import pick_link
+        ch = lambda i, key, text: Chunk(i, key, "product", text, text)
+        ctx = [ch(1, "example.org/join", "Join today (join.example.org)."),
+               ch(2, "example.org/grow-lp", "Join in person (example.org/branches).")]
+        widely = lambda u: 50 if "branches" in u else 3          # the branch page is linked from every page
+        view = self._view()
+        self.assertEqual(pick_link(ctx, view, parse_query("What's the link to join?"), widely), "join.example.org")
+        become = [ch(3, "example.org/join", "Become a member (join.example.org).")]
+        self.assertEqual(pick_link(become, view, parse_query("URL to become a member?"), widely), "join.example.org")
+        # not a membership question: ties are settled as before (the more widely linked page)
+        apply = [ch(4, "example.org/apply-info", "Apply now (apply.example.org)."),
+                 ch(5, "example.org/grow-lp", "Apply in person (example.org/branches).")]
+        self.assertEqual(pick_link(apply, view, parse_query("What's the link to apply?"), widely), "example.org/branches")
+
+    def test_a_named_special_answers_an_intro_rate_question(self):
+        from contract import Page, Snapshot
+        md = ("# Rates\n\n## Certificates\n\n| Certificate | APY |\n|---|---|\n"
+              "| 9 Month Coral Certificate Special | 3.15% |\n| 12 Month Coral Certificate | 1.40% |\n")
+        ks = build()
+        ks.ingest(Snapshot("s1", "2030-01-10", [Page("https://example.org/rates", "Rates | Example", md,
+                                                     "2030-01-10T09:00:00Z")]))
+        self.assertEqual(parse_query("What is the intro rate on the certificate special?").rate_kind, "offer")
+        self.assertEqual(parse_query("Is there a special intro rate on certificates?").rate_kind, "intro")
+        self.assertIn("3.15%", ks.answer("What is the intro rate on the certificate special?").text)
+        for q in ("What is the intro rate on certificates?", "Is there a special intro rate on certificates?",
+                  "What is the intro rate on the savings special?"):
+            a = ks.answer(q)
+            self.assertFalse(a.confident, q)
+            self.assertNotIn("3.15", a.text, q)
 
 
 class Contract(unittest.TestCase):

@@ -189,6 +189,12 @@ RATE_KINDS = r"intro(?:ductory)?|teaser"
 KIND_RATE = re.compile(rf"\b(?:{RATE_KINDS})\s+(?:(?:balance[- ]transfer|dividend|interest|annual percentage)\s+)?"
                        r"(?:apr|apy|rates?|yield|dividend)\b", re.I)
 KIND_EV = re.compile(rf"\b(?:{RATE_KINDS})\b", re.I)
+# ...unless the member names the offer itself ("the intro rate on the certificate special"): then the site's
+# "special" or "promo" on that product's own row or heading is the offer meant. Only "special" as a noun
+# counts, not "a special intro rate".
+OFFER_NOUN = re.compile(r"\b(?:specials?|promos?|promotions?)\b"
+                        r"(?!\s+(?:intro(?:ductory)?|teaser|rates?|ap[ry]s?|yields?|dividends?|interest)\b)", re.I)
+OFFER_LABEL = re.compile(r"\b(?:specials?|promos?|promotions?)\b", re.I)
 KIND_RATE_EV = re.compile(rf"\d+(?:\.\d+)?\s*%\s*\d?\s*(?:(?:{RATE_KINDS})\s+)?(?:APR|APY|annual percentage|dividend)|"
                           rf"(?:{RATE_KINDS})\s+(?:\w+\s+){{0,3}}(?:rate|apr|apy)\b[^.]{{0,40}}?\d+(?:\.\d+)?\s*%", re.I)
 NEGATED_QUALIFIER = re.compile(r"\b(?:not|non|excluding|except|other than|besides|without|rather than|instead of)"
@@ -283,7 +289,8 @@ class Query:
     text: str = ""                                   # the question without the lines it rules out
     specs: set = field(default_factory=set)          # loan-type specs ("7/1"), each must be on the row
     expansion: list = field(default_factory=list)    # search words the wording implies ("eligible" for "who can join?")
-    rate_kind: str | None = None                     # "intro": every rate asked about is an introductory rate
+    rate_kind: str | None = None                     # "intro": every rate asked about is an introductory rate;
+                                                     # "offer": ...of a special or promo the question names
 
     @property
     def numbers(self) -> set:
@@ -359,7 +366,7 @@ def parse_query(question: str) -> Query:
     if q.attribute == "rate":
         kinds = [m.span() for m in KIND_RATE.finditer(low)]
         if kinds and all(any(a <= s and e <= b for a, b in kinds) for s, e in (m.span() for m in RATE_Q.finditer(low))):
-            q.rate_kind = "intro"
+            q.rate_kind = "offer" if OFFER_NOUN.search(low) else "intro"
     if q.attribute in ("rate", "fee"):
         toks = re.findall(r"[a-z]+", low.replace("-", " "))
         for k, t in enumerate(toks):
@@ -423,11 +430,15 @@ def supports(c: Chunk, q: Query) -> bool:
     if q.rate_kind:
         # an introductory rate: the chunk says "intro", and its own title, heading or row label names the
         # product asked about (an intro offer on another product mentioned in passing doesn't count)
-        if not KIND_EV.search(text):
-            return False
-        own = c.index_text[:max(0, len(c.index_text) - len(c.text))] + " " + (c.label() if c.is_row else "")
-        if q.category and not names_line(own.lower(), q):
-            return False
+        label = ((c.label() if c.is_row else c.section) or "").lower()
+        offer = (q.rate_kind == "offer" and OFFER_LABEL.search(label) is not None
+                 and (not (q.category or q.descriptors) or names_line(label, q)))   # "9 Month Certificate Special"
+        if not offer:
+            if not KIND_EV.search(text):
+                return False
+            own = c.index_text[:max(0, len(c.index_text) - len(c.text))] + " " + (c.label() if c.is_row else "")
+            if q.category and not names_line(own.lower(), q):
+                return False
     if q.entity and (q.entity not in text or (q.entity_is_branch and "branch" not in text)):
         return False
     # a descriptor is present as itself or as the site's word for it ("car" loan -> "Auto" rows)

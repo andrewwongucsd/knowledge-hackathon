@@ -31,8 +31,8 @@ from datetime import date, timedelta   # noqa: E402
 
 from ingest import KIND_RANK, MONTHS, STATUS_RANK, Chunk, Store, _on_site, url_key   # noqa: E402
 import retrieve                        # noqa: E402
-from retrieve import (CHAT_FILLERS, STOP, Evidence, Index, parse_query, proper_names, select, tokenize,   # noqa: E402
-                      use_proper_names, use_site_words)
+from retrieve import (CHAT_FILLERS, MEMBERSHIP_Q, STOP, Evidence, Index, _stem, parse_query, proper_names,  # noqa: E402
+                      select, tokenize, use_proper_names, use_site_words)
 from synth import REFUSAL, Synthesizer  # noqa: E402
 
 
@@ -389,12 +389,18 @@ def pick_link(context: list[Chunk], view, q, carried=None) -> str | None:
     A link to one of the site's own hosts that the crawl never fetched (an application portal such as
     join.<site>) can't be checked against a page, so it needs more: a live, non-article page gives it, its
     anchor text names everything asked, and its own host or path shares a word asked (so a click tracker
-    behind "Apply today" is never the answer)."""
+    behind "Apply today" is never the answer).
+
+    For a question about joining or membership (becoming a member is joining), "join" also counts for that
+    host or path word, and a portal given by the site's page about joining (its title or path says so) wins a
+    tie: the page that gives a portal is the only evidence for it."""
     subject = set(q.tokens) - LINK_WORDS - CHAT_FILLERS - set(q.expansion)
     cover = subject - MEDIUM_WORDS
+    joining = MEMBERSHIP_Q.search(q.raw) is not None
+    addr = cover | ({_stem("join")} if joining else set())
     hosts = {k.split("/", 1)[0] for k in view.pages}
     pages: dict = {}
-    portals = set()
+    portals, given_by_own_page = set(), set()
     for c in context:
         for m in LINK_RE.finditer(c.text):
             link, anchor = m.group(2).rstrip("/"), set(tokenize(m.group(1)))
@@ -403,9 +409,11 @@ def pick_link(context: list[Chunk], view, q, carried=None) -> str | None:
                 carrier = view.pages.get(c.key)
                 if (link.split("/", 1)[0] in hosts or not _on_site(link, hosts) or carrier is None
                         or carrier.status == "missing" or carrier.page.kind == "article"
-                        or not cover or not cover <= anchor or not set(tokenize(link)) & cover):
+                        or not cover or not cover <= anchor or not set(tokenize(link)) & addr):
                     continue
                 portals.add(link)
+                if joining and addr & set(tokenize(f"{carrier.page.title or ''} {c.key.split('/', 1)[-1]}")):
+                    given_by_own_page.add(link)
             elif vp.status == "missing" or vp.page.kind == "article":
                 continue
             if anchor & subject:
@@ -414,7 +422,7 @@ def pick_link(context: list[Chunk], view, q, carried=None) -> str | None:
         return None
     def weight(u):                 # a portal counts where it is written as a link, not inside longer links
         return 0 if not carried else carried(f"({u})") if u in portals else carried(u)
-    return max(pages, key=lambda u: (len(pages[u]), weight(u)))
+    return max(pages, key=lambda u: (len(pages[u]), u in given_by_own_page, weight(u)))
 
 
 def link_source(link: str, context: list[Chunk], view):
