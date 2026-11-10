@@ -1021,6 +1021,43 @@ class Rev35(unittest.TestCase):
                          "example.org/canoes")
 
 
+class Rev36(unittest.TestCase):
+    """Requirement questions vs link requests; application words; vehicle types (synthetic data only)."""
+
+    def test_only_a_requirements_question_skips_the_application(self):
+        from solution import APPLY_NEEDS
+        for q in ("I need the link to apply for a canoe loan online. What is it?",
+                  "Which link do I need to apply for a canoe loan?", "What URL do I need to apply for a canoe loan?",
+                  "Link to apply for a canoe loan? I have all my documents ready."):
+            self.assertIsNone(APPLY_NEEDS.search(q), q)
+        for q in ("What do I need to apply for a canoe loan?", "What will I need when applying for a canoe loan? Link please.",
+                  "Which documents do I need to apply? Link?"):
+            self.assertIsNotNone(APPLY_NEEDS.search(q), q)
+
+    def _view(self):
+        from types import SimpleNamespace as NS
+        from ingest import Chunk
+        text = ("Auto loans (example.org/autos). Apply today (apply.example.org/loan-application/auto-loan). "
+                "Apply today (apply.example.org/loan-application/canoe-loan).")
+        chunk = Chunk(1, "example.org/autos", "product", text, text)
+        page = lambda key, title, chunks=(): NS(status="fresh", snapshot_id="s1",
+                                                page=NS(kind="product", key=key, url="https://" + key, title=title,
+                                                        chunks=list(chunks)))
+        return NS(pages={"example.org/autos": page("example.org/autos", "Auto Loans", [chunk]),
+                         "example.org/canoe-cover": page("example.org/canoe-cover", "Canoe Insurance")}), [chunk]
+
+    def test_vehicle_types_and_words_no_application_uses(self):
+        from solution import pick_link
+        view, ctx = self._view()
+        self.assertEqual(pick_link(ctx, view, parse_query("What's the link to apply for a truck loan?")),
+                         "apply.example.org/loan-application/auto-loan")
+        chatty = parse_query("My husband and I want to apply online for a canoe loan for the family. What link starts it?")
+        self.assertEqual(pick_link(ctx, view, chatty), "apply.example.org/loan-application/canoe-loan")
+        # a product the site has a page for ("insurance") is not another product's application
+        self.assertNotEqual(pick_link(ctx, view, parse_query("What's the link to apply for canoe insurance?")),
+                            "apply.example.org/loan-application/canoe-loan")
+
+
 class Contract(unittest.TestCase):
     def test_exactly_the_three_contract_methods(self):
         own = {n for n, v in vars(type(build())).items() if callable(v) and not n.startswith("__")}

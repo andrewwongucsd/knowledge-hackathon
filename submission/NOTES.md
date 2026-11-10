@@ -13,7 +13,7 @@
 A rate question whose term or model year picks out one row gets that row with no model call. A "how did it change" question gets the value at each date named. Otherwise Claude answers from the filtered evidence, and guards check that every number is in the evidence, no link goes to a page missing from the crawl, a repeated statement's newest value appears, and a value quoted for a named product comes with that product's own row. If the model can't answer an open question (how / who / what-is), it picks up to 3 of the site's pages by title (a list built from the crawl) and answers once more from those (about 2% of questions, 2–3 seconds more).
 
 **Link questions** ("link", "URL", "web address") get the live, non-article page the site's own text links for what was asked, never a calculator unless asked:
-- an application portal on one of the site's uncrawled hosts counts when a live page gives it and its own words name what was asked; an "apply for X" question gets X's online application, from the evidence or X's own page;
+- an application portal on one of the site's uncrawled hosts counts when a live page gives it and its own words name what was asked; an "apply for X" question gets X's online application, from the evidence or X's own page (words no application of the site uses, "my husband", are not the product; a minivan or truck is a vehicle), unless it asks what applying needs;
 - a link worded for another line ("a business auto loan") gives way to the site's page titled with what was asked;
 - a question about joining ("apply for membership", "become / sign up as a member", opening someone's first account, or a bare "join") also reads the site's pages about joining and gets the application link they give, or the one for continuing an application. Joining something else ("the newsletter", "a board member") is not joining, and a second request in the same sentence keeps the usual pick.
 
@@ -42,7 +42,7 @@ Nothing from the practice questions or this site is in the code or tests. The si
 | Battery: the 40 practice questions, 160 rewordings and 39 dated questions by independent reviewers | with key 0.938, reworded groups consistent 0.925; no key 0.780; 0 stale values, every should-refuse item declined |
 | 32 held-out dated questions checked against the pages | with key 0.984; no key 0.859 |
 | 12 "how did it change" questions | with key 0.90; no key 0.875 |
-| 90 link, eligibility and intro-rate questions in 5 independent sets, each written against the previous version | every set improved on the version it was written against, with no question worse beyond run-to-run variation (latest set: 0.101 → 0.479) |
+| 100 link, eligibility and intro-rate questions in 6 independent sets, each written against the previous version | every set improved on the version it was written against, with no question worse beyond run-to-run variation (latest set: 0.230 → 0.815) |
 | Conflicts vs a 21-entry key built independently | pillar 0.716 |
 
 ## Limitations
@@ -50,4 +50,5 @@ Nothing from the practice questions or this site is in the code or tests. The si
 - Model answers vary between runs, so reworded questions can disagree, and two slow API replies push p95 past 2s.
 - Contradictions that exist only across old snapshots are not listed.
 - Wording far from the site's can still miss the right page when the model answers a nearby question instead of declining.
-- A joining question whose extra words name something other links do (a city, "my first job") keeps the usual pick; a product word the site doesn't use ("minivan") isn't matched to its product.
+- A joining question whose extra words name something other links do, when they sit in the same message as the request ("my cousin in Dubuque", "my first job"), keeps the usual pick.
+- A link question that rules a line out ("for personal use, not for a business") still counts that line as asked.

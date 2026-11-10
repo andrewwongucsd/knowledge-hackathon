@@ -589,7 +589,14 @@ def _pick_any(context: list[Chunk], view, q, carried=None) -> str | None:
 
 
 APPLY_Q = re.compile(r"\b(?:apply(?:ing)?|applications?)\b", re.I)
-APPLY_NEEDS = re.compile(r"\b(?:need|needs|require[sd]?|requirements?|documents?|paperwork)\b[^?]*?\bappl", re.I)
+_LINKISH = r"(?:link|url|web\s?page|website|address)"
+# "what do I need to apply?" asks for the requirements; "I need the link to apply" / "which link do I need" asks for the link
+APPLY_NEEDS = re.compile(
+    rf"\b(?:what|which)\b(?:(?!\b{_LINKISH}\b)[^?.])*?\b(?:need(?:ed|s)?|require[sd]?)\b(?:(?!\b{_LINKISH}\b)[^?.])*?\bappl"
+    r"|\b(?:documents?|paperwork|requirements?)\b[^?.]*?\bappl|\bappl\w*\b[^?.]*?\b(?:documents?|paperwork|requirements?)\b",
+    re.I)
+# vehicle types are vehicles (an auto loan covers them); used only to match application links
+VEHICLE_KINDS = {_stem(w): {_stem("auto"), _stem("vehicle")} for w in ("minivan", "van", "suv", "truck", "pickup")}
 APPLY_LINK = re.compile(r"\b(?:apply|application|request|start)\w*", re.I)
 NOT_APPLY_PRODUCT = set(tokenize("apply applying application applications submit check complete"))
 
@@ -604,14 +611,20 @@ def _applications(context: list[Chunk], view, q, subject: set, hosts: set) -> di
         return {}
     site = {w.lower() for w in retrieve.SITE_WORDS}
     heads = {_stem(w) for w in GENERIC_HEADS}
-    product = {w for w in subject - FRAME_TALK - MEDIUM_WORDS - site - NOT_APPLY_PRODUCT if not w[0].isdigit()}
+    def syn(w):
+        return {w} | set(retrieve._SYN.get(w, ())) | VEHICLE_KINDS.get(w, set())
+    used, titled = _application_words(view, hosts)
+    # a word no application link of the site uses ("my husband", "for the family") is not the product, unless a
+    # product page is named with it (then the site has that product and no application of another one is it)
+    product = {w for w in subject - FRAME_TALK - MEDIUM_WORDS - site - NOT_APPLY_PRODUCT
+               if not w[0].isdigit() and (syn(w) & used or w in titled)}
     specific = product - heads
     if not specific:
         return {}
     apps: dict = {}
     def names_product(title):                 # the product's own page: its title names what was asked
         words = set(tokenize(title or ""))
-        return all(({w} | set(retrieve._SYN.get(w, ()))) & words for w in specific)
+        return all(syn(w) & words for w in specific)
     own_pages = [c for _, vp in sorted(view.pages.items())
                  if vp.status != "missing" and vp.page.kind not in ("article", "calculator")
                  and names_product(vp.page.title) for c in getattr(vp.page, "chunks", ())]
@@ -627,10 +640,35 @@ def _applications(context: list[Chunk], view, q, subject: set, hosts: set) -> di
             path = link.split("/", 1)[1] if "/" in link else ""
             last = set(tokenize(path.rsplit("/", 1)[-1])) | set(tokenize(own))
             whole = set(tokenize(path)) | set(tokenize(own))
-            if (all(({w} | (set(retrieve._SYN.get(w, ())) - heads)) & last for w in specific)
-                    and all(({w} | set(retrieve._SYN.get(w, ()))) & whole for w in product - specific)):
+            if (all((syn(w) - heads | {w}) & last for w in specific)
+                    and all(syn(w) & whole for w in product - specific)):
                 apps.setdefault(link, set()).add(c.key)
     return apps
+
+
+def _application_words(view, hosts: set) -> tuple[set, set]:
+    """The words the site's application links use (their addresses and own words), and the words of its
+    product pages' titles. Built once per view."""
+    cached = getattr(view, "_application_words", None)
+    if cached is None:
+        used, titled = set(), set()
+        for key, vp in view.pages.items():
+            if vp.status == "missing":
+                continue
+            if vp.page.kind == "product":
+                titled |= set(tokenize(getattr(vp.page, "title", "") or ""))
+            for c in getattr(vp.page, "chunks", ()):
+                for m in LINK_RE.finditer(c.text):
+                    link, own = m.group(2).rstrip("/"), _last_clause(m.group(1))
+                    if (view.pages.get(url_key(link)) is None and link.split("/", 1)[0] not in hosts
+                            and _on_site(link, hosts) and APPLY_LINK.search(own)):
+                        used |= set(tokenize(link.split("/", 1)[1] if "/" in link else "")) | set(tokenize(own))
+        cached = (used, titled)
+        try:
+            view._application_words = cached
+        except AttributeError:
+            pass
+    return cached
 
 
 OTHER_LINES = ("business", "jumbo")      # a line of products the question has to name to be asked about
