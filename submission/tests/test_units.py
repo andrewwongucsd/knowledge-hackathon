@@ -974,6 +974,53 @@ class Rev34(unittest.TestCase):
         self.assertEqual(parse_query("What is the rate for a $7,300 balance?").amounts, [7300.0])
 
 
+class Rev35(unittest.TestCase):
+    """First accounts, the clause that asks for the link, application links (synthetic data only)."""
+
+    def test_opening_a_first_account_is_joining_and_managing_one_is_not(self):
+        from solution import joining_info
+        for q in ("link to open my son's very first account", "What's the link to open my first account and become a member?",
+                  "URL to set up her first account online"):
+            self.assertTrue(joining_info(parse_query(q), {})[0], q)
+        for q in ("What's the link to see my son's first account balance?", "What's the link to get my first account statement?",
+                  "link to close my daughter's first account?"):
+            self.assertFalse(joining_info(parse_query(q), {})[0], q)
+
+    def test_only_the_clause_asking_for_the_link_counts(self):
+        from solution import _link_clause_words
+        self.assertNotIn("work", _link_clause_words("My friend from work wants an account. What's the URL he can use to join?"))
+        self.assertIn("harbor", _link_clause_words("I'd like to become a member; what's the link to the harbor schedule?"))
+
+    def _view(self):
+        from types import SimpleNamespace as NS
+        page = lambda key, kind, title: NS(status="fresh", snapshot_id="s1",
+                                           page=NS(kind=kind, key=key, url="https://" + key, title=title))
+        return NS(pages={k: page(k, kind, t) for k, kind, t in (
+            ("example.org/join", "product", "Join"), ("example.org/canoes", "product", "Canoe Loans"))})
+
+    def test_a_joining_question_with_context_elsewhere_gets_the_join_link(self):
+        from ingest import Chunk
+        from solution import pick_link
+        joins = [Chunk(1, "example.org/join", "product", "Become a member (join.example.org).", "Become a member (join.example.org).")]
+        q = parse_query("My friend from work wants to open his very first account. What's the URL he can use to join online?")
+        self.assertEqual(pick_link([], self._view(), q, None, joins, {"work": 40}), "join.example.org")
+        other = parse_query("I'd like to become a member; what's the link to the harbor schedule?")
+        self.assertNotEqual(pick_link([], self._view(), other, None, joins, {"harbor": 9, "schedul": 9}), "join.example.org")
+
+    def test_an_apply_question_gets_the_application_naming_the_product(self):
+        from ingest import Chunk
+        from solution import pick_link
+        text = ("Canoe loans (example.org/canoes). Apply today (apply.example.org/loan-application/canoe-loan). "
+                "Apply today (apply.example.org/loan-application/kayak-loan).")
+        ctx = [Chunk(1, "example.org/canoes", "product", text, text)]
+        view = self._view()
+        self.assertEqual(pick_link(ctx, view, parse_query("What's the link to apply for a canoe loan?")),
+                         "apply.example.org/loan-application/canoe-loan")
+        self.assertEqual(pick_link(ctx, view, parse_query("What's the link to apply for a loan?")), "example.org/canoes")
+        self.assertEqual(pick_link(ctx, view, parse_query("What do I need to apply for a canoe loan? Link please.")),
+                         "example.org/canoes")
+
+
 class Contract(unittest.TestCase):
     def test_exactly_the_three_contract_methods(self):
         own = {n for n, v in vars(type(build())).items() if callable(v) and not n.startswith("__")}

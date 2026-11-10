@@ -31,7 +31,7 @@ from datetime import date, timedelta   # noqa: E402
 
 from ingest import KIND_RANK, MONTH_RE, MONTHS, STATUS_RANK, Chunk, Store, _on_site, url_key   # noqa: E402
 import retrieve                        # noqa: E402
-from retrieve import (CHAT_FILLERS, FRAME_WORDS, GENERIC, MEMBERSHIP_Q, STOP, Evidence, Index, _stem,  # noqa: E402
+from retrieve import (CHAT_FILLERS, FRAME_WORDS, GENERIC, GENERIC_HEADS, MEMBERSHIP_Q, STOP, Evidence, Index, _stem,  # noqa: E402
                       parse_query, proper_names, select, tokenize, use_proper_names, use_site_words)
 from synth import REFUSAL, Synthesizer  # noqa: E402
 
@@ -391,7 +391,9 @@ JOIN_ACT = re.compile(
     r"(?:(?:a|an|the|my|\w+['’]s|\w+)\s+)?membership" + _AFTER_MEMBERSHIP +
     r"|(?:be|become|becoming|sign(?:ing)?\s+up\s+as|register(?:ing)?\s+as|enrol+(?:ing)?\s+as)\s+an?\s+(?:(\w+(?:\s+\w+)?)\s+)?member\b"
     r"|membership\s+application"
-    r"|open(?:ing)?\s+(?:my|your|a|an|their|his|her)\s+first\s+account\b)", re.I)    # a first account: joining
+    r"|(?:open(?:ing)?|get(?:ting)?|start(?:ing)?|set(?:ting)?\s+up)\s+(?:(?:my|your|our|their|his|her|a|an)\s+)?"
+    r"(?:\w+['’]s\s+)?(?:very\s+)?first\s+account(?=\s*(?:$|[?.!,;:]|\s+(?:online|with|today|now|here|for|at|and|or|so)\b)))",
+    re.I)    # opening someone's (very) first account is joining; "my first account balance" is not
 # "join the newsletter / webinar / committee": joining something else, unless it is the institution itself
 JOIN_OBJECT = re.compile(r"\bjoin(?:ing)?\s+(?:the|our|your|a|an)\s+(?!credit\s+unions?\b)(\w+)", re.I)
 JOIN_BARE = re.compile(r"\bjoin(?:ing)?\b|\bmembership" + _AFTER_MEMBERSHIP, re.I)
@@ -400,6 +402,9 @@ RESUME = re.compile(r"\b(?:continu\w*|resum\w*|finish\w*|complet\w*\s+(?:my|the|
                     r"(?:it\s+|this\s+|that\s+)?(?:back\s+)?up|get\s+back\s+to|return\s+to)", re.I)
 JOIN_WORDS = {_stem(w) for w in ("join", "member", "membership", "become")}
 JOIN_ACT_WORDS = JOIN_WORDS | set(tokenize("apply sign up register enrol enroll application open first account"))
+FIRST_ACCOUNT = re.compile(r"\bfirst\s+account\b", re.I)
+# the clause that asks for the link: a word asked elsewhere in the message ("my buddy from work …") is context
+CLAUSE_BREAK = re.compile(r"[,;:.?!—–]|\s-\s|\b(?:if|because|since|so|when|after|before)\b", re.I)
 # words that frame a request rather than say what it is about
 FRAME_TALK = set(tokenize("if am so also but didn doesn don isn wasn just then than very really click go send let type enter first "
                           "lets help used using before after since early late last week end beginning start started "
@@ -418,7 +423,7 @@ def joining_info(q, vocab=None) -> tuple[bool, set, set]:
     site = {w.lower() for w in retrieve.SITE_WORDS}
     phrase, other_member = set(), False
     for m in JOIN_ACT.finditer(q.raw):
-        phrase |= set(tokenize(m.group(0))) & JOIN_ACT_WORDS
+        phrase |= set(tokenize(m.group(0))) if FIRST_ACCOUNT.search(m.group(0)) else set(tokenize(m.group(0))) & JOIN_ACT_WORDS
         if m.group(1) and set(tokenize(m.group(1))) - FRAME_TALK - site:
             other_member = True
     subject = set(q.tokens) - LINK_WORDS - CHAT_FILLERS - set(q.expansion)
@@ -512,9 +517,17 @@ def pick_link(context: list[Chunk], view, q, carried=None, joins=(), vocab=None)
         return 0 if not carried else carried(f"({u})") if u in portals else carried(u)
     best = max(pages, key=lambda u: (named[u], u in given_by_join_page, u in joining_portals, len(pages[u]),
                                      u in exact, weight(u)))
-    if wanted and (named[best] == 0 or (best not in given_by_join_page and named[best] < len(wanted))):
+    if wanted and named[best] == 0 and wanted & _link_clause_words(q.raw):
+        return _pick_any(context, view, q, carried)        # something else asked, in the request itself
+    if wanted and named[best] and best not in given_by_join_page and named[best] < len(wanted):
         return _pick_any(context, view, q, carried)
     return best
+
+
+def _link_clause_words(text: str) -> set:
+    """The words of the clause(s) that ask for the link ("what's the URL he can use to join online?")."""
+    clauses = [c for c in CLAUSE_BREAK.split(text) if c and LINK_Q.search(c)]
+    return set(tokenize(" ".join(clauses))) if clauses else set(tokenize(text))
 
 
 def _asks_calculator(q) -> bool:
@@ -563,12 +576,61 @@ def _pick_any(context: list[Chunk], view, q, carried=None) -> str | None:
                 continue
             if anchor & subject:
                 pages.setdefault(link, set()).add(c.key)
+    apps = _applications(context, view, q, subject, hosts)
+    for link, keys in apps.items():
+        pages.setdefault(link, set()).update(keys)
+        portals.add(link)
     if not pages:
         return None
     def weight(u):                 # a portal counts where it is written as a link, not inside longer links
         return 0 if not carried else carried(f"({u})") if u in portals else carried(u)
-    best = max(pages, key=lambda u: (len(pages[u]), u in given_by_own_page, weight(u)))
+    best = max(pages, key=lambda u: (u in apps, len(pages[u]), u in given_by_own_page, weight(u)))
     return _own_line_page(best, words.get(best, []), view, q) or best
+
+
+APPLY_Q = re.compile(r"\b(?:apply(?:ing)?|applications?)\b", re.I)
+APPLY_NEEDS = re.compile(r"\b(?:need|needs|require[sd]?|requirements?|documents?|paperwork)\b[^?]*?\bappl", re.I)
+APPLY_LINK = re.compile(r"\b(?:apply|application|request|start)\w*", re.I)
+NOT_APPLY_PRODUCT = set(tokenize("apply applying application applications submit check complete"))
+
+
+def _applications(context: list[Chunk], view, q, subject: set, hosts: set) -> dict:
+    """For "where do I apply for X": the site's own application link for X (link -> pages giving it). The
+    link's words say apply / application / request / start, it is on one of the site's hosts the crawl never
+    fetched, a live non-article page gives it, and the product asked is named by the link's own words or the
+    last part of its address (a word every product shares, such as "loan", may be named anywhere in it).
+    A question about what applying needs ("what documents do I need to apply…") wants the page, not this."""
+    if not APPLY_Q.search(q.raw) or APPLY_NEEDS.search(q.raw):
+        return {}
+    site = {w.lower() for w in retrieve.SITE_WORDS}
+    heads = {_stem(w) for w in GENERIC_HEADS}
+    product = {w for w in subject - FRAME_TALK - MEDIUM_WORDS - site - NOT_APPLY_PRODUCT if not w[0].isdigit()}
+    specific = product - heads
+    if not specific:
+        return {}
+    apps: dict = {}
+    def names_product(title):                 # the product's own page: its title names what was asked
+        words = set(tokenize(title or ""))
+        return all(({w} | set(retrieve._SYN.get(w, ()))) & words for w in specific)
+    own_pages = [c for _, vp in sorted(view.pages.items())
+                 if vp.status != "missing" and vp.page.kind not in ("article", "calculator")
+                 and names_product(vp.page.title) for c in getattr(vp.page, "chunks", ())]
+    for c in list(context) + own_pages:
+        carrier = view.pages.get(c.key)
+        if carrier is None or carrier.status == "missing" or carrier.page.kind == "article":
+            continue
+        for m in LINK_RE.finditer(c.text):
+            link, own = m.group(2).rstrip("/"), _last_clause(m.group(1))
+            if (view.pages.get(url_key(link)) is not None or link.split("/", 1)[0] in hosts
+                    or not _on_site(link, hosts) or not APPLY_LINK.search(own)):
+                continue
+            path = link.split("/", 1)[1] if "/" in link else ""
+            last = set(tokenize(path.rsplit("/", 1)[-1])) | set(tokenize(own))
+            whole = set(tokenize(path)) | set(tokenize(own))
+            if (all(({w} | (set(retrieve._SYN.get(w, ())) - heads)) & last for w in specific)
+                    and all(({w} | set(retrieve._SYN.get(w, ()))) & whole for w in product - specific)):
+                apps.setdefault(link, set()).add(c.key)
+    return apps
 
 
 OTHER_LINES = ("business", "jumbo")      # a line of products the question has to name to be asked about
@@ -609,6 +671,9 @@ def link_source(link: str, context: list[Chunk], view):
     if vp is not None:
         return vp
     givers = sorted({c.key for c in context if f"({link})" in c.text or f"({link}/)" in c.text})
+    if not givers:                            # a link found on a page outside the evidence: any live page giving it
+        givers = sorted(k for k, vp in view.pages.items() if vp.status != "missing"
+                        and any(f"({link})" in c.text for c in getattr(vp.page, "chunks", ())))
     live = [view.pages[k] for k in givers if k in view.pages and view.pages[k].status != "missing"]
     return min(live, key=lambda p: (KIND_RANK[p.page.kind], p.page.key), default=None)
 
