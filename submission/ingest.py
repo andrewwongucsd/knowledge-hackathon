@@ -321,7 +321,9 @@ class Parser:
                 # "Col2"-style headers are converter placeholders, not labels.
                 header = ["" if re.fullmatch(r"Col\d+", h) else h
                           for h in (strip_footnotes(clean_inline(c, self.domains)) for c in cells)]
-                continue
+                if not any(re.search(r"\$\s?\d", h) for h in header):
+                    continue
+                header = []     # a "header" holding a dollar amount is a row: a table continued after a page break
             cells = [strip_footnotes(clean_inline(c, self.domains)) for c in cells]
             value_cols = [k for k, c in enumerate(cells)
                           if re.search(r"\d\s*%|\$\s?\d", c) and (

@@ -56,6 +56,13 @@ class KnowledgeSystem:
         _page_texts(index)
         _glossary(index)
         _dates_stated(index)
+        # the earliest effective date any crawl gives each page: a fee schedule dated only in later crawls was
+        # still not in effect before that date (see _too_new)
+        dated = self._store.__dict__.setdefault("first_effective", {})
+        for key, vp in view.pages.items():
+            effs = [c.effective for c in vp.page.chunks if c.effective]
+            if effs:
+                dated[key] = min(effs + ([dated[key]] if key in dated else []))
         self._indexes.append(index)
         self._cache.clear()
 
@@ -81,10 +88,12 @@ class KnowledgeSystem:
             # vi is None when nothing is ingested or the date is before the first snapshot
             index = self._indexes[vi] if vi is not None else None
             # A date that only names the snapshot being answered from is not a search word
-            search = strip_temporal(calendar_phrases(question, _newest(self._store)), lambda d: self._store.view_for(d) == vi or
+            now, crawls = (_iso(as_of), None) if as_of else (_now(self._store), _crawls(self._store))
+            search = strip_temporal(calendar_phrases(question, now, crawls), lambda d: self._store.view_for(d) == vi or
                                     (before is not None and _iso(d) is not None and _iso(d) < self._store.views[0].taken_on),
                                     _dates_stated(index)) if index else question
-            self._cache[key] = _respond(index, self._synth, question, search, _iso(asked), before)
+            self._cache[key] = _respond(index, self._synth, question, search, _iso(asked), before,
+                                        getattr(self._store, "first_effective", {}))
         return self._cache[key]
 
     def conflicts(self) -> list[Conflict]:
@@ -109,10 +118,24 @@ def _own_site(store: Store) -> None:
 MAX_SOURCES = 8     # pages that state the values given; the same page is often served under several URL variants
 
 
+UNDATED_REACH_DAYS = 365     # how far before the first crawl an undated page is taken to have read the same
+
+
+def _too_new(c: Chunk, view, before: date, dated: dict) -> bool:
+    """Before the first crawl, a chunk can't answer for a day before it took effect (its own effective date, or
+    the earliest any crawl gives its page) or before its page was published; an undated one answers only for
+    the year before the first crawl."""
+    vp = view.pages[c.key]
+    first = dated.get(c.key)
+    if (c.effective and c.effective > before) or (first and first > before) or (vp.page.publish and vp.page.publish > before):
+        return True
+    return not (c.effective or first) and (view.taken_on - before).days > UNDATED_REACH_DAYS
+
+
 def _respond(index: Index | None, synth: Synthesizer, question: str, search: str | None = None,
-             asked: date | None = None, before: date | None = None) -> Answer:
+             asked: date | None = None, before: date | None = None, dated: dict | None = None) -> Answer:
     """`before`: the question asks about a day before the first crawl, answered from the first crawl. The answer
-    stands only if nothing it rests on took effect after that day."""
+    stands only if nothing it rests on took effect after that day (see _too_new)."""
     if index is None:
         return Answer(text=REFUSAL, confident=False)
     view = index.view
@@ -152,7 +175,7 @@ def _respond(index: Index | None, synth: Synthesizer, question: str, search: str
     text, cited, confident, note = synth.compose(told, q, ev, view, asked,
                                                  lookup=lambda text: select(index, parse_query(text)),
                                                  second_look=second_look)
-    if not confident or (before and any(c.effective and c.effective > before for c in cited)):
+    if not confident or (before and any(_too_new(c, view, before, dated or {}) for c in cited)):
         return Answer(text=REFUSAL, confident=False)
     if fact:
         text, stated = fact_guard(text, fact)
@@ -233,20 +256,63 @@ _FRAMED = re.compile(r"\b(?:as of|as at|back in|back on|prior to|up until|until|
                      r"between|and|to|in|on|during)\s*$", re.I)
 
 
-def _relative(text: str, now: date) -> str:
-    """"last May" -> "in May 2030" (the latest May before `now`), "a year ago" -> "on September 28, 2029"; "in" / "on"
-    only when no frame word comes before."""
+# In a question about a value (a rate or a fee, "how much was …"), a year or a recent stretch of time names the
+# moment to read the site at: "in 2025", "last year", "last month", "two months ago". In a count, an event or an
+# article it names a period ("how many employees volunteered last year?") and is not read. "Over the last year"
+# and "the last week of the month" are spans, never moments.
+_IN_YEAR = re.compile(r"\b(in|during)\s+(20\d\d)\b(?=\s*(?:[,?.!;:]|$))", re.I)
+_LAST_UNIT = re.compile(r"(?<!the\s)\blast\s+(year|month)\b(?!['’]s)(?!\s+of\b)", re.I)
+_MONTHS_AGO = re.compile(r"\b(a|one|two|three|four|five|six|seven|eight|nine|ten|eleven|[1-9]|1[01])\s+months?\s+ago\b", re.I)
+_WEEKS_AGO = re.compile(r"(?<!the\s)\blast\s+week\b(?!['’]s)(?!\s+of\b)|\b(a|one|two|three|four|five|six|[1-6])\s+weeks?\s+ago\b", re.I)
+_UNITS_N = {**_YEARS_N, "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10, "eleven": 11}
+# a week phrase reads a crawl only if the crawl is the same for any "now" from two to six weeks after the newest crawl
+WEEK_NOW_RANGE = (14, 42)
+
+
+def _value_question(text: str) -> bool:
+    low = text.lower()
+    return bool((retrieve.RATE_Q.search(low) or retrieve.FEE_Q.search(low) or retrieve.PCT_PAID.search(low))
+                and not retrieve.COUNT_Q.search(low) and not EVENT_Q.search(low))
+
+
+def _crawl_at(day: date, crawls) -> int:
+    return max((i for i, c in enumerate(crawls) if c <= day), default=-1)
+
+
+def _relative(text: str, now: date, crawls=None) -> str:
+    """"last May" -> "in May 2030" (the latest May before `now`), "a year ago" -> "on September 28, 2029"; in a
+    value question also "in 2029" / "last year" -> "in December 2029", "last month" / "two months ago" -> that
+    month, and a week phrase whose crawl doesn't depend on `now` (see WEEK_NOW_RANGE) -> its day. "In" / "on" only
+    when no frame word comes before. `crawls`: the crawl dates when `now` is only assumed (no as-of date)."""
     put = lambda m, prep, d: d if _FRAMED.search(m.string[:m.start()]) else f"{prep} {d}"
+    day = lambda d: f"{calendar.month_name[d.month]} {d.day}, {d.year}"
     def last(m):
         month = [n.lower() for n in calendar.month_name].index(m.group(1).lower())
         return put(m, "in", f"{calendar.month_name[month]} {now.year if month < now.month else now.year - 1}")
     def ago(m):
         y = now.year - (_YEARS_N.get(m.group(1).lower()) or int(m.group(1)))
         return put(m, "on", f"{calendar.month_name[now.month]} {min(now.day, calendar.monthrange(y, now.month)[1])}, {y}")
-    return _YEARS_AGO.sub(ago, _LAST_MONTH.sub(last, text))
+    text = _YEARS_AGO.sub(ago, _LAST_MONTH.sub(last, text))
+    if not _value_question(text) or DATE_PHRASE.search(text):     # a date written out says it ("last month (May 2030)")
+        return text
+    def month_back(n):
+        y, m = divmod(now.year * 12 + now.month - 1 - n, 12)
+        return f"{calendar.month_name[m + 1]} {y}"
+    if not _MODEL_CUE.search(text):                      # "a car bought in 2025" is a model year
+        text = _IN_YEAR.sub(lambda m: f"{m.group(1)} December {m.group(2)}", text)
+    text = _LAST_UNIT.sub(lambda m: put(m, "in", f"December {now.year - 1}" if m.group(1).lower() == "year" else month_back(1)), text)
+    text = _MONTHS_AGO.sub(lambda m: put(m, "in", month_back(_UNITS_N.get(m.group(1).lower()) or int(m.group(1)))), text)
+    def weeks(m):
+        n = 1 if m.group(1) is None else (_UNITS_N.get(m.group(1).lower()) or int(m.group(1)))
+        if crawls:
+            lo, hi = (crawls[-1] + timedelta(days=d) - timedelta(weeks=n) for d in WEEK_NOW_RANGE)
+            if _crawl_at(lo, crawls) != _crawl_at(hi, crawls):
+                return m.group(0)                        # which crawl depends on when "now" is: not read
+        return put(m, "on", day(now - timedelta(weeks=n)))
+    return _WEEKS_AGO.sub(weeks, text)
 
 
-def calendar_phrases(text: str, now: date | None = None) -> str:
+def calendar_phrases(text: str, now: date | None = None, crawls=None) -> str:
     """Calendar phrases a date reader doesn't know, as dates it does: "Memorial Day 2026" -> "May 25, 2026",
     "Q3 2026" / "the third quarter of 2026" -> "September 2026", "the first half of 2026" -> "June 2026",
     "in the summer of 2026" -> "in August 2026", "2026-07" -> "July 2026", "as of 2025" -> "as of December 2025",
@@ -263,7 +329,7 @@ def calendar_phrases(text: str, now: date | None = None) -> str:
         text = _YEAR_ONLY.sub(lambda m: f"{m.group(1)} {'January' if m.group(1).lower() in ('before', 'prior to', 'until', 'till') else 'December'}"
                                         f" {m.group(2)}", text)
     if now is not None:
-        text = _relative(text, now)
+        text = _relative(text, now, crawls)
     return _YEAR_MONTH.sub(lambda m: month(int(m.group(1)), int(m.group(2))), text)
 
 
@@ -331,8 +397,17 @@ EVENT_Q = re.compile(r"\b(posts?|posted|articles?|blogs?|story|stories|news\w*|p
 CLAUSE_END = re.compile(r"(?<=[;!?])\s+|(?<=[a-z0-9%)\]][.])\s+(?=[A-Z])")   # never inside 9,999.99 or Sept. 1
 
 
-def _newest(store: Store) -> date | None:
-    return store.views[-1].taken_on if store.views else None
+# "Now", for relative dates when no as-of date is given: questions are asked after the newest crawl, about a month
+# after it ("today" is the month after the last crawl)
+NOW_AFTER_NEWEST_DAYS = 30
+
+
+def _now(store: Store) -> date | None:
+    return store.views[-1].taken_on + timedelta(days=NOW_AFTER_NEWEST_DAYS) if store.views else None
+
+
+def _crawls(store: Store) -> list:
+    return [v.taken_on for v in store.views]
 
 
 def date_asked(question: str, store: Store) -> str | None:
@@ -342,7 +417,7 @@ def date_asked(question: str, store: Store) -> str | None:
     change or an article or event. Not for questions about now (unless every date named is pinned: "Right now, as
     of March 2031, ..."; never when "now" is compared with it), spans ("since", "between"), dates outside the window,
     or a date in a side remark of a present-tense question."""
-    q = calendar_phrases(question, _newest(store)).strip()
+    q = calendar_phrases(question, _now(store), _crawls(store)).strip()
     now = NOW_Q.search(q)
     if len(store.views) < 2 or (now and COMPARE_NOW.search(q)):
         return None
@@ -432,7 +507,7 @@ SPAN_FROM = re.compile(r"\b(?:since|after|from)\s+(?:\S+\s+){0,2}$", re.I)
 def change_span(question: str, store: Store) -> tuple | None:
     """(start, end) dates of a change the question asks about; end None means "now". A month alone means
     the site as it stood by the end of that month."""
-    question = calendar_phrases(question, _newest(store))
+    question = calendar_phrases(question, _now(store), _crawls(store))
     if len(store.views) < 2 or not (CHANGE_ASK.search(question) or
                                     (COMPARE_ASK.search(question) and len(terms_in(question.lower())) <= 1)):
         return None

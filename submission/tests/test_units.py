@@ -437,9 +437,10 @@ class Rev23(unittest.TestCase):
                     raise RuntimeError("offline")
         s = Synthesizer()
         s._client = Fake()
-        for asked, shown in [(date(2030, 3, 20), "2030-03-20"), (None, "2030-03-01"), (date(2030, 2, 1), "2030-03-01")]:
+        for asked, shown in [(date(2030, 3, 20), "2030-03-20\n"), (None, "2030-03-01\n"),
+                             (date(2030, 2, 1), "2030-03-01. The member asks about 2030-02-01, before this snapshot")]:
             self.assertIsNone(s._llm("What is the APY?", NS(context=[c], chunks=[c]), view, asked))
-            self.assertTrue(sent[-1].startswith(f"Website snapshot date: {shown}\n"), sent[-1][:40])
+            self.assertTrue(sent[-1].startswith(f"Website snapshot date: {shown}"), sent[-1][:60])
 
     def test_text_dates_and_as_of_answer_from_the_same_snapshot(self):
         from contract import Page, Snapshot
@@ -1367,12 +1368,15 @@ class Rev40(unittest.TestCase):
         self.assertEqual(calendar_phrases("the 2029 canoe grant"), "the 2029 canoe grant")
         self.assertEqual(date_asked("As of 2029, what was the canoe fee?", st), "2029-12-31")
         self.assertEqual(date_asked("Before 2030, what was the canoe fee?", st), "2029-12-31")
-        self.assertIsNone(date_asked("What was the canoe fee in 2029?", st))                  # a period, not a moment
+        self.assertEqual(date_asked("What was the canoe fee in 2029?", st), "2029-12-31")      # a value: a moment
+        self.assertIsNone(date_asked("How many canoes did you sell in 2029?", st))             # a count: a period
         self.assertIsNone(date_asked("What was the APR on a canoe trailer built prior to 2029?", st))   # a model year
         self.assertEqual(date_asked("What was the kayak APY last March?", st), "2030-03-31")
-        self.assertEqual(date_asked("What was the kayak APY a year ago?", st), "2029-06-15")
-        self.assertIsNone(date_asked("What was the kayak APY last month?", st))
-        self.assertIsNone(date_asked("What was the canoe fee last year?", st))
+        self.assertEqual(date_asked("What was the kayak APY a year ago?", st), "2029-07-15")   # now: a month after the newest crawl
+        self.assertIsNone(date_asked("What was the kayak APY last month?", st))                 # June 2030: the newest crawl
+        self.assertEqual(date_asked("What was the canoe fee last year?", st), "2029-12-31")
+        self.assertIsNone(date_asked("How many canoe members joined last year?", st))
+        self.assertIsNone(date_asked("Have canoe loan rates gone up over the last year?", st))  # a span
         self.assertEqual(date_asked("Right now, as of March 2030, what's the kayak APY?", st), "2030-03-31")
         self.assertIsNone(date_asked("Is the kayak APY now higher than back in March 2030?", st))
 
@@ -1385,6 +1389,82 @@ class Rev40(unittest.TestCase):
         text = ks.answer("What APY would $30,000 in savings earn?").text
         self.assertIn("0.23%", text)
         self.assertNotIn("3.05%", text)
+
+
+class Rev41(unittest.TestCase):
+    """Dates before the first crawl and their lower bound; which way a wire goes; value questions about a year or a
+    recent month (synthetic data only)."""
+
+    def test_a_day_before_the_first_crawl_needs_what_was_in_effect_then(self):
+        from contract import Page, Snapshot
+        undated = "# Fee Schedule\n\n| Service | Fee |\n|---|---|\n| Canoe wire | $20.00 each |\n"
+        dated = undated + "\nFees effective as of 02/01/2030.\n"
+        kayak = "# Kayak Rentals\n\nThe kayak launch fee is $7.00 per day.\n"
+        ks = build()
+        ks.ingest(Snapshot("s1", "2030-03-01", [Page("https://example.org/fees", "Fees | Example", undated, "2030-03-01T09:00:00Z"),
+                                                Page("https://example.org/kayak", "Kayak | Example", kayak, "2030-03-01T09:00:00Z")]))
+        ks.ingest(Snapshot("s2", "2030-06-15", [Page("https://example.org/fees", "Fees | Example", dated, "2030-06-15T09:00:00Z"),
+                                                Page("https://example.org/kayak", "Kayak | Example", kayak, "2030-06-15T09:00:00Z")]))
+        self.assertIn("$20.00", ks.answer("What was the canoe wire fee as of February 15, 2030?").text)
+        early = ks.answer("What was the canoe wire fee in 2028?")      # a later crawl dates the schedule February 2030
+        self.assertFalse(early.confident)
+        self.assertEqual(numbers(early.text), set())
+        self.assertIn("$7.00", ks.answer("What was the kayak launch fee in 2029?").text)     # undated, the year before
+        self.assertFalse(ks.answer("What was the kayak launch fee in 2027?").confident)      # undated, long before
+
+    def test_which_way_a_wire_goes(self):
+        from retrieve import wire_direction
+        for text, way in [("My cousin wants to wire me money from Germany. Is there a fee?", "in"),
+                          ("What's the fee for wires from overseas?", "in"),
+                          ("Is there a fee for wire transfers coming in from abroad?", "in"),
+                          ("What's the fee to receive an international wire?", "in"),
+                          ("What's the fee for a wire to my checking account?", "in"),
+                          ("What's the fee to send a wire to my own account at another bank?", "out"),
+                          ("How much is a wire?", "out"),
+                          ("How much to wire money to my brother in Georgia?", "out"),
+                          ("What's the fee to wire money to Puerto Rico?", "out"),
+                          ("What's the fee to wire money to my sister in Birmingham?", "out"),
+                          ("How much to wire money to my cousin in Paris, Texas?", "out"),
+                          ("How much to wire $500 to Chad?", "out"),
+                          ("What's the fee to wire money to my sons account in Toronto?", "abroad"),
+                          ("How much to wire money to a Canadian bank account?", "abroad"),
+                          ("What's the fee to wire a payment in euros?", "abroad"),
+                          ("What does it cost to wire money to Europe?", "abroad"),
+                          ("How much to wire money to the Philippines?", "abroad"),
+                          ("What's the fee to wire money internationally?", "abroad"),
+                          ("How much to wire money to my friend in Lyon, France?", "abroad"),
+                          ("Do you charge for domestic and international wires?", "all"),
+                          ("What are your wire transfer fees?", "all")]:
+            self.assertEqual(wire_direction(text), way, text)
+
+    def test_wire_answers_and_how_much_to(self):
+        ks = Rev40()._fees()
+        self.assertIn("$45.00", ks.answer("What's the fee to wire money to my friend in Toronto?").text)
+        self.assertIn("$10.00", ks.answer("My cousin wants to wire me money from Germany. Is there a fee?").text)
+        self.assertIn("$10.00", ks.answer("My employer is wiring my bonus into my checking account. Is there a fee "
+                                          "for receiving it?").text)          # "wiring" is searched as "wire"
+        both = ks.answer("What are your wire transfer fees?").text
+        self.assertTrue(all(v in both for v in ("$10.00", "$20.00", "$45.00")), both)
+        self.assertEqual(parse_query("How much to wire money overseas?").attribute, "fee")
+        self.assertNotEqual(parse_query("How much to open a canoe account?").attribute, "fee")
+
+    def test_a_table_continued_after_a_page_break_has_no_header(self):
+        md = "# Fee Schedule\n\n|Official kayak check|$5.00* each|\n|---|---|\n|Incoming canoe wire|$10.00|\n|Domestic canoe wire|$20.00 each|\n"
+        p = Parser()
+        p.domains = {"example.org"}
+        rows = [c for c in p.parse("example.org/fees", "https://example.org/fees", "Fees", md).chunks if c.is_row]
+        self.assertEqual([r.cells[0] for r in rows], ["Official kayak check", "Incoming canoe wire", "Domestic canoe wire"])
+        self.assertNotIn("$5.00", rows[1].text)          # the first row's fee is not the second row's column
+
+    def test_a_year_or_a_recent_month_in_a_value_question(self):
+        from types import SimpleNamespace as NS
+        from solution import date_asked
+        st = NS(views=[NS(taken_on=date(2030, 1, 10)), NS(taken_on=date(2030, 3, 1)), NS(taken_on=date(2030, 6, 15))])
+        self.assertEqual(date_asked("What was the kayak APY two months ago?", st), "2030-05-31")     # now: mid-July
+        self.assertEqual(date_asked("How much was a canoe wire last year?", st), "2029-12-31")
+        self.assertEqual(date_asked("What was the canoe wire fee last year?", st), "2029-12-31")     # its twin, the same
+        self.assertIsNone(date_asked("Is the canoe fee charged in the last week of the month?", st))
+        self.assertIsNone(date_asked("What did the canoe club announce last month?", st))           # an event
 
 
 class Contract(unittest.TestCase):

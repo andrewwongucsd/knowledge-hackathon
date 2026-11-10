@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from datetime import date
 
 from ingest import KIND_RANK, MONTH_RE, STATUS_RANK, Chunk, View
+from places import CITY_COMMA, CURRENCY, FOREIGN_SET, GIVEN_NAMES, NATIONAL_BANK, PLACE_RE, PROVINCE_SET
 
 NUM_WORDS = {
     "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7, "eight": 8, "nine": 9,
@@ -101,7 +102,8 @@ RATE_Q = re.compile(r"\b(rates?|apr|apy|interest|dividends?|yield)\b", re.I)
 # "does any savings tier pay 0.45%?" asks about a rate without the word (cash back and points are not rates)
 PCT_PAID = re.compile(r"\b(?:pay|pays|paying|paid|earn|earns|earning)\s+(?:a\s+|an\s+)?\d+(?:\.\d+)?\s*(?:%|percent\b)"
                       r"(?!.*\b(?:cash\s*back|reward(?:s)?|points)\b)", re.I)
-FEE_Q = re.compile(r"\b(fees?|cost|charge[sd]?|price)\b|\bhow much (is|does|do|for|will)\b", re.I)
+FEE_Q = re.compile(r"\b(fees?|cost|charge[sd]?|price)\b|\bhow much (is|are|was|were|does|do|did|for|will)\b|"
+                   r"\bhow much to (?:wire|send|mail|replace|rush|stop|cash|certify|transfer)\b", re.I)
 HOURS_Q = re.compile(r"\bhours?\b", re.I)
 COUNT_Q = re.compile(r"\bhow many\s+([a-z-]+)", re.I)          # rebuilt with the site's name: use_site_words
 # Hours and counts asked without "hours" or "how many": "office hrs pls", "when is the walk-up window open?",
@@ -564,9 +566,14 @@ def supports(c: Chunk, q: Query) -> bool:
         have = c.tf if c.tf else Counter(tokenize(c.index_text))
         if not all(any(w in have for w in alts) for alts in q.subject):
             return False
-    if q.attribute == "fee" and (SEND_Q.search(q.raw) or (WIRE.search(q.raw) and TO_OTHER.search(q.raw))) \
-            and not RECEIVE_Q.search(q.raw) and re.search(r"\bincoming\b", text):
-        return False                    # sending (a wire to someone else) is never the incoming fee
+    if q.attribute == "fee" and (WIRE.search(q.raw) or SEND_Q.search(q.raw)):
+        way = wire_direction(q.raw)
+        if way in ("out", "abroad") and re.search(r"\bincoming\b", text):
+            return False                # sending a wire is never the incoming fee
+        if way == "in" and WIRE.search(q.raw) and not re.search(r"\b(?:incoming|inbound|receiv\w*)\b", text):
+            return False                # ...and receiving one is only the incoming fee, from anywhere
+        if WIRE.search(q.raw) and (not WIRE_FEE_LINE.search(c.text) or (way == "out" and re.search(r"\binternational\b", text))):
+            return False                # the wire's own fee line; a wire within the country is not the international one
     if q.terms:                         # some line must be about the asked term, not just "a term"
         lines = c.text.split("\n") if not c.is_row else [c.index_text]
         named = names_line(text, q)
@@ -853,6 +860,10 @@ def select(index: Index, q: Query, k: int = 8) -> Evidence:
         context += list_rows(hits, context, dropped_chunks, view, q)
     # The model reads rows of a line the question didn't ask for (business, jumbo, ...) last, after the
     # standard product's own evidence; the extractive answer's evidence is unchanged.
+    way = wire_direction(q.raw) if q.attribute == "fee" and WIRE.search(q.raw) else None
+    if way in ("out", "abroad") or (way == "in" and names_abroad(q.raw)):
+        # the model never reads another direction's wire fee ("receive an international wire" is the incoming fee)
+        context = [c for c in context if not (WIRE_FEE_LINE.search(c.text) and not supports(c, q))]
     other = [c for c in context if c.is_row and any(re.search(rf"\b{w}\b", f"{c.label()} {c.section} {c.key}".lower())
                                                     for w in SOFT_QUALIFIERS if w not in q.qualifiers)]
     context = [c for c in context if c not in other] + other
@@ -966,10 +977,20 @@ WIRE = re.compile(r"\bwir(?:e|es|ed|ing)\b", re.I)
 WIRE_ENDS = re.compile(r"\b(?:to|from|into)\s+(?:a|an|the|my|his|her|their|our|your|someone|somebody|another)\b[^.?!;]*", re.I)
 RECIPIENT = re.compile(r"\bto\s+(?:(?:a|an|the|my|his|her|their|our|your|someone|somebody|another)\b[^.?!;]*|"
                        r"[A-Z][\w'’-]*(?:\s+[A-Z][\w'’-]*)*)")
-# a wire to someone else is sent; one "to my (checking) account" or "to me" is received
-TO_OTHER = re.compile(r"\bto\s+(?!(?:me|us)\b|(?:my|our)\s+(?:own\s+)?(?:\w+\s+)?(?:accounts?|acct)\b)"
-                      r"(?:(?:a|an|the|my|his|her|their|our|your|someone|somebody|another)\b|[A-Z])")
 RECEIVE_Q = re.compile(r"\b(?:receiv\w*|incoming|inbound)\b", re.I)
+# Which way a wire goes (wire_direction). Several kinds asked about together are all answered.
+_WIRE_KIND = r"(?:incoming|inbound|outgoing|domestic|international|send(?:ing)?|receiv(?:e|ing))"
+WIRE_ALL = re.compile(rf"\b{_WIRE_KIND}\b\s*(?:,|/|\band\b|\bor\b|\bvs\.?|\bversus\b)\s*(?:\w+\s+)?{_WIRE_KIND}\b|"
+                      r"\bwire(?:\s+transfer)?\s+fees\b|\bfees\s+(?:for|on)\s+(?:\w+\s+)?wires\b", re.I)
+WIRE_IN = re.compile(r"\b(?:receiv\w*|incoming|inbound|coming\s+in|(?:wire[sd]?|wiring|send(?:s|ing)?|sent)\s+(?:me|us)|"
+                     r"(?:get|gets|getting|got|deposit\w*)\s+(?:a|an|the)\s+(?:\w+\s+)?wire)\b", re.I)
+WIRE_OUT = re.compile(r"\b(?:outgoing|send(?:s|ing)?\b(?!\s+(?:me|us)\b)|from\s+my\s+(?:\w+\s+)?(?:accounts?|acct)\b)", re.I)
+# "to my (own) checking account" or "to me" is the member's own; "to my account at another bank" is not
+WIRE_OWN = re.compile(r"\b(?:to|into)\s+(?:me|us)\b|\b(?:to|into)\s+(?:my|our)\s+(?:own\s+)?"
+                      r"(?:(?:\w+\s+)?(?:checking|savings|share|money\s+market)\s+)?(?:accounts?|acct)\b(?!\s+(?:at|with|in)\b)", re.I)
+WIRE_FROM_ABROAD = re.compile(r"\bfrom\s+(?:overseas|abroad|another\s+country|out\s+of\s+the\s+country)\b", re.I)
+WIRE_ABROAD = re.compile(r"\b(?:internationa\w*|intl|int['’]l|abroad|overseas|foreign|another\s+country|out\s+of\s+the\s+country|"
+                         r"outside\s+(?:of\s+)?the\s+(?:us|u\.s\.|united\s+states|country))\b", re.I)
 # a capitalised name before "location" or "office", not at the start of the question
 PLACE_NAMED = re.compile(r"(?<=\s)([A-Z][\w'’-]+)\s+(?:location|office)\b")
 NOT_PLACE_NAMES = {"main", "home", "head", "corporate", "post", "box", "back", "front", "branch"}
@@ -977,6 +998,9 @@ NOT_PLACE_NAMES = {"main", "home", "head", "corporate", "post", "box", "back", "
 
 # Chat shorthand for "please" and "thanks": never a thing the question asks about.
 CHAT_FILLERS = {_stem(w) for w in ("pls", "plz", "thx", "thanks", "thank", "ty", "asap")}
+# who ("someone who isn't a member") and how soon ("a debit card fast") are never what a fee is charged for
+NOT_FEE_SUBJECT = {_stem(w) for w in ("someone", "somebody", "anyone", "anybody", "everyone", "everybody", "person",
+                                      "people", "fast", "quick", "quickly", "soon", "urgent", "urgently", "immediately")}
 QUESTION_START = r"(?:how|what|what['’]?s|when|where|which|who|why|is|are|do|does|did|can|could|will|would|should)\b"
 OPENER = re.compile(rf"^(?:(?:[^?.!:]*[!:]|[^?,]*,|[^?]*?\s[-–—]\s)\s*)+?(?={QUESTION_START})", re.I)
 
@@ -1008,7 +1032,7 @@ def rare_subject(index: Index, q: Query) -> list[list[str]]:
     out = []
     for t in dict.fromkeys(tokenize(text)):
         if t in GENERIC or t in FEE_WORDS or t in CHAT_FILLERS or t == q.count_noun or t[0].isdigit() or t in SEND_WORDS \
-                or t in skip:
+                or t in skip or (q.attribute == "fee" and t in NOT_FEE_SUBJECT):
             continue                                # "send a wire": the fee line says what is sent, not "send"
         if len(index.postings.get(t, ())) < limit:
             out.append([t] + _SYN.get(t, []))
@@ -1019,7 +1043,67 @@ def rare_subject(index: Index, q: Query) -> list[list[str]]:
         out = [alts for alts in out if any(w in said for w in alts)]
         if not any(_stem("wire") in alts for alts in out):
             out.append([_stem("wire")])
+        way = wire_direction(q.raw)
+        kinds = {_stem(w) for w in ("international", "domestic", "incoming", "outgoing", "foreign", "overseas")}
+        # "wiring" and "wired" are searched as "wire", with the kind of wire it is
+        said = {"in": "incoming", "abroad": "international", "out": "domestic"}.get(way)
+        q.tokens += [t for t in (_stem("wire"), _stem(said) if said else None) if t and t not in q.tokens]
+        if way == "all":                                 # every kind asked about: none of them is required
+            out = [a for a in out if not set(a) & kinds]
+        elif way == "in":                                # an incoming wire costs the same from anywhere
+            out = [a for a in out if not set(a) & kinds] + [[_stem(w) for w in ("incoming", "inbound", "receive", "receiving")]]
+        elif way == "abroad":
+            out = [a for a in out if not set(a) & kinds] + [[_stem(w) for w in ("international", "foreign", "overseas")]]
     return out
+
+
+def _foreign_frames(text: str) -> set:
+    """The frames ("to", "in", "from") in which a wire question names a foreign place: a country, capital or big city
+    ("in London", "to the Philippines", "to Europe"), or a city with a foreign country or province after a comma
+    ("Lyon, France"). A city with anything else after the comma stays domestic ("Paris, Texas"), and a place that is
+    also a given name counts only after "in" ("to Chad" is a person)."""
+    commas = [(m.group(1).lower(), m.group(2).lower(), m.start()) for m in CITY_COMMA.finditer(text)]
+    domestic = {city for city, after, _ in commas if after not in PROVINCE_SET}
+    frames = set()
+    for m in PLACE_RE.finditer(text):
+        frame, name = m.group(1).lower(), m.group(2).lower()
+        if name in domestic or (frame == "to" and name in GIVEN_NAMES):
+            continue
+        frames.add(frame)
+    for city, after, at in commas:
+        if after in PROVINCE_SET and city not in FOREIGN_SET:
+            words = text[:at].lower().split()
+            frames.add(words[-1] if words and words[-1] in ("to", "in", "from") else "in")
+    return frames
+
+
+def wire_direction(text: str) -> str:
+    """Which wire a wire question asks about: "all" (several kinds named together, or "wire fees"), "in" (received:
+    "incoming", "wire me", "into my checking account", "from abroad"), "abroad" (sent abroad: "internationally",
+    "to my sister in London", "a Canadian bank", "in euros") or "out" (sent within the country, the default).
+    Sending ("send", "outgoing", "from my account") outranks "to my account"."""
+    for w in SITE_WORDS:                       # "into my <site name> checking account" is the member's own
+        text = re.sub(rf"\b{re.escape(w)}\b\s*", "", text, flags=re.I)
+    if WIRE_ALL.search(text):
+        return "all"
+    frames = _foreign_frames(text)
+    sending = bool(WIRE_OUT.search(text))
+    from_abroad = frames == {"from"} or (WIRE_FROM_ABROAD.search(text) and not frames - {"from"})
+    if WIRE_IN.search(text) or (not sending and (WIRE_OWN.search(text) or from_abroad)):
+        return "in"
+    return "abroad" if names_abroad(text, frames) else "out"
+
+
+def names_abroad(text: str, frames=None) -> bool:
+    """The wire question points abroad: a word ("internationally", "overseas"), a foreign place, a nationality's
+    bank or a foreign currency."""
+    frames = _foreign_frames(text) if frames is None else frames
+    return bool(WIRE_ABROAD.search(text) or frames - {"from"} or NATIONAL_BANK.search(text) or CURRENCY.search(text))
+
+
+# a wire's own fee line: the wire named next to its dollar amount ("Domestic wire $25.00 each"), not an offer's
+# condition that happens to mention wires and an amount
+WIRE_FEE_LINE = re.compile(r"\bwir(?:e|es)\b[^\n.$]{0,40}?\$\s?\d|\$\s?\d[\d,.]*[^\n.$]{0,15}\bwir(?:e|es)\b", re.I)
 
 
 def _wire_line_words(index: Index) -> set:

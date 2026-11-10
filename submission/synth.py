@@ -15,8 +15,8 @@ from dataclasses import replace
 from datetime import date
 
 from ingest import Chunk, View, url_key
-from retrieve import (SOFT_QUALIFIERS, Evidence, Query, _asked, names_line, on_other_line, other_lines, qualify,
-                      supports, terms_in, tier_width, tokenize)
+from retrieve import (SOFT_QUALIFIERS, WIRE, WIRE_FEE_LINE, Evidence, Query, _asked, names_line, on_other_line,
+                      other_lines, qualify, supports, terms_in, tier_width, tokenize, wire_direction)
 
 REFUSAL = "That isn't listed on our website, so I can't confirm it. Please contact us and we can help."
 # The prompt calls the context "excerpts"; a sentence that talks about them instead of the site is dropped.
@@ -146,8 +146,22 @@ def _as_chunk(text: str, like: Chunk) -> Chunk:
 
 def extractive(q: Query, ev: Evidence, view: View) -> tuple[str, list[Chunk]]:
     pool = [c for c in ev.chunks if supports(c, q)] if q.attribute else ev.chunks
+    if q.attribute == "fee":                   # a promotion's offer ("we'll give you $X") is never a fee
+        pool = [c for c in pool if c.kind != "promo"] or pool
     if not pool:
         return REFUSAL, []
+    if q.attribute == "fee" and WIRE.search(q.raw) and wire_direction(q.raw) == "all":
+        # several kinds of wire asked about ("domestic and international", "your wire fees"): one fee line of each
+        # kind, from the page that lists the first one
+        first = next((c for c in pool if WIRE_FEE_LINE.search(c.text)), None)
+        kinds = {}
+        for c in ([first] + [d for d in view.pages[first.key].page.chunks if d is not first]) if first else []:
+            kind = next((k for k in ("incoming", "domestic", "international") if k in c.text.lower()), None)
+            if kind and kind not in kinds and WIRE_FEE_LINE.search(c.text) and supports(c, q):
+                kinds[kind] = c
+        if len(kinds) > 1:
+            lines = list(kinds.values())
+            return " ".join(render_row(c) + "." if c.is_row else best_sentence(c, q) for c in lines), lines
     top = pool[0]
     one_amount = top.is_row and len(set(q.amounts)) == 1 and tier_width(top, q) is not None
     if one_amount:
@@ -378,8 +392,14 @@ class Synthesizer:
         excerpts = "\n\n".join(f"[{i}] ({describe(c, view)})\n{c.text}" for i, c in enumerate(_llm_chunks(ev), 1))
         # A dated question is answered from the site as it stood that day, i.e. the newest crawl
         # on or before it; showing the crawl's own (earlier) day reads as "can't confirm".
-        when = asked if asked and asked > view.taken_on else view.taken_on
-        return self._ask(f"Website snapshot date: {when.isoformat()}\n\nExcerpts:\n{excerpts}", question)
+        if asked and asked < view.taken_on:
+            # a day before the first crawl: the model is told the day, or "a year ago" reads as a year before the crawl
+            head = (f"Website snapshot date: {view.taken_on.isoformat()}. The member asks about {asked.isoformat()}, before "
+                    f"this snapshot: answer as of that day from excerpts already in effect then (an effective date on or "
+                    f"before it, or none).")
+        else:
+            head = f"Website snapshot date: {(asked if asked and asked > view.taken_on else view.taken_on).isoformat()}"
+        return self._ask(f"{head}\n\nExcerpts:\n{excerpts}", question)
 
     def _ask(self, content: str, question: str, system: str = SYSTEM, schema: dict = SCHEMA,
              max_tokens: int = 1024) -> dict | None:
@@ -462,7 +482,7 @@ class Synthesizer:
                     if again is not None:
                         return again[0], again[1], True, "; ".join(x for x in (again[2], note) if x)
                     return REFUSAL, [], False, note
-                accepted = self._accept(question, q, ev, view, out, lookup)
+                accepted = self._accept(question, q, ev, view, out, lookup, asked)
                 if accepted is not None:
                     text, cited, llm_note = accepted
                     return text, cited, True, "; ".join(x for x in (llm_note, note) if x)
@@ -472,11 +492,14 @@ class Synthesizer:
             cited = cited + ([own] if own else [])
         return text, cited, text != REFUSAL, note
 
-    def _accept(self, question: str, q: Query, ev: Evidence, view: View, out: dict, lookup=None):
+    def _accept(self, question: str, q: Query, ev: Evidence, view: View, out: dict, lookup=None,
+                asked: date | None = None):
         """The model's answer if it passes the guards: (text, cited chunks, note), else None."""
         text = _drop_dead_links(_drop_banned(str(out.get("answer", ""))), view)
         shown = _llm_chunks(ev)                # the exact excerpts the model saw, same numbering
         allowed = numbers(question) | numbers(" ".join(f"{c.text} {describe(c, view)}" for c in shown))
+        if asked:                              # the day it was told it may write back, in any form
+            allowed |= numbers(f"{asked.isoformat()} {asked.day} {asked.year} {asked.month}")
         if not text or not numbers(text) <= allowed:
             return None
         ids = [i for i in out.get("evidence_ids", []) if isinstance(i, int) and 1 <= i <= len(shown)]
@@ -496,7 +519,7 @@ class Synthesizer:
         out = self._llm(question, ev, view, asked)
         if not out or not out.get("answerable", False):
             return None
-        return self._accept(question, q, ev, view, out)
+        return self._accept(question, q, ev, view, out, asked=asked)
 
     def pick_pages(self, question: str, pages: str) -> list[str]:
         """Up to 3 page paths from the site's own page list ("path | title" lines) for a question."""
