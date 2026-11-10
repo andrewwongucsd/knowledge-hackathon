@@ -15,8 +15,12 @@ from dataclasses import replace
 from datetime import date
 
 from ingest import Chunk, View, url_key
-from retrieve import (SOFT_QUALIFIERS, WIRE, WIRE_FEE_LINE, Evidence, Query, _asked, names_line, on_other_line,
-                      other_lines, qualify, supports, terms_in, tier_width, tokenize, wire_direction)
+from collections import Counter
+from types import SimpleNamespace
+
+from retrieve import (KIND_NAME, SOFT_QUALIFIERS, SYNONYMS, WIRE, WIRE_FEE_LINE, Evidence, Query, _asked, asked_kinds,
+                      kinds_in, names_line, on_other_line, other_kind, other_lines, product_name, qualify, supports,
+                      terms_in, tier_width, tokenize, wire_direction)
 
 REFUSAL = "That isn't listed on our website, so I can't confirm it. Please contact us and we can help."
 # The prompt calls the context "excerpts"; a sentence that talks about them instead of the site is dropped.
@@ -146,6 +150,11 @@ def _as_chunk(text: str, like: Chunk) -> Chunk:
 
 def extractive(q: Query, ev: Evidence, view: View) -> tuple[str, list[Chunk]]:
     pool = [c for c in ev.chunks if supports(c, q)] if q.attribute else ev.chunks
+    if _leads_with_other_kind(q, ev):
+        # "what's the kayak savings rate?" led by a certificate table under a savings heading: the asked line answers
+        own = asked_line_row(q, ev, view)
+        rest = [c for c in pool if c is not own and not (c.is_row and other_kind(c, q))]
+        pool = ([own] if own else []) + rest or pool
     if q.attribute == "fee":                   # a promotion's offer ("we'll give you $X") is never a fee
         pool = [c for c in pool if c.kind != "promo"] or pool
     if not pool:
@@ -197,8 +206,10 @@ def _mentions(text: str, words) -> bool:
 
 
 def _line_words(q: Query) -> set:
-    """"Account" is every product's head word, so it names the line only when nothing more specific does."""
-    return (q.category - {"account", "accounts"}) or q.category
+    """"Account" is every product's head word, so it names the line only when nothing more specific does. The
+    site's word for the line counts too (a CD is a certificate)."""
+    words = (q.category - {"account", "accounts"}) or q.category
+    return words | {s for w in words if w.rstrip("s") == "cd" for s in SYNONYMS.get("cd", ())}
 
 
 def _names(c: Chunk, words) -> bool:
@@ -215,26 +226,12 @@ def _line_rows(q: Query, ev: Evidence, exclude=()) -> list[Chunk]:
 
 # The kind of product a row's name says it is, and the words that say nothing beyond its kind ("Basic Savings
 # Account" is the plain savings account; "Kayak Savings" is a named one).
-KIND_NAME = re.compile(r"\b(loan|mortgage|certificate|cd|card|savings|checking|heloc|money\s+market)s?\b")
 PLAIN_NAME = re.compile(r"\b(?:share|accounts?|rates?|regular|basic|standard|personal)\b")
 # lines that are a different kind of account, not a tier of the same one (jumbo, refinance)
 OTHER_LINE = ("health", "hsa", "ira", "traditional", "roth", "business")
 
 
-def _kinds(text: str) -> set:
-    return {re.sub(r"\s+", " ", m.group(1)) for m in KIND_NAME.finditer(text.lower())}
-
-
-def _product_name(c: Chunk) -> str:
-    """The row's own product name: its first label cell, else the last part of its heading, else the heading."""
-    for t in (c.label().split(" | ")[0], c.section.split(" · ")[-1], c.section):
-        if _kinds(t):
-            return t
-    return ""
-
-
-def _line_kinds(q: Query) -> set:
-    return {w if w == "savings" else w.rstrip("s") for w in _line_words(q)}
+_kinds, _product_name, _line_kinds = kinds_in, product_name, asked_kinds      # see retrieve
 
 
 def _foreign(c: Chunk, q: Query, lines=SOFT_QUALIFIERS) -> bool:
@@ -288,6 +285,62 @@ def named_row(q: Query, ev: Evidence, exclude=(), view: View | None = None) -> C
 
 
 QUOTED_PCT = re.compile(r"\d+(?:\.\d+)?\s*(?:%|percent\b|apy\b|apr\b)", re.I)
+
+
+INTRO_ROW = re.compile(r"\b(?:intro\w*|promo\w*|(?:1st|first)\s+\d+\s+months?)\b", re.I)
+
+
+def _leads_with_other_kind(q: Query, ev: Evidence) -> bool:
+    """A rate question naming a product line whose best evidence row is another kind of product by its own name
+    ("Kayak Rates · Special Certificates" for "what's the kayak savings rate?")."""
+    if q.attribute != "rate" or not q.category - {"account", "accounts"}:
+        return False
+    top = next((c for c in ev.chunks if supports(c, q)), None)
+    return top is not None and top.is_row and other_kind(top, q)
+
+
+def asked_line_row(q: Query, ev: Evidence, view: View | None) -> Chunk | None:
+    """The asked line's own row for such a question: of that kind and no unasked line, naming every descriptor and
+    qualifier as a word, never an intro rate unless one was asked; from the evidence, else from the crawl's
+    re-fetched pages; on the page with the most such rows; then the plainest product (see named_row)."""
+    def own(c):
+        text = f"{c.label()} {c.section}".lower()
+        word = lambda w: any(re.search(rf"\b{re.escape(x.lower())}\b", text) for x in [w] + list(SYNONYMS.get(w, ())))
+        return (not other_kind(c, q) and not _foreign(c, q) and all(word(d) for d in q.descriptors)
+                and (not q.qualifiers or any(word(w) for w in q.qualifiers))
+                and (q.rate_kind or not INTRO_ROW.search(f"{text} {' '.join(c.header).lower()}")))
+    words, gone = _line_words(q), {d.id for d in getattr(ev, "dropped", ())}
+    def candidates(chunks):
+        return [c for c in chunks if c.is_row and c.id not in gone and _names(c, words) and supports(c, q)
+                and qualify(c, q)[0] != "mismatch" and not (c.expired_on and c.expired_on < view.taken_on) and own(c)]
+    rows = [c for c in _line_rows(q, ev) if own(c)]
+    if not rows and view is not None:
+        rows = candidates(c for vp in view.pages.values() if vp.status == "fresh" for c in vp.page.chunks)
+    if not rows:
+        return None
+    page = Counter(c.key for c in rows).most_common(1)[0][0]
+    if view is not None and page in view.pages:           # every such row of that page, not just the evidence's
+        rows = candidates(view.pages[page].page.chunks) or rows
+    return named_row(q, SimpleNamespace(chunks=[c for c in rows if c.key == page], dropped=[]))
+
+
+def _table_of(own: Chunk, view: View | None, ev: Evidence) -> list[Chunk]:
+    pool = view.pages[own.key].page.chunks if view is not None and own.key in view.pages else ev.chunks
+    name = _product_name(own) or own.section
+    return [c for c in pool if c.is_row and c.key == own.key and c.table_span == own.table_span
+            and (_product_name(c) or c.section) == name] or [own]
+
+
+def line_table_first(q: Query, ev: Evidence, view: View) -> Evidence:
+    """For such a question the model reads the asked line's own table first, and never the other kind's rows."""
+    if not _leads_with_other_kind(q, ev):
+        return ev
+    own = asked_line_row(q, ev, view)
+    if own is None:
+        return ev
+    table = _table_of(own, view, ev)
+    rest = [c for c in (ev.context or ev.chunks) if c not in table and not (c.is_row and other_kind(c, q))]
+    return replace(ev, context=table + rest)
 
 
 def _quoted_elsewhere(question: str, q: Query, ev: Evidence) -> bool:
@@ -474,7 +527,7 @@ class Synthesizer:
         cooling = self._cooldown > 0
         self._cooldown = max(0, self._cooldown - 1)
         if self.enabled and not cooling and not clear_cut(question, q, ev):
-            ev = own_table_first(question, q, ev, view, lookup)
+            ev = line_table_first(q, own_table_first(question, q, ev, view, lookup), view)
             out = self._llm(question, ev, view, asked)
             if out is not None:
                 if not out.get("answerable", False):

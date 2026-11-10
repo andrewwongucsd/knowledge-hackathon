@@ -99,7 +99,13 @@ OPTIONS_Q = re.compile(r"\boptions\b", re.I)
 PRODUCT_HEADS = r"loans?|mortgages?|certificates?|cds?|accounts?|cards?|savings|checking|visa|mastercard|discover|amex|heloc|line"
 
 RATE_Q = re.compile(r"\b(rates?|apr|apy|interest|dividends?|yield)\b", re.I)
+# "what does a savings account pay?" asks about a rate without the word (never "…pay in fees")
+DEPOSIT_PAYS = re.compile(r"\bwhat\s+(?:does|did|do|will|would)\s+(?:a|an|the|my|your)?\s*(?:[\w-]+\s+){0,3}"
+                          r"(?:savings|checking|certificates?|cds?|money\s+market|accounts?)\s+(?:account\s+)?(?:pay|earn|yield)s?\b|"
+                          r"\bwhat\s+(?:is|was|are|were)\s+(?:a|an|the|my|your)?\s*(?:[\w-]+\s+){0,4}"
+                          r"(?:savings|checking|certificates?|cds?|money\s+market|accounts?|specials?)\s+(?:paying|earning|yielding)\b", re.I)
 # "does any savings tier pay 0.45%?" asks about a rate without the word (cash back and points are not rates)
+PLAIN_DESCRIPTORS = {"regular", "basic", "standard", "plain", "normal", "ordinary", "simple", "everyday", "share", "personal"}
 PCT_PAID = re.compile(r"\b(?:pay|pays|paying|paid|earn|earns|earning)\s+(?:a\s+|an\s+)?\d+(?:\.\d+)?\s*(?:%|percent\b)"
                       r"(?!.*\b(?:cash\s*back|reward(?:s)?|points)\b)", re.I)
 FEE_Q = re.compile(r"\b(fees?|cost|charge[sd]?|price)\b|\bhow much (is|are|was|were|does|do|did|for|will)\b|"
@@ -393,7 +399,7 @@ def parse_query(question: str) -> Query:
     q.excluded -= q.qualifiers          # a line named elsewhere without a negation is still asked about
     if m := COUNT_Q.search(low):
         q.attribute, q.count_noun = "count", _stem(m.group(1))
-    elif RATE_Q.search(low) or PCT_PAID.search(low):
+    elif RATE_Q.search(low) or PCT_PAID.search(low) or (DEPOSIT_PAYS.search(low) and not FEE_Q.search(low)):
         q.attribute = "rate"
     elif FEE_Q.search(low):
         q.attribute = "fee"
@@ -461,7 +467,8 @@ def parse_query(question: str) -> Query:
                 cut = [j for j, w in enumerate(win) if w in DETERMINERS]   # "the sheet says its certificate"
                 win = win[cut[-1] + 1:] if cut else win
                 q.descriptors |= {w for w in win if w not in GENERIC and w not in EVALUATIVE and len(w) > 2
-                                  and w not in FRAME_WORDS and not re.fullmatch(PRODUCT_HEADS, w)}
+                                  and w not in FRAME_WORDS and not re.fullmatch(PRODUCT_HEADS, w)
+                                  and not RATE_Q.fullmatch(w)}       # "what APY does savings earn": APY is no product
                 q.category.add(t)
     if q.rate_kind and not q.category and MONEY_MARKET.search(low):
         # an intro or special rate on "the money market": that account is the product asked about
@@ -745,6 +752,17 @@ def select(index: Index, q: Query, k: int = 8) -> Evidence:
     view = index.view
     # A product word the site never uses ("share certificate") is a synonym, not a requirement.
     q.descriptors = {d for d in q.descriptors if _stem(d) in index.postings}
+    if q.category and q.descriptors & PLAIN_DESCRIPTORS:
+        # "a regular canoe savings account": a plain word counts only if a row of the asked kind names itself with it
+        kinds = asked_kinds(q)
+        def says(d):
+            for pos, _ in index.postings.get(_stem(d), []):
+                c = index.chunks[pos]
+                name = product_name(c) if c.is_row else ""
+                if name and kinds_in(name) & kinds and re.search(rf"\b{re.escape(d)}", name.lower()):
+                    return True
+            return False
+        q.descriptors = {d for d in q.descriptors if d not in PLAIN_DESCRIPTORS or says(d)}
     if q.attribute in ("rate", "fee") and q.entity and q.entity_is_branch and site_branch(index, q.entity):
         # rates and fees are the same at every branch: a branch the site has doesn't narrow the answer
         q.place, q.entity, q.entity_is_branch = q.entity, None, False
@@ -870,6 +888,49 @@ def select(index: Index, q: Query, k: int = 8) -> Evidence:
     return Evidence(chosen, dropped_chunks, supported, copies, context)
 
 
+# The kind of product a row's own name says it is ("Regular Certificate" under a "Kayak Savings Rates" heading is a
+# certificate). A CD is a certificate; a name saying "money market" is a money market, whatever else it says.
+KIND_NAME = re.compile(r"\b(loan|mortgage|certificate|cd|card|savings|checking|heloc|money\s+market)s?\b")
+KIND_SAME = {"cd": "certificate"}
+LOAN_KINDS = {"loan", "mortgage", "heloc"}
+HOME_LOAN = re.compile(r"\bhome\s+loans?\b", re.I)          # a home loan is a mortgage (a loan on home equity is not)
+KNOWN_KINDS = {"loan", "mortgage", "certificate", "card", "savings", "checking", "heloc", "money market"}
+
+
+def kinds_in(text: str) -> set:
+    text = HOME_LOAN.sub("mortgage", text.lower())
+    kinds = {KIND_SAME.get(k, k) for k in (re.sub(r"\s+", " ", m.group(1)) for m in KIND_NAME.finditer(text))}
+    return {"money market"} if "money market" in kinds else kinds
+
+
+def product_name(c: Chunk) -> str:
+    """The row's own product name: its first label cell, else the last part of its heading, else the heading."""
+    for t in (c.label().split(" | ")[0], c.section.split(" · ")[-1], c.section):
+        if kinds_in(t):
+            return t
+    return ""
+
+
+def asked_kinds(q: Query) -> set:
+    """The kinds of product the question names ("account" alone names none in particular)."""
+    words = (q.category - {"account", "accounts"}) or q.category
+    kinds = {KIND_SAME.get(k, k) for k in (w if w == "savings" else w.rstrip("s") for w in words)}
+    kinds = {"heloc" if k == "line" else k for k in kinds}                  # a line of credit
+    kinds |= {"money market"} if re.search(r"\bmoney\s+market", q.raw, re.I) else set()
+    kinds = (kinds - {"loan"}) | {"mortgage"} if HOME_LOAN.search(q.raw) else kinds
+    return kinds & KNOWN_KINDS
+
+
+def other_kind(c: Chunk, q: Query) -> bool:
+    """The row's own name says another kind of product than the one asked ("loan" alone takes any kind of loan)."""
+    asked, kinds = asked_kinds(q), kinds_in(product_name(c))
+    if not asked:                                   # no kind the names can be compared with
+        return False
+    if "loan" in asked:
+        kinds = {"loan" if k in LOAN_KINDS else k for k in kinds}
+    return bool(kinds - asked)
+
+
 def _asked(w: str, q: Query) -> bool:
     low = (q.text or q.raw).lower()     # "refinancing", "IRAs" and "refi" ask for that line too
     return (w in q.qualifiers or re.search(rf"\b{re.escape(_stem(w))}", low) is not None
@@ -984,6 +1045,9 @@ WIRE_ALL = re.compile(rf"\b{_WIRE_KIND}\b\s*(?:,|/|\band\b|\bor\b|\bvs\.?|\bvers
                       r"\bwire(?:\s+transfer)?\s+fees\b|\bfees\s+(?:for|on)\s+(?:\w+\s+)?wires\b", re.I)
 WIRE_IN = re.compile(r"\b(?:receiv\w*|incoming|inbound|coming\s+in|(?:wire[sd]?|wiring|send(?:s|ing)?|sent)\s+(?:me|us)|"
                      r"(?:get|gets|getting|got|deposit\w*)\s+(?:a|an|the)\s+(?:\w+\s+)?wire)\b", re.I)
+# someone else sends the wire ("a wire my employer sends to my account"): it is received
+WIRE_OTHER_SENDS = re.compile(r"\b(?:(?:my|our|his|her|their)\s+(?!own\b)[a-z]+|someone|somebody|they|he|she)\s+(?:is\s+|will\s+|wants\s+to\s+|"
+                              r"plans\s+to\s+)?(?:send|sends|sending|sent|wire|wires|wiring|wired)\b", re.I)
 WIRE_OUT = re.compile(r"\b(?:outgoing|send(?:s|ing)?\b(?!\s+(?:me|us)\b)|from\s+my\s+(?:\w+\s+)?(?:accounts?|acct)\b)", re.I)
 # "to my (own) checking account" or "to me" is the member's own; "to my account at another bank" is not
 WIRE_OWN = re.compile(r"\b(?:to|into)\s+(?:me|us)\b|\b(?:to|into)\s+(?:my|our)\s+(?:own\s+)?"
@@ -1000,7 +1064,16 @@ NOT_PLACE_NAMES = {"main", "home", "head", "corporate", "post", "box", "back", "
 CHAT_FILLERS = {_stem(w) for w in ("pls", "plz", "thx", "thanks", "thank", "ty", "asap")}
 # who ("someone who isn't a member") and how soon ("a debit card fast") are never what a fee is charged for
 NOT_FEE_SUBJECT = {_stem(w) for w in ("someone", "somebody", "anyone", "anybody", "everyone", "everybody", "person",
-                                      "people", "fast", "quick", "quickly", "soon", "urgent", "urgently", "immediately")}
+                                      "people", "fast", "quick", "quickly", "soon", "urgent", "urgently", "immediately",
+                                      "yesterday", "today", "tonight", "tomorrow", "recently", "earlier", "already")}
+# A relative clause after the thing a fee is asked about ("a check I wrote", "a check my wife wrote", "the card I've
+# used"): its verb, and its subject noun, say what was done with it. They are not required fee words unless the site
+# states a fee next to them ("…lost key $100": "a debit card I lost" still needs a fee for a lost card).
+REL_CLAUSE = re.compile(r"\b(?:a|an|the|this|that|my|your|our|his|her|their)\s+(?:[a-z][\w'’-]*\s+){0,2}?([a-z]+)\s+"
+                        r"(?:that\s+|which\s+)?(?:(?:i|we|you|he|she|they)(?:['’](?:ve|d|ll))?|(?:my|our|his|her|their)\s+([a-z]+))\s+"
+                        r"(?!(?:can|could|would|should|will|do|does|did|am|is|are|was|were|have|has|had|need|want|wants|might|"
+                        r"must|may|plan|hope|get|got)\b)([a-z]+)\b", re.I)
+TIME_NOUNS = {"time", "times", "day", "days", "moment", "way", "week", "month", "year", "night", "morning"}
 QUESTION_START = r"(?:how|what|what['’]?s|when|where|which|who|why|is|are|do|does|did|can|could|will|would|should)\b"
 OPENER = re.compile(rf"^(?:(?:[^?.!:]*[!:]|[^?,]*,|[^?]*?\s[-–—]\s)\s*)+?(?={QUESTION_START})", re.I)
 
@@ -1023,6 +1096,10 @@ def rare_subject(index: Index, q: Query) -> list[list[str]]:
     # words in parentheses restate the thing ("a teller's check (bank draft)"); a branch the site has doesn't
     # narrow a fee (see select)
     skip = {t for m in re.finditer(r"\(([^)]*)\)", text) for t in tokenize(m.group(1))} | ({_stem(w) for w in (q.place, "branch", "location", "office")} if q.place else set())
+    fee_said = _fee_line_words(index)
+    for m in REL_CLAUSE.finditer(text):
+        if m.group(1).lower() not in TIME_NOUNS:
+            skip |= {_stem(w.lower()) for w in (m.group(2), m.group(3)) if w and _stem(w.lower()) not in fee_said}
     wire = bool(WIRE.search(text))
     if wire:
         recipient = {t for m in RECIPIENT.finditer(text) for t in tokenize(m.group(0))} - {_stem("wire")}
@@ -1087,7 +1164,7 @@ def wire_direction(text: str) -> str:
     if WIRE_ALL.search(text):
         return "all"
     frames = _foreign_frames(text)
-    sending = bool(WIRE_OUT.search(text))
+    sending = bool(WIRE_OUT.search(text)) and not (WIRE_OTHER_SENDS.search(text) and WIRE_OWN.search(text))
     from_abroad = frames == {"from"} or (WIRE_FROM_ABROAD.search(text) and not frames - {"from"})
     if WIRE_IN.search(text) or (not sending and (WIRE_OWN.search(text) or from_abroad)):
         return "in"
@@ -1104,6 +1181,22 @@ def names_abroad(text: str, frames=None) -> bool:
 # a wire's own fee line: the wire named next to its dollar amount ("Domestic wire $25.00 each"), not an offer's
 # condition that happens to mention wires and an amount
 WIRE_FEE_LINE = re.compile(r"\bwir(?:e|es)\b[^\n.$]{0,40}?\$\s?\d|\$\s?\d[\d,.]*[^\n.$]{0,15}\bwir(?:e|es)\b", re.I)
+
+
+def _fee_line_words(index: Index) -> set:
+    """Every word the site writes just before a dollar amount on one line ("Stop payment … $30.00", "lost key
+    $100.00"): the things it states a fee or price for. Built once per view."""
+    words = getattr(index, "_fee_words", None)
+    if words is None:
+        words = set()
+        for c in index.chunks:
+            if c.kind == "article" or "$" not in c.text:
+                continue
+            for line in c.text.split("\n"):
+                for m in re.finditer(r"\$\s?\d", line):
+                    words |= set(tokenize(line[max(0, m.start() - 40):m.start()]))
+        index._fee_words = words
+    return words
 
 
 def _wire_line_words(index: Index) -> set:

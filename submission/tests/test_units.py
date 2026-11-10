@@ -1467,6 +1467,90 @@ class Rev41(unittest.TestCase):
         self.assertIsNone(date_asked("What did the canoe club announce last month?", st))           # an event
 
 
+class Rev42(unittest.TestCase):
+    """Relative clauses in fee questions; the model's question with its date written out; the asked kind of product
+    before another kind under the same heading; a wire someone else sends (synthetic data only)."""
+
+    def _fees(self):
+        from contract import Page, Snapshot
+        md = ("# Fee Schedule\n\n| Service | Fee |\n|---|---|\n| Canoe check stop payment | $30.00 per item |\n"
+              "| Re-key canoe locker due to lost key | $100.00 |\n| Kayak money order | $5.00 each |\n")
+        ks = build()
+        ks.ingest(Snapshot("s1", "2030-06-15", [Page("https://example.org/fees", "Fees | Example", md, "2030-06-15T09:00:00Z")]))
+        return ks
+
+    def test_a_relative_clause_is_not_what_is_charged_unless_a_fee_names_it(self):
+        import retrieve
+        ks = self._fees()
+        idx = ks._indexes[-1]
+        old, retrieve.RARE_SHARE = retrieve.RARE_SHARE, 0.5         # in a tiny index, make one-line words rare
+        try:
+            def subject(text):
+                q = parse_query(text)
+                return {w for alts in retrieve.rare_subject(idx, q) for w in alts}
+            self.assertNotIn(_stem("wrote"), subject("What would it cost to stop a canoe check I wrote?"))
+            self.assertNotIn(_stem("wife"), subject("What would it cost to stop a canoe check my wife wrote?"))
+            self.assertIn(_stem("lost"), subject("What's the fee for a canoe card I lost?"))        # a fee names "lost"
+            self.assertIn(_stem("overdraw"), subject("What's the canoe fee each time I overdraw?"))  # not a relative clause
+            self.assertNotIn(_stem("yesterday"), subject("What would it cost to stop a canoe check from yesterday?"))
+        finally:
+            retrieve.RARE_SHARE = old
+        self.assertIn("$30.00", ks.answer("What would it cost to stop payment on a canoe check I wrote?").text)
+
+    def test_the_model_reads_the_date_the_question_named(self):
+        from contract import Page, Snapshot
+        md = "# Kayak Rates\n\n| Account | APY |\n|---|---|\n| Kayak Savings | {} |\n"
+        ks = build()
+        for sid, day, apy in (("s1", "2030-01-10", "1.10%"), ("s2", "2030-03-01", "1.20%"), ("s3", "2030-06-15", "1.30%")):
+            ks.ingest(Snapshot(sid, day, [Page("https://example.org/rates", "Rates | Example", md.format(apy), f"{day}T09:00:00Z")]))
+        sent = []
+        class Fake:
+            class messages:
+                @staticmethod
+                def create(**k):
+                    sent.append(k["messages"][0]["content"])
+                    raise RuntimeError("offline")
+        ks._synth.enabled, ks._synth._client = True, Fake()
+        ks.answer("What was the Kayak Savings APY last March?")
+        self.assertIn("Question: What was the Kayak Savings APY in March 2030?", sent[-1])
+        ks.answer("What was the Kayak Savings APY last March?", "2030-06-20")             # as_of: as written
+        self.assertIn("Question: What was the Kayak Savings APY last March?", sent[-1])
+
+    def test_the_asked_kind_of_product_before_another_under_the_same_heading(self):
+        from contract import Page, Snapshot
+        md = ("# Kayak Savings Rates\n\n| Term | APY | Min. to Earn |\n|---|---|---|\n| 9 Month Certificate Special | 3.15% | $1,000 |\n\n"
+              "## Basic Savings\n\n| Balance | APY |\n|---|---|\n| $0.00 - $999.99 | 0.05% |\n| $1,000+ | 0.17% |\n")
+        ks = build()
+        ks.ingest(Snapshot("s1", "2030-06-15", [Page("https://example.org/rates", "Rates | Example", md, "2030-06-15T09:00:00Z")]))
+        text = ks.answer("What is the savings rate?").text
+        self.assertIn("0.17%", text)
+        self.assertNotIn("3.15%", text)
+        self.assertIn("3.15%", ks.answer("What's the 9-month certificate special APY?").text)
+        sent = []
+        class Fake:
+            class messages:
+                @staticmethod
+                def create(**k):
+                    sent.append(k["messages"][0]["content"])
+                    raise RuntimeError("offline")
+        ks._synth.enabled, ks._synth._client = True, Fake()
+        ks._cache.clear()
+        ks.answer("What is the savings rate?")
+        self.assertIn("0.17%", sent[-1])               # the model reads the savings table ...
+        self.assertNotIn("3.15%", sent[-1])            # ... and not the certificate under the same heading
+
+    def test_kinds_rate_cues_and_descriptors(self):
+        from retrieve import kinds_in, wire_direction
+        self.assertEqual(kinds_in("Canoe CD Rates"), {"certificate"})
+        self.assertEqual(kinds_in("Premier Money Market Savings"), {"money market"})
+        self.assertEqual(parse_query("What does a canoe savings account pay?").attribute, "rate")
+        self.assertEqual(parse_query("What will my canoe checking account pay in fees each month?").attribute, "fee")
+        self.assertEqual(parse_query("What was the 9-month kayak certificate special paying two months ago?").attribute, "rate")
+        self.assertNotIn("apy", parse_query("What APY does canoe savings earn?").descriptors)
+        self.assertEqual(wire_direction("What's the fee for a wire my employer sends to my account?"), "in")
+        self.assertEqual(wire_direction("What's the fee when I send a wire to my account at another bank?"), "out")
+
+
 class Contract(unittest.TestCase):
     def test_exactly_the_three_contract_methods(self):
         own = {n for n, v in vars(type(build())).items() if callable(v) and not n.startswith("__")}

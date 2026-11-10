@@ -92,7 +92,13 @@ class KnowledgeSystem:
             search = strip_temporal(calendar_phrases(question, now, crawls), lambda d: self._store.view_for(d) == vi or
                                     (before is not None and _iso(d) is not None and _iso(d) < self._store.views[0].taken_on),
                                     _dates_stated(index)) if index else question
-            self._cache[key] = _respond(index, self._synth, question, search, _iso(asked), before,
+            told = question
+            if asked and not as_of:
+                # the date the question named is the one read: the model sees it written out ("Two months ago, …" ->
+                # "In August 2026, …"), or it counts back from the snapshot date itself
+                told = calendar_phrases(question, now, crawls)
+                told = told[:1].upper() + told[1:]
+            self._cache[key] = _respond(index, self._synth, told, search, _iso(asked), before,
                                         getattr(self._store, "first_effective", {}))
         return self._cache[key]
 
@@ -271,8 +277,8 @@ WEEK_NOW_RANGE = (14, 42)
 
 def _value_question(text: str) -> bool:
     low = text.lower()
-    return bool((retrieve.RATE_Q.search(low) or retrieve.FEE_Q.search(low) or retrieve.PCT_PAID.search(low))
-                and not retrieve.COUNT_Q.search(low) and not EVENT_Q.search(low))
+    return bool((retrieve.RATE_Q.search(low) or retrieve.FEE_Q.search(low) or retrieve.PCT_PAID.search(low)
+                 or retrieve.DEPOSIT_PAYS.search(low)) and not retrieve.COUNT_Q.search(low) and not EVENT_Q.search(low))
 
 
 def _crawl_at(day: date, crawls) -> int:
