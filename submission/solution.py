@@ -113,7 +113,8 @@ def _respond(index: Index | None, synth: Synthesizer, question: str, search: str
     q = parse_query(search or question)       # the model still sees the full question
     linking = LINK_Q.search(question) is not None
     vocab = _anchor_vocab(index) if linking else None
-    joining, _, wanted = joining_info(q, vocab) if linking else (False, set(), set())
+    named = _title_names(index) if linking else None
+    joining, _, wanted = joining_info(q, vocab, named) if linking else (False, set(), set())
     if joining and not wanted and _stem("join") not in q.tokens:
         q.expansion = q.expansion + [_stem("join")]        # "sign up as a member": the link to join
         q.tokens = q.tokens + [_stem("join")]
@@ -122,7 +123,8 @@ def _respond(index: Index | None, synth: Synthesizer, question: str, search: str
         carried = lambda u: sum(u in t for t in _page_texts(index).values())
         near, wide = ev.context or ev.chunks, [c for _, c in index.search(q.tokens, top=30)]
         joins = _join_chunks(index) if joining else []
-        link = pick_link(near, view, q, carried, joins, vocab) or pick_link(wide, view, q, carried, joins, vocab)
+        link = (pick_link(near, view, q, carried, joins, vocab, named)
+                or pick_link(wide, view, q, carried, joins, vocab, named))
         if link:
             vp = link_source(link, near + wide + joins, view)
             return Answer(text=f"You can find that at {link}.", confident=True,
@@ -411,15 +413,26 @@ FRAME_TALK = set(tokenize("if am so also but didn doesn don isn wasn just then t
                           "middle mid she he her him his hers someone somebody anybody people"))
 FRAME_TALK |= {_stem(w) for w in FRAME_WORDS} | {_stem(w) for w in GENERIC}
 MONTH_WORD = re.compile(rf"^(?:{MONTH_RE})$", re.I)
+SENTENCE_END = re.compile(r"(?<=[.?!;])\s+")         # "…join. My cousin…" ends a sentence; "site.com" does not
+# the request names who joins ("so she can join", "for my cousin to join")
+JOINER = re.compile(r"\b(?:she|he|they|(?:my|our|his|her|their)\s+\w+)\b[^.?!;]*\bjoin", re.I)
+# how the link is passed on, never what it is for ("email it to her", "share the link", "text me the web address")
+SEND_IT = re.compile(r"\b(?:e-?mail|text|message|send|forward|share)\s+(?:(?:me|her|him|them|us)\s+)?"
+                     r"(?:it|this|that|them|the\s+(?:link|url|(?:web\s?)?address|web\s?page|website))\b", re.I)
+# things people join besides the credit union
+EVENT_WORDS = re.compile(r"\b(?:webinar|meeting|class|seminar|workshop|session|call|event|zoom|team|club|group|board|"
+                         r"committee|program|challenge|contest)s?\b", re.I)
 FACT_RARE = 0.01        # a question word on under 1% of chunks names the fact asked about
 
 
-def joining_info(q, vocab=None) -> tuple[bool, set, set]:
+def joining_info(q, vocab=None, named=None) -> tuple[bool, set, set]:
     """(is the question about joining, the words asked, what else is asked beyond joining). Joining: an action
     ("apply for membership", "become / sign up as a member", "membership application"), or a bare "join" or
     "membership" when nothing else is asked. A member of a kind ("a board member") is not joining. "Picking an
     application back up" asks to continue it. With the site's link vocabulary, a word that at most one link
-    on the site names ("text it to my sister") can't be what a link is asked for."""
+    on the site names ("text it to my sister") can't be what a link is asked for. How the link is passed on
+    ("email it to her") is never what it is for. In a message of several sentences, the ones that don't ask
+    for the link are context (see _request_words)."""
     site = {w.lower() for w in retrieve.SITE_WORDS}
     phrase, other_member = set(), False
     for m in JOIN_ACT.finditer(q.raw):
@@ -427,7 +440,8 @@ def joining_info(q, vocab=None) -> tuple[bool, set, set]:
         if m.group(1) and set(tokenize(m.group(1))) - FRAME_TALK - site:
             other_member = True
     subject = set(q.tokens) - LINK_WORDS - CHAT_FILLERS - set(q.expansion)
-    wanted = {w for w in subject - JOIN_WORDS - phrase - MEDIUM_WORDS - FRAME_TALK - site
+    sent = set(tokenize(" ".join(m.group(0) for m in SEND_IT.finditer(q.raw))))
+    wanted = {w for w in _request_words(q.raw, subject, named) - sent - JOIN_WORDS - phrase - MEDIUM_WORDS - FRAME_TALK - site
               if not w[0].isdigit() and not MONTH_WORD.match(w)}
     if vocab is not None:
         wanted = {w for w in wanted if vocab.get(w, 0) >= 2}
@@ -437,6 +451,46 @@ def joining_info(q, vocab=None) -> tuple[bool, set, set]:
     joining = not other_member and (bool(phrase) or (JOIN_BARE.search(q.raw) is not None and not wanted
                                                      and not joins_other))
     return joining, subject, wanted
+
+
+def _request_words(raw: str, subject: set, named=None) -> set:
+    """The words of a joining request, without its context. In a message of several sentences, a sentence
+    with neither the link word nor a joining word is context ("My cousin just moved here. Can you send me
+    the link so she can join?") when the request is plainly about joining: a joining phrase ("apply for
+    membership"), or the link sentence names who joins. The whole message counts when the request also
+    asks to apply for something ("so he can join and apply"), the context names a line of products, or,
+    for "so she can join", the context names something else one joins: an event, or a word that names
+    one of the site's own pages and little else (`named`, see _title_names)."""
+    sentences = [s for s in SENTENCE_END.split(raw.strip()) if s.strip()]
+    asking = [s for s in sentences if LINK_Q.search(s) or JOIN_BARE.search(s) or JOIN_ACT.search(s)]
+    context = " ".join(s for s in sentences if s not in asking)
+    if not asking or not context.strip():
+        return subject
+    acted = any(JOIN_ACT.search(s) for s in asking)
+    if not acted and not any(JOINER.search(s) for s in asking if LINK_Q.search(s)):
+        return subject
+    if (any(APPLY_Q.search(JOIN_ACT.sub(" ", s)) for s in asking)
+            or re.search(rf"\b(?:{'|'.join(OTHER_LINES)})", context, re.I)):
+        return subject
+    if not acted and (EVENT_WORDS.search(context) or set(tokenize(context)) & (named or set())):
+        return subject
+    return subject & set(tokenize(" ".join(asking)))
+
+
+def _title_names(index: Index) -> set:
+    """Words that name one of the site's own pages and little else: in a live, non-article page's title, and
+    on under 1% of the site's chunks (a program's own name). Built once per view."""
+    names = getattr(index, "_title_names", None)
+    if names is None:
+        site = {w.lower() for w in retrieve.SITE_WORDS}
+        titled = set()
+        for vp in index.view.pages.values():
+            if vp.status != "missing" and vp.page.kind != "article":
+                titled |= set(tokenize(vp.page.title or "")) - site
+        limit = FACT_RARE * max(1, len(index.chunks))
+        names = {w for w in titled if len(index.postings.get(w, ())) < limit}
+        index._title_names = names
+    return names
 
 
 def _anchor_vocab(index: Index) -> Counter:
@@ -473,12 +527,12 @@ def _clause(text: str) -> str:
     return re.split(r"[.!?;:—–|]|\s{2,}|\\\\", text)[-1]
 
 
-def pick_link(context: list[Chunk], view, q, carried=None, joins=(), vocab=None) -> str | None:
+def pick_link(context: list[Chunk], view, q, carried=None, joins=(), vocab=None, named=None) -> str | None:
     """The site's own link for what was asked (see _pick_any). A question about joining the credit union also
     reads the site's pages about joining, and prefers, in order: a link whose own words name more of what else
     was asked ("Continue my application" for picking one back up), an application portal given by a page about
     joining, then the usual order. When something else was asked and no link names it, the usual pick stands."""
-    joining, subject, wanted = joining_info(q, vocab)
+    joining, subject, wanted = joining_info(q, vocab, named)
     if not joining:
         return _pick_any(context, view, q, carried)
     join_keys = {c.key for c in joins}
@@ -597,6 +651,7 @@ APPLY_NEEDS = re.compile(
     re.I)
 # vehicle types are vehicles (an auto loan covers them); used only to match application links
 VEHICLE_KINDS = {_stem(w): {_stem("auto"), _stem("vehicle")} for w in ("minivan", "van", "suv", "truck", "pickup")}
+LINE_WORDS = {_stem(w) for w in ("personal", "business")}     # lines of products an address may name anywhere
 APPLY_LINK = re.compile(r"\b(?:apply|application|request|start)\w*", re.I)
 NOT_APPLY_PRODUCT = set(tokenize("apply applying application applications submit check complete"))
 
@@ -622,9 +677,13 @@ def _applications(context: list[Chunk], view, q, subject: set, hosts: set) -> di
     if not specific:
         return {}
     apps: dict = {}
+    # a line ("personal", "business") may be named anywhere in an address once another word picks the
+    # product ("a personal van loan"); "personal loan", "personal line" name a product of their own
+    lines = {w for w in LINE_WORDS if not re.search(rf"\b{w}\w*\s+(?:{'|'.join(GENERIC_HEADS)})\b", q.raw, re.I)}
+    pinned = specific - lines
     def names_product(title):                 # the product's own page: its title names what was asked
         words = set(tokenize(title or ""))
-        return all(syn(w) & words for w in specific)
+        return all(syn(w) & words for w in (pinned or specific))
     own_pages = [c for _, vp in sorted(view.pages.items())
                  if vp.status != "missing" and vp.page.kind not in ("article", "calculator")
                  and names_product(vp.page.title) for c in getattr(vp.page, "chunks", ())]
@@ -640,7 +699,7 @@ def _applications(context: list[Chunk], view, q, subject: set, hosts: set) -> di
             path = link.split("/", 1)[1] if "/" in link else ""
             last = set(tokenize(path.rsplit("/", 1)[-1])) | set(tokenize(own))
             whole = set(tokenize(path)) | set(tokenize(own))
-            if (all((syn(w) - heads | {w}) & last for w in specific)
+            if (all((syn(w) - heads | {w}) & (whole if w in lines and pinned else last) for w in specific)
                     and all(syn(w) & whole for w in product - specific)):
                 apps.setdefault(link, set()).add(c.key)
     return apps

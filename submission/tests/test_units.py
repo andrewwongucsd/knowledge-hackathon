@@ -15,7 +15,7 @@ import run_eval  # noqa: E402
 import scoring  # noqa: E402
 from contract import Answer, Conflict  # noqa: E402
 from ingest import Parser, View, strip_footnotes, url_key  # noqa: E402
-from retrieve import _stem, amount_ranges, model_year_ranges, parse_query  # noqa: E402
+from retrieve import _stem, amount_ranges, model_year_ranges, parse_query, tokenize  # noqa: E402
 from solution import build  # noqa: E402
 from synth import REFUSAL, _drop_banned, _drop_dead_links, _sentences, numbers, render_row  # noqa: E402
 
@@ -1056,6 +1056,69 @@ class Rev36(unittest.TestCase):
         # a product the site has a page for ("insurance") is not another product's application
         self.assertNotEqual(pick_link(ctx, view, parse_query("What's the link to apply for canoe insurance?")),
                             "apply.example.org/loan-application/canoe-loan")
+
+
+class Rev37(unittest.TestCase):
+    """Context in another sentence, how a link is passed on, lines ruled out, line words in addresses
+    (synthetic data only)."""
+
+    def test_context_in_another_sentence_is_not_what_is_asked(self):
+        from solution import _request_words
+        def words(q, named=None):
+            return _request_words(q, set(tokenize(q)), named)
+        moved = "My cousin just moved to Harborview. Can you send me the link so she can join?"
+        self.assertFalse(set(tokenize("harborview moved")) & words(moved))
+        teen = ("My teen just started her first job and wants a canoe account. "
+                "What's the web address where she can apply for membership?")
+        self.assertFalse(set(tokenize("job canoe")) & words(teen))
+        # kept: no one named as joining, an event, a second request, a line, or a page the site names
+        for q, kept in (("The harbor picnic is on Saturday. What's the link to join?", "picnic"),
+                        ("My son has a webinar tonight. Can you send me the link so he can join?", "webinar"),
+                        ("My son wants a canoe loan. What's the link so he can join and apply?", "canoe"),
+                        ("I need a business canoe account. What's the link to apply for membership?", "business")):
+            self.assertTrue(set(tokenize(kept)) <= words(q), q)
+        regatta = "My wife heard about the harbor regatta. Can you send me the link so she can join?"
+        self.assertTrue(set(tokenize("regatta")) <= words(regatta, set(tokenize("regatta"))))
+        self.assertFalse(set(tokenize("regatta")) & words(regatta))
+        one = "What's the link on example.org where she can join?"        # a domain doesn't end a sentence
+        self.assertEqual(words(one), set(tokenize(one)))
+
+    def test_how_a_link_is_passed_on_is_not_what_it_is_for(self):
+        from solution import joining_info
+        for q in ("Can you share the link so my cousin can join?", "Email me the web address so my dad can become a member."):
+            joining, _, wanted = joining_info(parse_query(q), {"share": 50, "email": 9, "web": 9})
+            self.assertTrue(joining, q)
+            self.assertFalse(wanted, q)
+
+    def test_a_line_ruled_out_and_one_asked_about(self):
+        self.assertEqual(parse_query("What's the canoe loan rate, not for my business?").excluded, {"business"})
+        self.assertEqual(parse_query("Cashier's check fee? Except for business.").excluded, {"business"})
+        self.assertNotIn("business", parse_query("Canoe loan rate, not for a business?").tokens)
+        asked = parse_query("Not sure if I qualify or not for a jumbo special. What's the jumbo special rate?")
+        self.assertEqual(asked.excluded, set())
+        self.assertIn("jumbo", asked.qualifiers)
+
+    def _view(self):
+        from types import SimpleNamespace as NS
+        from ingest import Chunk
+        text = ("Canoe loans (example.org/canoes). Apply today (apply.example.org/loan-application-personal/canoe-loan). "
+                "Personal loans (example.org/personal-loans). "
+                "Apply today (apply.example.org/loan-application-personal/personal-loan).")
+        chunk = Chunk(1, "example.org/canoes", "product", text, text)
+        page = lambda key, title, chunks=(): NS(status="fresh", snapshot_id="s1",
+                                                page=NS(kind="product", key=key, url="https://" + key, title=title,
+                                                        chunks=list(chunks)))
+        return NS(pages={"example.org/canoes": page("example.org/canoes", "Canoe Loans", [chunk]),
+                         "example.org/personal-loans": page("example.org/personal-loans", "Personal Loans")}), [chunk]
+
+    def test_a_line_word_may_sit_anywhere_in_an_application_address(self):
+        from solution import pick_link
+        view, ctx = self._view()
+        for q in ("What's the link to apply for a personal canoe loan?",
+                  "I need the link to apply for a loan on a canoe. It's for personal use, not for a business."):
+            self.assertEqual(pick_link(ctx, view, parse_query(q)), "apply.example.org/loan-application-personal/canoe-loan", q)
+        self.assertEqual(pick_link(ctx, view, parse_query("What's the link to apply for a personal loan?")),
+                         "apply.example.org/loan-application-personal/personal-loan")
 
 
 class Contract(unittest.TestCase):

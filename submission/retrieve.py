@@ -202,8 +202,10 @@ OFFER_LABEL = re.compile(r"\b(?:specials?|promos?|promotions?)\b", re.I)
 MONEY_MARKET = re.compile(r"\bmoney\s+markets?\b", re.I)
 KIND_RATE_EV = re.compile(rf"\d+(?:\.\d+)?\s*%\s*\d?\s*(?:(?:{RATE_KINDS})\s+)?(?:APR|APY|annual percentage|dividend)|"
                           rf"(?:{RATE_KINDS})\s+(?:\w+\s+){{0,3}}(?:rate|apr|apy)\b[^.]{{0,40}}?\d+(?:\.\d+)?\s*%", re.I)
-NEGATED_QUALIFIER = re.compile(r"\b(?:not|non|excluding|except|other than|besides|without|rather than|instead of)"
-                               r"[\s-]+(?:(?:the|a|an|any)\s+)?(%s)\b" % "|".join(SOFT_QUALIFIERS), re.I)
+# "not the jumbo", "not for my business", "except for business": a line ruled out ("…or not for a jumbo" asks about it)
+NEGATED_QUALIFIER = re.compile(r"(?<!\bor\s)\b(?:not|non|excluding|except|other than|besides|without|rather than|instead of)"
+                               r"[\s-]+(?:for\s+(?:(?:the|a|an|any|my|our)\s+)?|(?:the|a|an|any)\s+)?(%s)\b"
+                               % "|".join(SOFT_QUALIFIERS), re.I)
 
 
 def normalize_numbers(text: str) -> str:
@@ -323,6 +325,7 @@ def parse_query(question: str) -> Query:
     below = {_f(a) * (1000 if k else 1) for a, k in AMT_UNDER_RE.findall(norm)}
     q.amounts = [a - 0.01 if a in below else a for a in q.amounts]
     q.qualifiers = {w for w in SOFT_QUALIFIERS if re.search(rf"\b{w}\b", low)}
+    q.excluded -= q.qualifiers          # a line named elsewhere without a negation is still asked about
     if m := COUNT_Q.search(low):
         q.attribute, q.count_noun = "count", _stem(m.group(1))
     elif RATE_Q.search(low):
