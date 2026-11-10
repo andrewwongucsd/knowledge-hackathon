@@ -1176,7 +1176,7 @@ class Rev39(unittest.TestCase):
         self.assertEqual(parse_query("I can put $400 a month into a kayak certificate. What APY would I get?").amounts, [])
         self.assertEqual(parse_query("I earn $70,000 a year. What's the 30-year canoe loan rate?").amounts, [])
         self.assertEqual(parse_query("What's the canoe loan rate on a loan over $40,000?").amounts, [40000.01])
-        self.assertEqual(parse_query("I'm buying a $90,000 canoe with $10,000 down. What's the rate?").amounts, [90000.0])
+        self.assertEqual(parse_query("I'm buying a $90,000 canoe with $10,000 down. What's the rate?").amounts, [80000.0])
 
     def _system(self):
         from contract import Page, Snapshot
@@ -1253,6 +1253,138 @@ class Rev39(unittest.TestCase):
         self.assertTrue(rows[0].text.startswith("Special"))                       # names a kind of product already
         self.assertTrue(rows[1].text.startswith("Standard Certificate"))          # a one-word heading, under the tab
         self.assertTrue(rows[2].text.startswith("Canoe Account Rates · Harbor Choice"))
+
+
+class Rev40(unittest.TestCase):
+    """Branch names never crash a question; the asked product's own row; wires and their recipients; year-only and
+    relative dates; down payments; branches the site has (synthetic data only)."""
+
+    def test_no_question_shape_raises(self):
+        heads = ["What's the canoe loan rate at the Harbor branch", "What's the official check fee at the Elm Street branch",
+                 "What are the hours of the Harbor branch", "What's the link to the kayak page for the Harbor branch",
+                 "How much is a wire at the harbor branch", "What's the 12-month certificate rate"]
+        tails = ["?", "? I'm a member.", "? It's for a 12-month certificate.", " as of March 2030?", "? Asking for a friend.",
+                 ", not the jumbo?", " back in 2029?"]
+        for h in heads:
+            for t in tails:
+                parse_query(h + t)                          # must not raise
+
+    def _rows(self):
+        from types import SimpleNamespace as NS
+        from ingest import Chunk
+        def row(i, cell, apy, section, span):
+            return Chunk(i, "example.org/rates", "product", f"{cell} {apy}", f"{section} Balance APY {cell} {apy}",
+                         section=section, is_row=True, header=["Balance", "APY"], cells=[cell, apy], value_cols=[1], table_span=span)
+        rows = [row(1, "$0.00 - $999.99", "0.05%", "Rates · Basic Savings", (1, 4)),
+                row(2, "$1,000+", "0.17%", "Rates · Basic Savings", (1, 4)),
+                row(3, "$0.01+", "1.92%", "Rates · Kayak Savings", (6, 8)),
+                row(4, "$10,000+", "0.61%", "Rates · Canoe Money Market", (10, 12)),
+                row(5, "$10,000+", "0.61%", "Rates · Health Savings Account", (14, 16)),
+                row(6, "—", "0.00%", "Rates · Basic Checking", (18, 20)),
+                row(7, "$5,000 - $19,999.99", "2.65%", "Rates · Kayak Checking", (22, 24))]
+        view = NS(pages={"example.org/rates": NS(page=NS(chunks=rows))}, taken_on=date(2030, 6, 1))
+        return rows, view, NS
+
+    def test_the_asked_products_own_row_is_the_plainest_at_its_top_tier(self):
+        from synth import named_row, named_row_guard
+        rows, view, NS = self._rows()
+        q = parse_query("Do any savings tiers pay 0.61% APY?")
+        ev = NS(chunks=[rows[3], rows[4], rows[2]], dropped=[])
+        self.assertIs(named_row(q, ev, view=view), rows[1])            # not the named or health account, nor the $0 tier
+        text, own = named_row_guard("Do any savings tiers pay 0.61% APY?", q, ev, "Yes, the money market pays 0.61%.", view=view)
+        self.assertIs(own, rows[1])
+        self.assertIn("0.17%", text)
+        checking = parse_query("What APY does checking pay on a $10,000 balance?")
+        self.assertIs(named_row(checking, NS(chunks=[rows[6], rows[5]], dropped=[]), view=view), rows[6])   # the tier that fits
+
+    def test_a_value_of_the_same_kind_of_product_appends_nothing(self):
+        from types import SimpleNamespace as NS
+        from ingest import Chunk
+        from synth import named_row_guard
+        def row(i, cell, apy, section):
+            return Chunk(i, "example.org/rates", "product", f"{cell} {apy}", f"{section} {cell} {apy}", section=section,
+                         is_row=True, header=["Term", "APY"], cells=[cell, apy], value_cols=[1], table_span=(i, i))
+        regular = row(1, "12 Month Certificate", "3.05%", "Rates · Certificates")
+        jumbo = row(2, "12 Month Jumbo Certificate", "3.45%", "Rates · Certificates")
+        q = parse_query("Do any certificates pay 3.45% APY?")
+        self.assertIsNone(named_row_guard("Do any certificates pay 3.45% APY?", q, NS(chunks=[jumbo, regular], dropped=[]),
+                                          "Yes, the 12-month jumbo pays 3.45%.")[1])
+
+    def _fees(self):
+        from contract import Page, Snapshot
+        fees = ("# Fee Schedule\n\n| Service | Fee |\n|---|---|\n| Domestic wire | $20.00 each |\n| Incoming wire | $10.00 |\n"
+                "| International wire | $45.00 each |\n| Official check | $5.00 each |\n| Stop payment | $30.00 per item |\n")
+        contact = "# Contact Us\n\n## Harbor Branch\n\n12 Main St., Rivertown, ST 00000\n\nMon - Fri 9 a.m. - 4 p.m.\n"
+        ks = build()
+        for sid, day in (("s1", "2030-01-10"), ("s2", "2030-06-15")):
+            ks.ingest(Snapshot(sid, day, [Page("https://example.org/fees", "Fees | Example", fees, f"{day}T09:00:00Z"),
+                                          Page("https://example.org/contact", "Contact | Example", contact, f"{day}T09:00:00Z")]))
+        return ks
+
+    def test_a_wires_recipient_is_not_what_is_charged(self):
+        from ingest import Chunk
+        from retrieve import supports
+        ks = self._fees()
+        self.assertIn("$20.00", ks.answer("How much does it cost to wire money to my nephew's bank in Oakvale?").text)
+        self.assertFalse(ks.answer("What does it cost to send money to Zapcash?").confident)     # not a wire: still declines
+        self.assertIn("$5.00", ks.answer("What's the fee for an official check (bank draft)?").text)
+        incoming = Chunk(1, "example.org/fees", "document", "Incoming wire $10.00", "Fees Incoming wire $10.00")
+        self.assertTrue(supports(incoming, parse_query("What's the fee for a wire to my checking account?")))   # received
+        self.assertFalse(supports(incoming, parse_query("What's the fee for a wire to my nephew's bank?")))     # sent
+
+    def test_a_branch_the_site_has_does_not_narrow_a_fee(self):
+        ks = self._fees()
+        self.assertIn("$5.00", ks.answer("What's the official check fee at the Harbor branch?").text)
+        self.assertFalse(ks.answer("What's the official check fee at the Oakdale branch?").confident)
+        self.assertIn("$5.00", ks.answer("What's the official check fee at your Harbor location?").text)
+        self.assertFalse(ks.answer("What's the official check fee at your Oakdale location?").confident)
+        self.assertEqual(parse_query("What's the canoe loan rate at your Harbor, Ohio branch?").entity, "harbor")
+
+    def test_only_what_a_wire_fee_line_can_say_narrows_a_wire_question(self):
+        ks = self._fees()
+        self.assertIn("$20.00", ks.answer("My cousin banks in Oakvale and I want to wire her some money for her "
+                                          "graduation. What do you charge to send it?").text)
+        self.assertIn("$10.00", ks.answer("Someone is wiring money to me from another bank. Is there a fee for that "
+                                          "incoming wire into my account?").text)
+        self.assertIn("$45.00", ks.answer("What's the fee for an international wire to my cousin?").text)
+
+    def test_a_percent_paid_is_a_rate_question(self):
+        self.assertEqual(parse_query("Is there a kayak savings tier that earns 0.45%?").attribute, "rate")
+        self.assertNotEqual(parse_query("Do I earn 2% cash back on the canoe card?").attribute, "rate")
+
+    def test_down_payments(self):
+        self.assertEqual(parse_query("I'm buying a $250,000 canoe with $50,000 down. What's the rate?").amounts, [200000.0])
+        self.assertEqual(parse_query("I'm buying a $250,000 canoe and putting 20% down. What's the rate?").amounts, [200000.0])
+        self.assertEqual(parse_query("What's the rate with a down payment of $40,000 on a $200,000 canoe?").amounts, [160000.0])
+        self.assertEqual(parse_query("What's the rate on a $240,000 loan if I put $50,000 down?").amounts, [240000.0])
+        self.assertEqual(parse_query("What's the rate on a canoe loan of $250,000 with $60,000 down?").amounts, [250000.0])
+
+    def test_year_only_and_relative_dates(self):
+        from types import SimpleNamespace as NS
+        from solution import calendar_phrases, date_asked
+        st = NS(views=[NS(taken_on=date(2030, 1, 10)), NS(taken_on=date(2030, 3, 1)), NS(taken_on=date(2030, 6, 15))])
+        self.assertEqual(calendar_phrases("As of 2029, what was it?"), "As of December 2029, what was it?")
+        self.assertEqual(calendar_phrases("the 2029 canoe grant"), "the 2029 canoe grant")
+        self.assertEqual(date_asked("As of 2029, what was the canoe fee?", st), "2029-12-31")
+        self.assertEqual(date_asked("Before 2030, what was the canoe fee?", st), "2029-12-31")
+        self.assertIsNone(date_asked("What was the canoe fee in 2029?", st))                  # a period, not a moment
+        self.assertIsNone(date_asked("What was the APR on a canoe trailer built prior to 2029?", st))   # a model year
+        self.assertEqual(date_asked("What was the kayak APY last March?", st), "2030-03-31")
+        self.assertEqual(date_asked("What was the kayak APY a year ago?", st), "2029-06-15")
+        self.assertIsNone(date_asked("What was the kayak APY last month?", st))
+        self.assertIsNone(date_asked("What was the canoe fee last year?", st))
+        self.assertEqual(date_asked("Right now, as of March 2030, what's the kayak APY?", st), "2030-03-31")
+        self.assertIsNone(date_asked("Is the kayak APY now higher than back in March 2030?", st))
+
+    def test_an_amount_over_a_certificate_minimum_still_asks_about_savings(self):
+        from contract import Page, Snapshot
+        md = ("# Rates\n\n## Basic Savings\n\n| Balance | APY |\n|---|---|\n| $0.00 - $19,999.99 | 0.10% |\n| $20,000+ | 0.23% |\n\n"
+              "## Certificates\n\n| Term | APY | Min. to Earn |\n|---|---|---|\n| 12 Month | 3.05% | $1,000 |\n")
+        ks = build()
+        ks.ingest(Snapshot("s1", "2030-01-10", [Page("https://example.org/rates", "Rates | Example", md, "2030-01-10T09:00:00Z")]))
+        text = ks.answer("What APY would $30,000 in savings earn?").text
+        self.assertIn("0.23%", text)
+        self.assertNotIn("3.05%", text)
 
 
 class Contract(unittest.TestCase):

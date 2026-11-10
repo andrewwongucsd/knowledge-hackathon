@@ -81,7 +81,7 @@ class KnowledgeSystem:
             # vi is None when nothing is ingested or the date is before the first snapshot
             index = self._indexes[vi] if vi is not None else None
             # A date that only names the snapshot being answered from is not a search word
-            search = strip_temporal(calendar_phrases(question), lambda d: self._store.view_for(d) == vi or
+            search = strip_temporal(calendar_phrases(question, _newest(self._store)), lambda d: self._store.view_for(d) == vi or
                                     (before is not None and _iso(d) is not None and _iso(d) < self._store.views[0].taken_on),
                                     _dates_stated(index)) if index else question
             self._cache[key] = _respond(index, self._synth, question, search, _iso(asked), before)
@@ -144,7 +144,12 @@ def _respond(index: Index | None, synth: Synthesizer, question: str, search: str
         pages, paths = _page_list(index)
         keys = [paths[p] for p in map(_path, synth.pick_pages(text, pages)) if p in paths]
         return _pages_evidence(index, q, keys) if keys else None
-    text, cited, confident, note = synth.compose(question, q, ev, view, asked,
+    told = question
+    if q.place:                                       # the model isn't told a branch it might think matters
+        told = re.sub(rf"[,\s]*\b(?:at|in|from|near|for|of)?\s*(?:the|your|our|a)?\s*{re.escape(q.place)}\b[\w\s,'’.-]*?"
+                      r"\b(?:branch|location|office)\b", " ", question, count=1, flags=re.I)
+        told = re.sub(r"\s+([?.!,;:])", r"\1", re.sub(r"\s{2,}", " ", told)).strip()
+    text, cited, confident, note = synth.compose(told, q, ev, view, asked,
                                                  lookup=lambda text: select(index, parse_query(text)),
                                                  second_look=second_look)
     if not confident or (before and any(c.effective and c.effective > before for c in cited)):
@@ -214,12 +219,38 @@ _QUARTER = re.compile(r"\bQ([1-4])\s+(20\d\d)\b|\b(?:the\s+)?(first|second|third
 _HALF = re.compile(r"\b(?:the\s+)?(first|second)\s+half\s+(?:of\s+)?(20\d\d)\b", re.I)
 _YEAR_MONTH = re.compile(r"\b(20\d\d)-(0[1-9]|1[0-2])\b(?!-\d)(?![\s-]*(?:model|vehicle|car|truck|suv)s?\b)", re.I)
 _ORDINAL = ["first", "second", "third", "fourth"]
+# A year alone names a moment only after "as of / back in / by" (the year's end) or "before / until" (the day
+# before it starts), and only where it ends the phrase. "In 2025" names a period, and a year next to a vehicle
+# word is a model year ("a car built prior to 2020").
+_YEAR_ONLY = re.compile(r"\b(as of|as at|back in|by|before|prior to|until|till)\s+(20\d\d)\b(?=\s*(?:[,?.!;:]|$))", re.I)
+_MODEL_CUE = re.compile(r"\b(?:model|vehicle|car|truck|suv|built|made|manufactured)s?\b", re.I)
+# Relative dates that name the same month whether "now" is the newest crawl or a little after it: "last May",
+# "this past May", "a year ago". "Last month", "two weeks ago" and "last year" (a period) are not read.
+_LAST_MONTH = re.compile(r"\b(?:last|this past)\s+(%s)\b(?!\s+\d)" % "|".join(calendar.month_name[1:]), re.I)
+_YEARS_AGO = re.compile(r"\b(a|an|one|two|three|four|five|[1-9])\s+years?\s+ago\b", re.I)
+_YEARS_N = {"a": 1, "an": 1, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5}
+_FRAMED = re.compile(r"\b(?:as of|as at|back in|back on|prior to|up until|until|till|before|since|after|by|from|"
+                     r"between|and|to|in|on|during)\s*$", re.I)
 
 
-def calendar_phrases(text: str) -> str:
+def _relative(text: str, now: date) -> str:
+    """"last May" -> "in May 2030" (the latest May before `now`), "a year ago" -> "on September 28, 2029"; "in" / "on"
+    only when no frame word comes before."""
+    put = lambda m, prep, d: d if _FRAMED.search(m.string[:m.start()]) else f"{prep} {d}"
+    def last(m):
+        month = [n.lower() for n in calendar.month_name].index(m.group(1).lower())
+        return put(m, "in", f"{calendar.month_name[month]} {now.year if month < now.month else now.year - 1}")
+    def ago(m):
+        y = now.year - (_YEARS_N.get(m.group(1).lower()) or int(m.group(1)))
+        return put(m, "on", f"{calendar.month_name[now.month]} {min(now.day, calendar.monthrange(y, now.month)[1])}, {y}")
+    return _YEARS_AGO.sub(ago, _LAST_MONTH.sub(last, text))
+
+
+def calendar_phrases(text: str, now: date | None = None) -> str:
     """Calendar phrases a date reader doesn't know, as dates it does: "Memorial Day 2026" -> "May 25, 2026",
     "Q3 2026" / "the third quarter of 2026" -> "September 2026", "the first half of 2026" -> "June 2026",
-    "in the summer of 2026" -> "in August 2026", "2026-07" -> "July 2026"."""
+    "in the summer of 2026" -> "in August 2026", "2026-07" -> "July 2026", "as of 2025" -> "as of December 2025",
+    "before 2026" -> "before January 2026"; with `now` (the newest crawl), "last May" and "a year ago"."""
     day = lambda d: f"{calendar.month_name[d.month]} {d.day}, {d.year}"
     month = lambda y, m: f"{calendar.month_name[m]} {y}"
     for name, when in HOLIDAYS.items():
@@ -228,6 +259,11 @@ def calendar_phrases(text: str) -> str:
     text = _QUARTER.sub(lambda m: month(int(m.group(2) or m.group(4)),
                                         3 * (int(m.group(1)) if m.group(1) else _ORDINAL.index(m.group(3).lower()) + 1)), text)
     text = _HALF.sub(lambda m: month(int(m.group(2)), 6 if m.group(1).lower() == "first" else 12), text)
+    if not _MODEL_CUE.search(text):
+        text = _YEAR_ONLY.sub(lambda m: f"{m.group(1)} {'January' if m.group(1).lower() in ('before', 'prior to', 'until', 'till') else 'December'}"
+                                        f" {m.group(2)}", text)
+    if now is not None:
+        text = _relative(text, now)
     return _YEAR_MONTH.sub(lambda m: month(int(m.group(1)), int(m.group(2))), text)
 
 
@@ -282,6 +318,8 @@ AUX_RE = re.compile(r"\b(used to|is|are|was|were|does|do|did|has|have|had|can|co
                     r"\b(?:what|who|where|when|how|which|that|it|there|here)['’]s\b", re.I)
 PAST_AUX = {"was", "were", "did", "had", "used to"}
 NOW_Q = re.compile(r"\b(now|today|currently|presently|nowadays|anymore|any longer|these days)\b", re.I)
+# "now" set against a past date compares the two ("is it now higher than back in May?"): the newest crawl answers
+COMPARE_NOW = re.compile(r"\b(?:than|compar\w*|versus|vs\.?|same|differ\w*|still|chang\w*|since)\b", re.I)
 # A question about a change, or about an article or event, is answered from the newest crawl, which
 # records the change or the article; the date then says when it happened, not when to read the site.
 CHANGE_Q = re.compile(r"\b(chang\w*|rise[sn]?|rising|rose|raise[ds]?|increas\w*|decreas\w*|drop\w*|fell|fall\w*|"
@@ -293,15 +331,22 @@ EVENT_Q = re.compile(r"\b(posts?|posted|articles?|blogs?|story|stories|news\w*|p
 CLAUSE_END = re.compile(r"(?<=[;!?])\s+|(?<=[a-z0-9%)\]][.])\s+(?=[A-Z])")   # never inside 9,999.99 or Sept. 1
 
 
+def _newest(store: Store) -> date | None:
+    return store.views[-1].taken_on if store.views else None
+
+
 def date_asked(question: str, store: Store) -> str | None:
     """When no date is passed, a single moment the question itself names inside the crawl window
     ("as of March 2031", "what was it on 3/14/2031", "before April 2031") selects the site as it stood then.
     "As of / back in" always pin; "in / on / during" pin only in a past-tense question that is not about a
-    change or an article or event. Not for questions about now, spans ("since", "between"), dates outside
-    the window, or a date in a side remark of a present-tense question."""
-    q = calendar_phrases(question).strip()
-    if len(store.views) < 2 or NOW_Q.search(q):
+    change or an article or event. Not for questions about now (unless every date named is pinned: "Right now, as
+    of March 2031, ..."; never when "now" is compared with it), spans ("since", "between"), dates outside the window,
+    or a date in a side remark of a present-tense question."""
+    q = calendar_phrases(question, _newest(store)).strip()
+    now = NOW_Q.search(q)
+    if len(store.views) < 2 or (now and COMPARE_NOW.search(q)):
         return None
+    pins = set()                            # "Right now, as of June 2026, ...": the date it pins is meant
     cuts = [0] + [m.end() for m in CLAUSE_END.finditer(q)] + [len(q)]
     spans = list(zip(cuts, cuts[1:]))
     ask = next((s for s in reversed(spans) if "?" in q[s[0]:s[1]]), spans[-1])
@@ -337,7 +382,8 @@ def date_asked(question: str, store: Store) -> str | None:
         if frame in BEFORE_FRAMES:
             d = d - timedelta(days=1)
         found.add((d, precise))
-    if len({d for d, _ in found}) != 1:
+        pins.add(frame in PIN_FRAMES)
+    if (now and pins != {True}) or len({d for d, _ in found}) != 1:
         return None
     d, precise = found.pop()
     first, last = store.views[0].taken_on, store.views[-1].taken_on
@@ -386,7 +432,7 @@ SPAN_FROM = re.compile(r"\b(?:since|after|from)\s+(?:\S+\s+){0,2}$", re.I)
 def change_span(question: str, store: Store) -> tuple | None:
     """(start, end) dates of a change the question asks about; end None means "now". A month alone means
     the site as it stood by the end of that month."""
-    question = calendar_phrases(question)
+    question = calendar_phrases(question, _newest(store))
     if len(store.views) < 2 or not (CHANGE_ASK.search(question) or
                                     (COMPARE_ASK.search(question) and len(terms_in(question.lower())) <= 1)):
         return None

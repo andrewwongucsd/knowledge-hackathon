@@ -169,7 +169,7 @@ def extractive(q: Query, ev: Evidence, view: View) -> tuple[str, list[Chunk]]:
             # The top row matched a value shared with a different product than the one the question
             # names ("savings"): also give the named product's own row from the evidence, so a value
             # coincidence can't crowd out the product asked about.
-            own = named_row(q, ev, rows)
+            own = named_row(q, ev, rows, view)
             if own:
                 rows = rows + [own]
         return " ".join(render_row(r) + "." for r in rows), rows
@@ -199,37 +199,133 @@ def _line_rows(q: Query, ev: Evidence, exclude=()) -> list[Chunk]:
             and supports(c, q) and qualify(c, q)[0] != "mismatch"]
 
 
-def named_row(q: Query, ev: Evidence, exclude=()) -> Chunk | None:
-    """The plainest (shortest-named) such row. A row whose own name says it comes first: a page heading
-    like "Deposit Rates" covers every product on the page."""
-    named = _line_rows(q, ev, exclude)
-    by_name = [c for c in named if _mentions(c.label().lower(), _line_words(q))]
-    return min(by_name or named, key=lambda c: len(f"{c.label()} {c.section}")) if named else None
+# The kind of product a row's name says it is, and the words that say nothing beyond its kind ("Basic Savings
+# Account" is the plain savings account; "Kayak Savings" is a named one).
+KIND_NAME = re.compile(r"\b(loan|mortgage|certificate|cd|card|savings|checking|heloc|money\s+market)s?\b")
+PLAIN_NAME = re.compile(r"\b(?:share|accounts?|rates?|regular|basic|standard|personal)\b")
+# lines that are a different kind of account, not a tier of the same one (jumbo, refinance)
+OTHER_LINE = ("health", "hsa", "ira", "traditional", "roth", "business")
+
+
+def _kinds(text: str) -> set:
+    return {re.sub(r"\s+", " ", m.group(1)) for m in KIND_NAME.finditer(text.lower())}
+
+
+def _product_name(c: Chunk) -> str:
+    """The row's own product name: its first label cell, else the last part of its heading, else the heading."""
+    for t in (c.label().split(" | ")[0], c.section.split(" · ")[-1], c.section):
+        if _kinds(t):
+            return t
+    return ""
+
+
+def _line_kinds(q: Query) -> set:
+    return {w if w == "savings" else w.rstrip("s") for w in _line_words(q)}
+
+
+def _foreign(c: Chunk, q: Query, lines=SOFT_QUALIFIERS) -> bool:
+    """A row of a line the question didn't ask about, or of another kind of product than the one it names."""
+    low = f"{c.label()} {c.section}".lower()
+    if any(re.search(rf"\b{w}\b", low) and not _asked(w, q) for w in lines):
+        return True
+    return bool(_kinds(_product_name(c)) - _line_kinds(q))
+
+
+def _name_extra(c: Chunk, q: Query) -> set:
+    name = KIND_NAME.sub(" ", PLAIN_NAME.sub(" ", _product_name(c).lower()))
+    return set(re.findall(r"[a-z]+", name)) - {d.lower() for d in q.descriptors}
+
+
+def _names_descriptors(c: Chunk, q: Query) -> bool:
+    low = f"{c.label()} {c.section}".lower()
+    return all(re.search(rf"\b{re.escape(d.lower())}", low) for d in q.descriptors)
+
+
+def _top_pct(c: Chunk) -> float:
+    return max((n for _, v in c.values() if "%" in v for n in numbers(v)), default=0.0)
+
+
+def named_row(q: Query, ev: Evidence, exclude=(), view: View | None = None) -> Chunk | None:
+    """The asked product's own row. Rows of another kind or of an unasked line never count. With the view, every
+    row of that line on the page of the first such evidence row is a candidate (minus stale rows and expired
+    offers): a row fitting the asked amount, term or model year first (the tightest tier), else the plainest
+    product (fewest name words beyond its kind, then page order) at its top tier (the highest rate a deposit
+    pays, the lowest a loan charges)."""
+    words = _line_words(q)
+    plain = [c for c in _line_rows(q, ev, exclude) if not _foreign(c, q)]
+    if not plain:
+        return None
+    rows = plain
+    if view is not None and plain[0].key in view.pages:
+        gone = {d.id for d in getattr(ev, "dropped", ())}
+        rows = [c for c in view.pages[plain[0].key].page.chunks
+                if c.is_row and c not in exclude and c.id not in gone and not (c.expired_on and c.expired_on < view.taken_on)
+                and _names(c, words) and supports(c, q) and qualify(c, q)[0] != "mismatch" and not _foreign(c, q)] or plain
+    pinned = bool(q.amounts or q.terms or q.years)
+    fits = lambda c: pinned and qualify(c, q)[0] == "match"
+    best = min(rows, key=lambda c: (not fits(c), not _names_descriptors(c, q), len(_name_extra(c, q)), c.id))
+    table = [c for c in rows if c.key == best.key and c.table_span == best.table_span]
+    if fits(best):
+        tiers = [c for c in table if fits(c) and tier_width(c, q) is not None]
+        return min(tiers, key=lambda c: (tier_width(c, q), c.id)) if tiers else best
+    if _line_kinds(q) & {"loan", "mortgage", "card", "heloc", "line"}:
+        return min(table, key=lambda c: (_top_pct(c), c.id))
+    return max(table, key=lambda c: (_top_pct(c), -c.id))
 
 
 QUOTED_PCT = re.compile(r"\d+(?:\.\d+)?\s*(?:%|percent\b|apy\b|apr\b)", re.I)
 
 
-def named_row_guard(question: str, q: Query, ev: Evidence, text: str, lookup=None) -> tuple[str, Chunk | None]:
-    """A member who quotes a value for a named product ("does savings pay 1.23%?") gets that product's
-    own value too, even when the value they quote belongs to another product's table. The quoted number
-    pulls in the rows that carry it, so `lookup` searches again without it to find the product's own rows."""
+def _quoted_elsewhere(question: str, q: Query, ev: Evidence) -> bool:
+    """The member quotes a value for a product line ("do any savings tiers pay 1.23%?") that only another kind of
+    product's rows carry (a money market's, a health savings account's), not a tier or special of the line itself."""
     if not (q.category and QUOTED_PCT.search(question)):
-        return text, None
+        return False
+    quoted = numbers(" ".join(QUOTED_PCT.findall(question)))
+    carriers = [c for c in ev.chunks if c.is_row and quoted & {n for _, v in c.values() if "%" in v for n in numbers(v)}]
+    return bool(carriers) and all(_foreign(c, q, OTHER_LINE) for c in carriers)
+
+
+def _own_row_and_table(question: str, q: Query, ev: Evidence, lookup=None, view: View | None = None):
+    """The asked product's own row and its table. The quoted number pulls in the rows that carry it, so `lookup`
+    searches again without it to find the product's own rows."""
     if lookup is not None:
         more = lookup(QUOTED_PCT.sub(" ", question))
         if more is not None and more.chunks:
             have = {c.id for c in more.chunks}
             ev = replace(ev, chunks=list(more.chunks) + [c for c in ev.chunks if c.id not in have])
-    own = named_row(q, ev)
+    own = named_row(q, ev, view=view)
     if own is None:
+        return None, []
+    pool = view.pages[own.key].page.chunks if view is not None and own.key in view.pages else ev.chunks
+    name = _product_name(own) or own.section
+    table = [c for c in pool if c.is_row and c.key == own.key and c.table_span == own.table_span
+             and (_product_name(c) or c.section) == name] or [own]
+    return own, table
+
+
+def named_row_guard(question: str, q: Query, ev: Evidence, text: str, lookup=None,
+                    view: View | None = None) -> tuple[str, Chunk | None]:
+    """A member who quotes a value for a named product that belongs to another kind of product's table gets the
+    named product's own value too (its top tier, see named_row)."""
+    if not _quoted_elsewhere(question, q, ev):
         return text, None
-    head = lambda c: c.label().split(" | ")[0]
-    same = [c for c in ev.chunks if c.is_row and c.key == own.key and c.table_span == own.table_span
-            and head(c) == head(own)] or [own]
-    if {n for c in same for _, v in c.values() if "%" in v for n in numbers(v)} & numbers(text):
+    own, table = _own_row_and_table(question, q, ev, lookup, view)
+    if own is None or {n for c in table for _, v in c.values() if "%" in v for n in numbers(v)} & numbers(text):
         return text, None                      # the answer already gives that product's own value
     return f"{text.rstrip()} {render_row(own)}.", own
+
+
+def own_table_first(question: str, q: Query, ev: Evidence, view: View, lookup=None) -> Evidence:
+    """For such a question the model reads the named product's own table first, so it can say whether that
+    product pays the value, not only which other product does."""
+    if not _quoted_elsewhere(question, q, ev):
+        return ev
+    own, table = _own_row_and_table(question, q, ev, lookup, view)
+    if own is None:
+        return ev
+    shown = list(ev.context or ev.chunks)
+    return replace(ev, context=table + [c for c in shown if c not in table])
 
 
 COMPARE_Q = re.compile(r"\b(compar\w*|vs\.?|versus|differ\w*|chang\w*|better|higher|lower|than|which is|should i|"
@@ -358,6 +454,7 @@ class Synthesizer:
         cooling = self._cooldown > 0
         self._cooldown = max(0, self._cooldown - 1)
         if self.enabled and not cooling and not clear_cut(question, q, ev):
+            ev = own_table_first(question, q, ev, view, lookup)
             out = self._llm(question, ev, view, asked)
             if out is not None:
                 if not out.get("answerable", False):
@@ -370,6 +467,9 @@ class Synthesizer:
                     text, cited, llm_note = accepted
                     return text, cited, True, "; ".join(x for x in (llm_note, note) if x)
         text, cited = extractive(q, ev, view)
+        if text != REFUSAL:                     # the no-key answer gets the same own row
+            text, own = named_row_guard(question, q, ev, text, lookup, view)
+            cited = cited + ([own] if own else [])
         return text, cited, text != REFUSAL, note
 
     def _accept(self, question: str, q: Query, ev: Evidence, view: View, out: dict, lookup=None):
@@ -381,7 +481,7 @@ class Synthesizer:
             return None
         ids = [i for i in out.get("evidence_ids", []) if isinstance(i, int) and 1 <= i <= len(shown)]
         cited = [shown[i - 1] for i in ids] or ev.chunks[:1]
-        text, own = named_row_guard(question, q, ev, text, lookup)
+        text, own = named_row_guard(question, q, ev, text, lookup, view)
         return text, cited + ([own] if own else []), str(out.get("note") or "").strip()
 
     def _second_look(self, question: str, q: Query, view: View, asked, second_look):

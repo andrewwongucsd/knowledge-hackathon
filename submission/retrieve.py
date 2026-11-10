@@ -98,6 +98,9 @@ OPTIONS_Q = re.compile(r"\boptions\b", re.I)
 PRODUCT_HEADS = r"loans?|mortgages?|certificates?|cds?|accounts?|cards?|savings|checking|visa|mastercard|discover|amex|heloc|line"
 
 RATE_Q = re.compile(r"\b(rates?|apr|apy|interest|dividends?|yield)\b", re.I)
+# "does any savings tier pay 0.45%?" asks about a rate without the word (cash back and points are not rates)
+PCT_PAID = re.compile(r"\b(?:pay|pays|paying|paid|earn|earns|earning)\s+(?:a\s+|an\s+)?\d+(?:\.\d+)?\s*(?:%|percent\b)"
+                      r"(?!.*\b(?:cash\s*back|reward(?:s)?|points)\b)", re.I)
 FEE_Q = re.compile(r"\b(fees?|cost|charge[sd]?|price)\b|\bhow much (is|does|do|for|will)\b", re.I)
 HOURS_Q = re.compile(r"\bhours?\b", re.I)
 COUNT_Q = re.compile(r"\bhow many\s+([a-z-]+)", re.I)          # rebuilt with the site's name: use_site_words
@@ -174,6 +177,13 @@ AMT_NOT_BALANCE = re.compile(r"\$\s?([\d,]+(?:\.\d+)?)\s*([kK])?\b(?=\s*(?:(?:a|
                              r"|(?:monthly|annually|yearly|weekly)\b|(?:monthly\s+)?payments?\b|(?:in\s+)?(?:income|salary)\b|down\b))"
                              r"|\b(?:earn|earns|earning|make|makes|making|income\s+of|salary\s+of)\s+(?:about\s+|around\s+)?\$\s?([\d,]+(?:\.\d+)?)\s*([kK])?\b",
                              re.I)
+# a down payment against a price leaves the loan amount: "$250,000 home with $50,000 down", "20% down"
+DOWN_RE = re.compile(r"\$\s?([\d,]+(?:\.\d+)?)\s*([kK])?\s+(?:as\s+(?:a\s+|the\s+)?)?down\b|"
+                     r"\bdown\s+payment\s+(?:of\s+|is\s+|will\s+be\s+)?(?:about\s+|around\s+)?\$\s?([\d,]+(?:\.\d+)?)\s*([kK])?\b", re.I)
+PCT_DOWN = re.compile(r"\b(\d{1,2}(?:\.\d+)?)\s*(?:%|percent)\s+down\b|\bdown\s+payment\s+of\s+(\d{1,2}(?:\.\d+)?)\s*(?:%|percent)", re.I)
+# ...but an amount stated as the loan itself is already the loan amount ("a $240,000 mortgage", "borrow $X")
+LOAN_AMT = re.compile(r"\$\s?[\d,]+(?:\.\d+)?\s*[kK]?\s+(?:(?:home|auto|car|boat|personal)\s+)?(?:loan|mortgage|heloc)\b|"
+                      r"\b(?:loan|mortgage|borrow\w*|financ\w*)\s+(?:of\s+|amount\s+of\s+)?(?:about\s+|around\s+)?\$", re.I)
 # a table cell under a "Min." header holding a bare dollar amount: the least a row's rate applies to
 MIN_HEADER = re.compile(r"\bmin(?:imum|\.)?\b", re.I)
 AMT_CELL = re.compile(r"\$\s?([\d,]+(?:\.\d+)?)")
@@ -307,6 +317,7 @@ class Query:
     count_noun: str | None = None                    # "office" for "how many offices"
     entity_is_branch: bool = False
     entity: str | None = None                        # named branch, e.g. "elm"
+    place: str | None = None                         # a branch the site has, named in a rate or fee question
     descriptors: set = field(default_factory=set)    # words naming the product, e.g. {"tractor"}
     category: set = field(default_factory=set)       # the product-line word itself, e.g. {"savings"}
     list_intent: bool = False                        # "what cards do you offer": show every product line
@@ -344,19 +355,19 @@ def parse_query(question: str) -> Query:
     context = False
     head = normalize_numbers(asked.group(0)).lower() if asked else low
     tail = low[len(head):] if asked and low.startswith(head) else ""
-    words = low
+    product_text = low
     if tail.strip() and not ASIDE_ASKS.match(tail) and not RATE_Q.search(tail) and not FEE_Q.search(tail):
         quiet = {_stem(w) for w in GENERIC | FRAME_WORDS} | set(CHAT_FILLERS)
         if any(t not in quiet and not t[0].isdigit() and not RATE_Q.fullmatch(t) and not FEE_Q.search(t) for t in q.tokens):
-            words = head
+            product_text = head
             def own(text):
                 ws = set(tokenize(text))
                 ws |= {s for w in list(ws) for s in _SYN.get(w, ())}
                 return {w for w in ws if not w[0].isdigit()} - quiet - {_stem(w) for w in GENERIC_HEADS} - STOP
             context = bool(ABOUT_ME.match(tail)) and not ASIDE_INTENT.match(tail) and not (own(tail) & own(head))
-    if tail.strip() and words == low:
+    if tail.strip() and product_text == low:
         q.tokens = tokenize(question)     # the aside is part of the request ("What's the rate? It's for a CD"): search it too
-    pinned = words == head and terms_in(head)          # a term in the question itself is never overridden
+    pinned = product_text == head and terms_in(head)          # a term in the question itself is never overridden
     q.terms = terms_in(head) if pinned else terms_in(head if context else low)
     q.native_terms = native_terms(head) if pinned else native_terms(head if context else low)
     if re.search(r"model|vehicle|\bcar\b|truck", low):     # model years only, never "as of March 2031"
@@ -364,10 +375,15 @@ def parse_query(question: str) -> Query:
                    if not re.search(rf"(?:{MONTH_RE})\s*(?:\d{{1,2}}(?:st|nd|rd|th)?,?\s*)?$", norm[:m.start()])}
     if q.years and tail.strip():
         mine = {y for y in q.years if str(y) in head}
-        q.years = mine if (mine and words == head) or context else q.years
+        q.years = mine if (mine and product_text == head) or context else q.years
     q.amounts = [_f(a) * (1000 if k else 1) for a, k in re.findall(r"\$\s?([\d,]+(?:\.\d+)?)\s*([kK])?\b", norm)]
     other = {_f(m.group(1) or m.group(3)) * (1000 if (m.group(2) or m.group(4)) else 1) for m in AMT_NOT_BALANCE.finditer(norm)}
-    q.amounts = [a for a in q.amounts if a not in other]
+    downs = [_f(m.group(1) or m.group(3)) * (1000 if (m.group(2) or m.group(4)) else 1) for m in DOWN_RE.finditer(norm)]
+    q.amounts = [a for a in q.amounts if a not in other and a not in downs]
+    pct = PCT_DOWN.search(norm)
+    if (downs or pct) and len(set(q.amounts)) == 1 and q.amounts[0] > sum(downs) and not LOAN_AMT.search(norm):
+        price = q.amounts[0]                 # one price and a down payment: the amount borrowed
+        q.amounts = [price - sum(downs)] if downs else [round(price * (1 - _f(pct.group(1) or pct.group(2)) / 100), 2)]
     below = {_f(a) * (1000 if k else 1) for a, k in AMT_UNDER_RE.findall(norm)}
     above = {_f(a) * (1000 if k else 1) for a, k in AMT_OVER_RE.findall(norm)}
     q.amounts = [a - 0.01 if a in below else a + 0.01 if a in above else a for a in q.amounts]
@@ -375,7 +391,7 @@ def parse_query(question: str) -> Query:
     q.excluded -= q.qualifiers          # a line named elsewhere without a negation is still asked about
     if m := COUNT_Q.search(low):
         q.attribute, q.count_noun = "count", _stem(m.group(1))
-    elif RATE_Q.search(low):
+    elif RATE_Q.search(low) or PCT_PAID.search(low):
         q.attribute = "rate"
     elif FEE_Q.search(low):
         q.attribute = "fee"
@@ -397,8 +413,8 @@ def parse_query(question: str) -> Query:
         syn = {**syn, _stem("hsa"): [_stem("health")]}     # a rate row names the line in full
     for t in list(q.tokens):
         q.tokens += [x for x in syn.get(t, []) if x not in q.tokens]
-    m = re.search(r"\b((?:[A-Z][\w'’.-]*\s+){0,3}[A-Z][\w'’.-]*)\s+[Bb]ranch\b", question)
-    if m:
+    m = re.search(r"\b((?:[A-Z][\w'’.-]*\s+){0,3}[A-Z][\w'’.-]*)(?:,\s+[A-Z][\w'’.-]*)?\s+[Bb]ranch\b", question)
+    if m:                                       # "the Harbor, Ohio branch": the city before the state
         # "<Name>'s Elm branch": the site name's possessive is not the branch name
         words = [re.sub(r"['’]s$", "", w) for w in m.group(1).split()]
         words = [w for w in words if w.strip(".,'’").lower() not in BRANCH_NOT_NAMES]
@@ -409,6 +425,9 @@ def parse_query(question: str) -> Query:
         name = next((w for w in m.group(1).split() if w in PROPER_NAMES), None) if m else None
         if name:
             q.entity, q.entity_is_branch = name, True
+    if not q.entity and q.attribute in ("rate", "fee") and (m := PLACE_NAMED.search(question)) \
+            and m.group(1).lower() not in BRANCH_NOT_NAMES | NOT_PLACE_NAMES:
+        q.entity, q.entity_is_branch = m.group(1).lower(), True     # "at your Rivertown location": a branch
     if q.attribute is None and (m := COUNT_CUE.search(low)) and m.group(1) not in STOP:
         q.attribute, q.count_noun = "count", _stem(m.group(1))
         q.tokens = [t for t in q.tokens if t not in ("number", "total")]
@@ -431,7 +450,9 @@ def parse_query(question: str) -> Query:
     if q.attribute in ("rate", "fee") and (q.qualifiers & {"hsa"} or re.search(r"\bhealth savings\b", low)):
         q.qualifiers |= {"hsa", "health"}                   # one line, written either way
     if q.attribute in ("rate", "fee"):
-        toks = re.findall(r"[a-z]+", words.replace("-", " "))
+        if q.attribute == "fee" and WIRE.search(low):
+            product_text = WIRE_ENDS.sub(" ", product_text)    # "from my account to my son's bank account": not the product
+        toks = re.findall(r"[a-z]+", product_text.replace("-", " "))
         for k, t in enumerate(toks):
             if re.fullmatch(PRODUCT_HEADS, t):
                 win = toks[max(0, k - 2):k]
@@ -543,8 +564,9 @@ def supports(c: Chunk, q: Query) -> bool:
         have = c.tf if c.tf else Counter(tokenize(c.index_text))
         if not all(any(w in have for w in alts) for alts in q.subject):
             return False
-    if q.attribute == "fee" and SEND_Q.search(q.raw) and re.search(r"\bincoming\b", text):
-        return False                    # sending is never the incoming fee
+    if q.attribute == "fee" and (SEND_Q.search(q.raw) or (WIRE.search(q.raw) and TO_OTHER.search(q.raw))) \
+            and not RECEIVE_Q.search(q.raw) and re.search(r"\bincoming\b", text):
+        return False                    # sending (a wire to someone else) is never the incoming fee
     if q.terms:                         # some line must be about the asked term, not just "a term"
         lines = c.text.split("\n") if not c.is_row else [c.index_text]
         named = names_line(text, q)
@@ -702,10 +724,24 @@ def _row_key(c: Chunk) -> tuple:
     return (re.sub(r"\W+", " ", c.label().lower()).strip(), _pct_values(c))
 
 
+def site_branch(index: Index, name: str) -> bool:
+    """A branch the site has: a live page that isn't an article names it with an address or opening hours."""
+    view = index.view
+    for pos, _ in index.postings.get(_stem(name), []):
+        c = index.chunks[pos]
+        if c.kind != "article" and view.pages[c.key].status != "missing" and (ADDRESS_EV.search(c.text) or HOURS_EV.search(c.text)):
+            return True
+    return False
+
+
 def select(index: Index, q: Query, k: int = 8) -> Evidence:
     view = index.view
     # A product word the site never uses ("share certificate") is a synonym, not a requirement.
     q.descriptors = {d for d in q.descriptors if _stem(d) in index.postings}
+    if q.attribute in ("rate", "fee") and q.entity and q.entity_is_branch and site_branch(index, q.entity):
+        # rates and fees are the same at every branch: a branch the site has doesn't narrow the answer
+        q.place, q.entity, q.entity_is_branch = q.entity, None, False
+        q.tokens = [t for t in q.tokens if t not in (_stem(q.place), _stem("branch"), _stem("location"), _stem("office"))]
     if q.attribute in ("fee", "count") and not q.subject:
         q.subject = rare_subject(index, q)
     hits = index.search(q.tokens, top=400)
@@ -924,6 +960,19 @@ RARE_SHARE = 0.005       # a word on under 0.5% of chunks names something specif
 FEE_WORDS = {_stem(w) for w in ("fee", "fees", "cost", "costs", "charge", "charges", "price", "pay")}
 SEND_WORDS = {_stem(w) for w in ("send", "sending", "sends")}
 SEND_Q = re.compile(r"\bsend(?:s|ing)?\b", re.I)
+# A wire's recipient ("to my son's bank in Rivertown") says where the money goes, not what is charged: those words
+# aren't required, but the fee line must be about a wire. ("The fee for an incoming wire" names the wire itself.)
+WIRE = re.compile(r"\bwir(?:e|es|ed|ing)\b", re.I)
+WIRE_ENDS = re.compile(r"\b(?:to|from|into)\s+(?:a|an|the|my|his|her|their|our|your|someone|somebody|another)\b[^.?!;]*", re.I)
+RECIPIENT = re.compile(r"\bto\s+(?:(?:a|an|the|my|his|her|their|our|your|someone|somebody|another)\b[^.?!;]*|"
+                       r"[A-Z][\w'’-]*(?:\s+[A-Z][\w'’-]*)*)")
+# a wire to someone else is sent; one "to my (checking) account" or "to me" is received
+TO_OTHER = re.compile(r"\bto\s+(?!(?:me|us)\b|(?:my|our)\s+(?:own\s+)?(?:\w+\s+)?(?:accounts?|acct)\b)"
+                      r"(?:(?:a|an|the|my|his|her|their|our|your|someone|somebody|another)\b|[A-Z])")
+RECEIVE_Q = re.compile(r"\b(?:receiv\w*|incoming|inbound)\b", re.I)
+# a capitalised name before "location" or "office", not at the start of the question
+PLACE_NAMED = re.compile(r"(?<=\s)([A-Z][\w'’-]+)\s+(?:location|office)\b")
+NOT_PLACE_NAMES = {"main", "home", "head", "corporate", "post", "box", "back", "front", "branch"}
 
 
 # Chat shorthand for "please" and "thanks": never a thing the question asks about.
@@ -946,13 +995,44 @@ def rare_subject(index: Index, q: Query) -> list[list[str]]:
     its synonyms. A fee line or count that names none of them answers a different question, so the
     honest answer is "isn't listed". Common words ("lost", "card") are not required."""
     limit = RARE_SHARE * max(1, len(index.chunks))
+    text = asking_clause(q.raw)                      # a greeting names nothing asked about
+    # words in parentheses restate the thing ("a teller's check (bank draft)"); a branch the site has doesn't
+    # narrow a fee (see select)
+    skip = {t for m in re.finditer(r"\(([^)]*)\)", text) for t in tokenize(m.group(1))} | ({_stem(w) for w in (q.place, "branch", "location", "office")} if q.place else set())
+    wire = bool(WIRE.search(text))
+    if wire:
+        recipient = {t for m in RECIPIENT.finditer(text) for t in tokenize(m.group(0))} - {_stem("wire")}
+        sent = {_stem("money"), _stem("funds")}                   # what is sent, not what is charged
+        skip |= recipient | sent
+        q.tokens = [t for t in q.tokens if t not in recipient | sent]
     out = []
-    for t in dict.fromkeys(tokenize(asking_clause(q.raw))):      # a greeting names nothing asked about
-        if t in GENERIC or t in FEE_WORDS or t in CHAT_FILLERS or t == q.count_noun or t[0].isdigit() or t in SEND_WORDS:
+    for t in dict.fromkeys(tokenize(text)):
+        if t in GENERIC or t in FEE_WORDS or t in CHAT_FILLERS or t == q.count_noun or t[0].isdigit() or t in SEND_WORDS \
+                or t in skip:
             continue                                # "send a wire": the fee line says what is sent, not "send"
         if len(index.postings.get(t, ())) < limit:
             out.append([t] + _SYN.get(t, []))
+    if wire:
+        # only a word a wire's fee line can say ("international", "incoming") narrows a wire question; the rest
+        # ("my brother", "for his wedding", "in Rivertown") is who and why
+        said = _wire_line_words(index)
+        out = [alts for alts in out if any(w in said for w in alts)]
+        if not any(_stem("wire") in alts for alts in out):
+            out.append([_stem("wire")])
     return out
+
+
+def _wire_line_words(index: Index) -> set:
+    """Every word on a chunk that names a wire and a dollar amount. Built once per view."""
+    words = getattr(index, "_wire_words", None)
+    if words is None:
+        words = set()
+        for pos, _ in index.postings.get(_stem("wire"), []):
+            c = index.chunks[pos]
+            if "$" in c.text:
+                words |= set(c.tf) if c.tf else set(tokenize(c.index_text))
+        index._wire_words = words
+    return words
 
 
 def _bm25_floor(hits) -> float:
