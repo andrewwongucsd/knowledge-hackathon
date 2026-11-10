@@ -32,7 +32,7 @@ from datetime import date, timedelta   # noqa: E402
 from ingest import KIND_RANK, MONTH_RE, MONTHS, STATUS_RANK, Chunk, Store, _on_site, url_key   # noqa: E402
 import retrieve                        # noqa: E402
 from retrieve import (CHAT_FILLERS, FRAME_WORDS, GENERIC, GENERIC_HEADS, MEMBERSHIP_Q, STOP, Evidence, Index, _stem,  # noqa: E402
-                      parse_query, proper_names, select, tokenize, use_proper_names, use_site_words)
+                      parse_query, proper_names, select, terms_in, tokenize, use_proper_names, use_site_words)
 from synth import REFUSAL, Synthesizer  # noqa: E402
 
 
@@ -72,15 +72,19 @@ class KnowledgeSystem:
         asked = as_of or moment_asked(question, self._store, self._indexes)   # or the moment it names
         vi = self._store.view_for(asked)
         day = _iso(asked)                       # the day the model is told, when later than the crawl
+        before = None                           # a date before the first crawl: read it, guarded (see _respond)
+        if vi is None and day and self._store.views and day < self._store.views[0].taken_on:
+            vi, before = 0, day
         shown = day if vi is not None and day and day > self._store.views[vi].taken_on else None
-        key = (re.sub(r"[^a-z0-9$%.]+", " ", question.lower()).strip(), vi, shown)
+        key = (re.sub(r"[^a-z0-9$%.]+", " ", question.lower()).strip(), vi, shown, before)
         if key not in self._cache:
             # vi is None when nothing is ingested or the date is before the first snapshot
             index = self._indexes[vi] if vi is not None else None
             # A date that only names the snapshot being answered from is not a search word
-            search = strip_temporal(question, lambda d: self._store.view_for(d) == vi,
+            search = strip_temporal(calendar_phrases(question), lambda d: self._store.view_for(d) == vi or
+                                    (before is not None and _iso(d) is not None and _iso(d) < self._store.views[0].taken_on),
                                     _dates_stated(index)) if index else question
-            self._cache[key] = _respond(index, self._synth, question, search, _iso(asked))
+            self._cache[key] = _respond(index, self._synth, question, search, _iso(asked), before)
         return self._cache[key]
 
     def conflicts(self) -> list[Conflict]:
@@ -106,7 +110,9 @@ MAX_SOURCES = 8     # pages that state the values given; the same page is often 
 
 
 def _respond(index: Index | None, synth: Synthesizer, question: str, search: str | None = None,
-             asked: date | None = None) -> Answer:
+             asked: date | None = None, before: date | None = None) -> Answer:
+    """`before`: the question asks about a day before the first crawl, answered from the first crawl. The answer
+    stands only if nothing it rests on took effect after that day."""
     if index is None:
         return Answer(text=REFUSAL, confident=False)
     view = index.view
@@ -141,7 +147,7 @@ def _respond(index: Index | None, synth: Synthesizer, question: str, search: str
     text, cited, confident, note = synth.compose(question, q, ev, view, asked,
                                                  lookup=lambda text: select(index, parse_query(text)),
                                                  second_look=second_look)
-    if not confident:
+    if not confident or (before and any(c.effective and c.effective > before for c in cited)):
         return Answer(text=REFUSAL, confident=False)
     if fact:
         text, stated = fact_guard(text, fact)
@@ -175,6 +181,54 @@ def _respond(index: Index | None, synth: Synthesizer, question: str, search: str
         seen.add(key)
         sources.append(Source(url=vp.page.url, snapshot_id=vp.snapshot_id, quote=quote))
     return Answer(text=text, sources=sources, confident=True, conflict_note=note or None)
+
+
+def _nth_weekday(year: int, month: int, weekday: int, n: int) -> date:
+    """The n-th weekday of a month (n = -1: the last one)."""
+    if n > 0:
+        d = date(year, month, 1)
+        return d + timedelta(days=(weekday - d.weekday()) % 7, weeks=n - 1)
+    d = date(year, month, calendar.monthrange(year, month)[1])
+    return d - timedelta(days=(d.weekday() - weekday) % 7)
+
+
+# US holidays with a year ("Memorial Day 2026"), quarters, halves, seasons after a frame word, and "2026-07"
+HOLIDAYS = {r"new year['’]?s(?: day)?": lambda y: date(y, 1, 1),
+            r"(?:martin luther king|mlk)(?: jr\.?)? day": lambda y: _nth_weekday(y, 1, 0, 3),
+            r"presidents['’]? day": lambda y: _nth_weekday(y, 2, 0, 3),
+            r"memorial day": lambda y: _nth_weekday(y, 5, 0, -1),
+            r"juneteenth": lambda y: date(y, 6, 19),
+            r"(?:independence day|the fourth of july|fourth of july)": lambda y: date(y, 7, 4),
+            r"labor day": lambda y: _nth_weekday(y, 9, 0, 1),
+            r"(?:columbus|indigenous peoples['’]?) day": lambda y: _nth_weekday(y, 10, 0, 2),
+            r"halloween": lambda y: date(y, 10, 31),
+            r"veterans['’]? day": lambda y: date(y, 11, 11),
+            r"thanksgiving(?: day)?": lambda y: _nth_weekday(y, 11, 3, 4),
+            r"christmas eve": lambda y: date(y, 12, 24),
+            r"christmas(?: day)?": lambda y: date(y, 12, 25),
+            r"new year['’]?s eve": lambda y: date(y, 12, 31)}
+SEASON_END = {"spring": 5, "summer": 8, "fall": 11, "autumn": 11}     # meteorological seasons, by their last month
+_SEASON = re.compile(r"\b(in|during|as of|as at|back in|by|since|before|after)\s+(?:the\s+)?(spring|summer|fall|autumn)"
+                     r"\s+(?:of\s+)?(20\d\d)\b(?!\s+(?:semester|transcript|term|edition|cycle|session|class|catalog))", re.I)
+_QUARTER = re.compile(r"\bQ([1-4])\s+(20\d\d)\b|\b(?:the\s+)?(first|second|third|fourth)\s+quarter\s+(?:of\s+)?(20\d\d)\b", re.I)
+_HALF = re.compile(r"\b(?:the\s+)?(first|second)\s+half\s+(?:of\s+)?(20\d\d)\b", re.I)
+_YEAR_MONTH = re.compile(r"\b(20\d\d)-(0[1-9]|1[0-2])\b(?!-\d)(?![\s-]*(?:model|vehicle|car|truck|suv)s?\b)", re.I)
+_ORDINAL = ["first", "second", "third", "fourth"]
+
+
+def calendar_phrases(text: str) -> str:
+    """Calendar phrases a date reader doesn't know, as dates it does: "Memorial Day 2026" -> "May 25, 2026",
+    "Q3 2026" / "the third quarter of 2026" -> "September 2026", "the first half of 2026" -> "June 2026",
+    "in the summer of 2026" -> "in August 2026", "2026-07" -> "July 2026"."""
+    day = lambda d: f"{calendar.month_name[d.month]} {d.day}, {d.year}"
+    month = lambda y, m: f"{calendar.month_name[m]} {y}"
+    for name, when in HOLIDAYS.items():
+        text = re.sub(rf"\b{name},?\s+(20\d\d)\b", lambda m: day(when(int(m.group(1)))), text, flags=re.I)
+    text = _SEASON.sub(lambda m: f"{m.group(1)} {month(int(m.group(3)), SEASON_END[m.group(2).lower()])}", text)
+    text = _QUARTER.sub(lambda m: month(int(m.group(2) or m.group(4)),
+                                        3 * (int(m.group(1)) if m.group(1) else _ORDINAL.index(m.group(3).lower()) + 1)), text)
+    text = _HALF.sub(lambda m: month(int(m.group(2)), 6 if m.group(1).lower() == "first" else 12), text)
+    return _YEAR_MONTH.sub(lambda m: month(int(m.group(1)), int(m.group(2))), text)
 
 
 DATE_PHRASE = re.compile(
@@ -221,7 +275,8 @@ FRAME_RE = re.compile(r"\b(as of|as at|back in|back on|prior to|up until|until|t
                       r"from|between|and|to|in|on|during|for|at)\b", re.I)
 PIN_FRAMES = {"as of", "as at", "back in", "back on"}           # the site as it stood then
 BEFORE_FRAMES = {"prior to", "up until", "until", "till", "before"}   # the day before
-BLOCK_FRAMES = {"since", "after", "by", "from", "between", "and", "to"}   # a span or a change, not a moment
+BLOCK_FRAMES = {"since", "after", "from", "between", "and", "to"}   # a span or a change, not a moment
+BY_OPENS = re.compile(r"(?:^|[.!?;:,—–]\s*|\s-\s)by\b[^.!?;:,—–]*$", re.I)   # "By (the end of) June 2026, ..." opens it
 QUALIFIER_RE = re.compile(r"\b(mid|middle|early|start|beginning|late|end)\b", re.I)
 AUX_RE = re.compile(r"\b(used to|is|are|was|were|does|do|did|has|have|had|can|could|will|would|should)\b|"
                     r"\b(?:what|who|where|when|how|which|that|it|there|here)['’]s\b", re.I)
@@ -244,7 +299,7 @@ def date_asked(question: str, store: Store) -> str | None:
     "As of / back in" always pin; "in / on / during" pin only in a past-tense question that is not about a
     change or an article or event. Not for questions about now, spans ("since", "between"), dates outside
     the window, or a date in a side remark of a present-tense question."""
-    q = question.strip()
+    q = calendar_phrases(question).strip()
     if len(store.views) < 2 or NOW_Q.search(q):
         return None
     cuts = [0] + [m.end() for m in CLAUSE_END.finditer(q)] + [len(q)]
@@ -263,6 +318,8 @@ def date_asked(question: str, store: Store) -> str | None:
         frame = " ".join(frames[-1].group(1).lower().split()) if frames else ""
         if frame in BLOCK_FRAMES or not (ask[0] <= m.start(1) < ask[1] or past):
             return None
+        if frame == "by" and not BY_OPENS.search(before):
+            return None                         # "...had to be opened by August 31": a deadline, not a moment
         precise = bool(_DAY_PRECISE.search(m.group(1)))
         if frame not in PIN_FRAMES | BEFORE_FRAMES and (not past or CHANGE_Q.search(q) or EVENT_Q.search(q)):
             return None
@@ -286,7 +343,7 @@ def date_asked(question: str, store: Store) -> str | None:
     first, last = store.views[0].taken_on, store.views[-1].taken_on
     if not precise and d < first and (d.year, d.month) == (first.year, first.month):
         d = first                       # "early March" when the first crawl is mid-March: the nearest reading
-    return d.isoformat() if first <= d < last else None
+    return d.isoformat() if d < last else None      # before the first crawl: see KnowledgeSystem.answer
 
 
 def moment_asked(question: str, store: Store, indexes: list) -> str | None:
@@ -305,7 +362,7 @@ def moment_asked(question: str, store: Store, indexes: list) -> str | None:
     # the best evidence (the top three pages when it is prose, not a rate or fee row)
     best = pages[:1] if ev.chunks[0].is_row else pages[:3]
     since = store.views[vi].taken_on
-    if any(p.publish and since < p.publish <= asked for p in best) or any(p.publish == asked for p in pages):
+    if any(p.publish and since < p.publish <= asked for p in best) or any(p.publish == asked for p in best):
         return None                     # ... or the question names the day one of those articles came out
     return d
 
@@ -318,6 +375,8 @@ CHANGE_ASK = re.compile(
     r"\b(?:did|has|have|had)\b[^?]{0,120}?\b(?:go(?:ne)? (?:up|down)|went (?:up|down)|increase[ds]?|"
     r"decrease[ds]?|rise[ns]?|rose|fall(?:en)?|fell|drop(?:ped)?|change[ds]?)\b|"
     r"\bwhat (?:was|is|were) the change\b", re.I)
+# "Was it the same on May 12 and June 9, 2026?", "compare … on A with … on B": a comparison across two dates
+COMPARE_ASK = re.compile(r"\b(?:was|were|is|are)\b[^?]{0,120}?\bthe same\b|\bcompare[ds]?\b|\b(?:differ|different)\b", re.I)
 _MONTH = "|".join(MONTHS) + "|sept?|jan|feb|mar|apr|jun|jul|aug|oct|nov|dec"
 MONTH_PAIR = re.compile(rf"\b(?:between|from)\s+({_MONTH})\.?\s+(?:and|to)\s+(?:{_MONTH})\.?\s+"
                         rf"(?:\d{{1,2}}(?:st|nd|rd|th)?,?\s+)?(20\d\d)", re.I)          # "between May and June 2026"
@@ -327,7 +386,9 @@ SPAN_FROM = re.compile(r"\b(?:since|after|from)\s+(?:\S+\s+){0,2}$", re.I)
 def change_span(question: str, store: Store) -> tuple | None:
     """(start, end) dates of a change the question asks about; end None means "now". A month alone means
     the site as it stood by the end of that month."""
-    if len(store.views) < 2 or not CHANGE_ASK.search(question):
+    question = calendar_phrases(question)
+    if len(store.views) < 2 or not (CHANGE_ASK.search(question) or
+                                    (COMPARE_ASK.search(question) and len(terms_in(question.lower())) <= 1)):
         return None
     found = [(m.start(1), d) for m in DATE_PHRASE.finditer(question) if (d := _phrase_date(m.group(1)))]
     if len(found) < 2 and (mp := MONTH_PAIR.search(question)) and (d := _phrase_date(f"{mp.group(1)} {mp.group(2)}")):

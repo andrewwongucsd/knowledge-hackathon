@@ -167,6 +167,16 @@ AMT_PLUS_RE = re.compile(r"\$\s?([\d,]+(?:\.\d+)?)\s*(?:\+|and (?:up|above|over)
 AMT_LESS_RE = re.compile(r"\$\s?([\d,]+(?:\.\d+)?)\s+or less", re.I)
 # "a balance under $X" is a balance just below X: the tier that ends below X, not the one starting at X
 AMT_UNDER_RE = re.compile(r"\b(?:under|less\s+than|below)\s+\$\s?([\d,]+(?:\.\d+)?)\s*([kK])?\b", re.I)
+# ...and "over $X" is just above X
+AMT_OVER_RE = re.compile(r"\b(?:over|above|more\s+than|greater\s+than)\s+\$\s?([\d,]+(?:\.\d+)?)\s*([kK])?\b", re.I)
+# an amount per period, a payment, an income or a down payment is not a balance or loan amount
+AMT_NOT_BALANCE = re.compile(r"\$\s?([\d,]+(?:\.\d+)?)\s*([kK])?\b(?=\s*(?:(?:a|per|each|every)\s+(?:month|year|week|paycheck)\b"
+                             r"|(?:monthly|annually|yearly|weekly)\b|(?:monthly\s+)?payments?\b|(?:in\s+)?(?:income|salary)\b|down\b))"
+                             r"|\b(?:earn|earns|earning|make|makes|making|income\s+of|salary\s+of)\s+(?:about\s+|around\s+)?\$\s?([\d,]+(?:\.\d+)?)\s*([kK])?\b",
+                             re.I)
+# a table cell under a "Min." header holding a bare dollar amount: the least a row's rate applies to
+MIN_HEADER = re.compile(r"\bmin(?:imum|\.)?\b", re.I)
+AMT_CELL = re.compile(r"\$\s?([\d,]+(?:\.\d+)?)")
 SOFT_QUALIFIERS = ("jumbo", "business", "traditional", "roth", "ira", "refinance", "hsa", "health")
 # A loan-type spec ("7/1", "10/6" adjustable rates): two small numbers, never part of a date.
 SPEC_RE = re.compile(r"(?<![\d/])(\d{1,2})/(\d{1,2})(?![\d/])")
@@ -344,6 +354,8 @@ def parse_query(question: str) -> Query:
                 ws |= {s for w in list(ws) for s in _SYN.get(w, ())}
                 return {w for w in ws if not w[0].isdigit()} - quiet - {_stem(w) for w in GENERIC_HEADS} - STOP
             context = bool(ABOUT_ME.match(tail)) and not ASIDE_INTENT.match(tail) and not (own(tail) & own(head))
+    if tail.strip() and words == low:
+        q.tokens = tokenize(question)     # the aside is part of the request ("What's the rate? It's for a CD"): search it too
     pinned = words == head and terms_in(head)          # a term in the question itself is never overridden
     q.terms = terms_in(head) if pinned else terms_in(head if context else low)
     q.native_terms = native_terms(head) if pinned else native_terms(head if context else low)
@@ -354,8 +366,11 @@ def parse_query(question: str) -> Query:
         mine = {y for y in q.years if str(y) in head}
         q.years = mine if (mine and words == head) or context else q.years
     q.amounts = [_f(a) * (1000 if k else 1) for a, k in re.findall(r"\$\s?([\d,]+(?:\.\d+)?)\s*([kK])?\b", norm)]
+    other = {_f(m.group(1) or m.group(3)) * (1000 if (m.group(2) or m.group(4)) else 1) for m in AMT_NOT_BALANCE.finditer(norm)}
+    q.amounts = [a for a in q.amounts if a not in other]
     below = {_f(a) * (1000 if k else 1) for a, k in AMT_UNDER_RE.findall(norm)}
-    q.amounts = [a - 0.01 if a in below else a for a in q.amounts]
+    above = {_f(a) * (1000 if k else 1) for a, k in AMT_OVER_RE.findall(norm)}
+    q.amounts = [a - 0.01 if a in below else a + 0.01 if a in above else a for a in q.amounts]
     q.qualifiers = {w for w in SOFT_QUALIFIERS if re.search(rf"\b{w}\b", head if context else low)}
     q.excluded -= q.qualifiers          # a line named elsewhere without a negation is still asked about
     if m := COUNT_Q.search(low):
@@ -466,6 +481,8 @@ def qualify(c: Chunk, q: Query) -> tuple[str, float]:
                 factor, matched = factor * 1.6, True
             elif c.is_row:
                 return "mismatch", 0.0
+        elif (minimums := row_minimums(c)) and any(a < m for a in q.amounts for m in minimums):
+            factor *= 0.6                       # the amount asked is below what this row's rate needs
     for w in SOFT_QUALIFIERS:
         present = re.search(rf"\b{w}\b", low) is not None
         if w in q.qualifiers and not (present or (w in LINE_ALIAS and re.search(LINE_ALIAS[w], low))) and c.is_row:
@@ -473,6 +490,29 @@ def qualify(c: Chunk, q: Query) -> tuple[str, float]:
         if w not in q.qualifiers and present:
             factor *= 0.6
     return ("match" if matched else "neutral"), factor
+
+
+def row_minimums(c: Chunk) -> list[float]:
+    """A row's minimums: bare dollar cells under a "Min." / "Minimum" header ("Min. to Earn $100,000"). A $0
+    minimum says nothing."""
+    out = []
+    for h, cell in zip(c.header or [], c.cells or []):
+        m = AMT_CELL.fullmatch((cell or "").strip())
+        if c.is_row and h and MIN_HEADER.search(h) and m and _f(m.group(1)) > 0:
+            out.append(_f(m.group(1)))
+    return out
+
+
+def tier_width(c: Chunk, q: Query) -> float | None:
+    """How narrow the tier is that a row gives the asked amount: the width of its narrowest matching range, or
+    minus its largest minimum at or below the amount (a higher minimum is a narrower tier). None: no tier."""
+    if not (c.is_row and q.amounts):
+        return None
+    spans = [hi - lo for lo, hi in amount_ranges(c.label()) if all(lo <= a <= hi for a in q.amounts)]
+    if spans:
+        return min(spans)
+    floors = [m for m in row_minimums(c) if all(a >= m for a in q.amounts)]
+    return -max(floors) if floors else None
 
 
 def supports(c: Chunk, q: Query) -> bool:
@@ -503,6 +543,8 @@ def supports(c: Chunk, q: Query) -> bool:
         have = c.tf if c.tf else Counter(tokenize(c.index_text))
         if not all(any(w in have for w in alts) for alts in q.subject):
             return False
+    if q.attribute == "fee" and SEND_Q.search(q.raw) and re.search(r"\bincoming\b", text):
+        return False                    # sending is never the incoming fee
     if q.terms:                         # some line must be about the asked term, not just "a term"
         lines = c.text.split("\n") if not c.is_row else [c.index_text]
         named = names_line(text, q)
@@ -880,6 +922,8 @@ def with_context(chosen: list[Chunk], dropped: list[Chunk], view, q: Query, over
 
 RARE_SHARE = 0.005       # a word on under 0.5% of chunks names something specific (a place, a service)
 FEE_WORDS = {_stem(w) for w in ("fee", "fees", "cost", "costs", "charge", "charges", "price", "pay")}
+SEND_WORDS = {_stem(w) for w in ("send", "sending", "sends")}
+SEND_Q = re.compile(r"\bsend(?:s|ing)?\b", re.I)
 
 
 # Chat shorthand for "please" and "thanks": never a thing the question asks about.
@@ -904,8 +948,8 @@ def rare_subject(index: Index, q: Query) -> list[list[str]]:
     limit = RARE_SHARE * max(1, len(index.chunks))
     out = []
     for t in dict.fromkeys(tokenize(asking_clause(q.raw))):      # a greeting names nothing asked about
-        if t in GENERIC or t in FEE_WORDS or t in CHAT_FILLERS or t == q.count_noun or t[0].isdigit():
-            continue
+        if t in GENERIC or t in FEE_WORDS or t in CHAT_FILLERS or t == q.count_noun or t[0].isdigit() or t in SEND_WORDS:
+            continue                                # "send a wire": the fee line says what is sent, not "send"
         if len(index.postings.get(t, ())) < limit:
             out.append([t] + _SYN.get(t, []))
     return out

@@ -102,6 +102,42 @@ PLAIN_WORDS = {"rate", "account", "loan", "card", "line", "home", "interest", "f
                "percentage", "the", "and", "of", "for", "your", "our", "my"}
 
 
+# words that say what kind of product a heading is about; a heading with none ("Harbor Choice") needs its tab
+KIND_WORD = re.compile(r"\b(?:accounts?|savings|checking|certificates?|cds?|loans?|mortgages?|cards?|visa|money\s+market|"
+                       r"iras?|hsa|heloc|lines?|specials?|promos?|rates?|share|deposits?)\b", re.I)
+
+
+def _tab_caption(text: str, tab: str, under: str = "") -> str:
+    """A table's caption under an in-page tab: the tab's name when the sub-heading right after it says less
+    ("Kayak Rates" under "Health Kayak Rates"); the tab that names a product we are in, plus the sub-heading,
+    when the sub-heading names no kind of product ("Harbor Choice" under "Canoe Account Rates", a second table
+    "Standard" under "Rowboat Certificate Rates"); otherwise the sub-heading."""
+    if tab and _says_less(text, tab):
+        return tab
+    if tab and not KIND_WORD.search(text):
+        return f"{tab} · {text}"
+    if under and not KIND_WORD.search(text) and (noun := _product_noun(under)):
+        return f"{text} {noun}"                 # a later table: only the product it is ("Standard Certificate")
+    return text
+
+
+PRODUCT_NOUN = re.compile(r"\b(?:certificates?|accounts?|loans?|mortgages?|cards?|savings|checking|money\s+market|iras?|heloc|"
+                          r"lines?\s+of\s+credit)\b", re.I)
+
+
+def _product_noun(tab: str) -> str:
+    """The product a tab names, from its first product word to its last, with its line: "Rowboat Certificate
+    Rates" -> "Certificate", "Business Canoe Account Rates" -> "Business Canoe Account", "Health Kayak Account
+    Rates" -> "Health Kayak Account"."""
+    found = list(PRODUCT_NOUN.finditer(tab))
+    if not found:
+        return ""
+    noun = tab[found[0].start():found[-1].end()]
+    lines = [w.title() for w in ("business", "health", "jumbo") if re.search(rf"\b{w}\b", tab, re.I)
+             and not re.search(rf"\b{w}\b", noun, re.I)]
+    return " ".join(lines + [noun])
+
+
 def _says_less(text: str, tab: str) -> bool:
     """A sub-heading that says less than the tab above it: every word of it is in the tab's name, and the tab
     adds a word that names something ("Health"), not just "Rates"."""
@@ -198,7 +234,7 @@ class Parser:
         # PDF conversions leave HTML entities, sometimes double-escaped ("&amp;#45;" for "-").
         lines = html.unescape(html.unescape(md)).splitlines()
         chunks: list[Chunk] = []
-        section, caption, tabbed = "", "", ""
+        section, caption, tabbed, under = "", "", "", ""      # under: the in-page tab naming a product we are in
         i, short_buf = 0, []
 
         def flush_short():
@@ -229,6 +265,7 @@ class Parser:
                 j += 1
             i = j
             if block[0].startswith("#"):
+                under = ""
                 flush_short()
                 section = clean_inline(block[0].lstrip("#"), self.domains)
                 if re.search(r"\d", section):           # headings like "...with N% APY" carry facts
@@ -237,14 +274,18 @@ class Parser:
                 if not block:
                     continue
             text = clean_inline(" ".join(block), self.domains)
-            if len(re.findall(r"[A-Za-z]{2,}", text)) < 2 and not re.search(r"\d", text):
-                continue                                # "\# # #", lone bullets, stray markup
-            # an in-page tab ("- [Health Savings Rates](<this page>#)") names what follows it: a sub-heading that
-            # says less ("Savings Rates") is the tab's
+            # an in-page tab ("- [Health Kayak Rates](<this page>#)") names what follows it (see _tab_caption)
             tab = TAB_LINK.fullmatch(block[0]) if len(block) == 1 else None
             above, tabbed = tabbed, (clean_inline(tab.group(1), self.domains) if tab and url_key(tab.group(2)) == key else "")
+            if tabbed:
+                under = tabbed if KIND_WORD.search(tabbed) else ""
+            if len(re.findall(r"[A-Za-z]{2,}", text)) < 2 and not re.search(r"\d", text):
+                after = next((ln.strip() for ln in lines[j:] if ln.strip()), "")
+                if len(block) == 1 and re.fullmatch(r"[A-Z][A-Za-z]{2,}", text) and after.startswith("|"):
+                    caption = _tab_caption(text, above, under)   # a one-word heading right above a table ("Regular")
+                continue                                # "\# # #", lone bullets, stray markup
             if len(text) < 60 and not re.search(r"\d(?!\d*(?:st|nd|rd|th)\b)", text) and len(block) == 1:
-                caption = above if above and _says_less(text, above) else text   # e.g. "Savings Rates" above a table
+                caption = _tab_caption(text, above, under)   # e.g. "Savings Rates" or "1st Choice Checking" above a table
             money_lines = [b for b in block if re.search(r"\$\s?\d|\d%", b)]
             if len(block) >= 3 and len(money_lines) * 2 >= len(block):
                 flush_short()                           # fee schedules: one fact per line

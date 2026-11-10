@@ -16,7 +16,7 @@ from datetime import date
 
 from ingest import Chunk, View, url_key
 from retrieve import (SOFT_QUALIFIERS, Evidence, Query, _asked, names_line, on_other_line, other_lines, qualify,
-                      supports, terms_in, tokenize)
+                      supports, terms_in, tier_width, tokenize)
 
 REFUSAL = "That isn't listed on our website, so I can't confirm it. Please contact us and we can help."
 # The prompt calls the context "excerpts"; a sentence that talks about them instead of the site is dropped.
@@ -149,13 +149,21 @@ def extractive(q: Query, ev: Evidence, view: View) -> tuple[str, list[Chunk]]:
     if not pool:
         return REFUSAL, []
     top = pool[0]
+    one_amount = top.is_row and len(set(q.amounts)) == 1 and tier_width(top, q) is not None
+    if one_amount:
+        # an amount inside several nested tiers ("$100,000 or less", "$300,000 or less") asks for the tightest
+        siblings = [c for c in view.pages[top.key].page.chunks if c.is_row and c.table_span == top.table_span
+                    and supports(c, q) and qualify(c, q)[0] != "mismatch" and tier_width(c, q) is not None]
+        top = min([top] + siblings, key=lambda c: tier_width(c, q))
     if top.is_row:
         # Tiers the question did not pin down (e.g. the loan amount for a "25-year home loan") are shown as a
         # range: every row of the same table that matches all qualifiers the question did give.
         hidden, lines = {d.id for d in ev.dropped}, other_lines(q, top)
         same_table = [c for c in view.pages[top.key].page.chunks if c.is_row and c is not top
                       and c.table_span == top.table_span and c.id not in hidden and supports(c, q)
-                      and qualify(c, q)[0] != "mismatch" and not on_other_line(c, lines)]
+                      and qualify(c, q)[0] != "mismatch" and not on_other_line(c, lines)
+                      and not any(re.search(rf"\b{w}\b", f"{c.label()} {c.section}".lower()) for w in q.excluded)
+                      and not (one_amount and tier_width(c, q) != tier_width(top, q))]
         rows = [top] + same_table[:3]
         if q.category and not _names(top, q.category):
             # The top row matched a value shared with a different product than the one the question
@@ -224,8 +232,9 @@ def named_row_guard(question: str, q: Query, ev: Evidence, text: str, lookup=Non
     return f"{text.rstrip()} {render_row(own)}.", own
 
 
-COMPARE_Q = re.compile(r"\b(compar\w*|vs\.?|versus|differ\w*|chang\w*|better|higher|lower|than|which is|should i)\b", re.I)
-SECOND_ASK = re.compile(r"\b(?:and|also|plus)\s+(?:what|when|how|is|are|does|do|the\s+\d)", re.I)
+COMPARE_Q = re.compile(r"\b(compar\w*|vs\.?|versus|differ\w*|chang\w*|better|higher|lower|than|which is|should i|"
+                       r"more|most|less|least)\b", re.I)
+SECOND_ASK = re.compile(r"\b(?:and|also|plus),?\s+(?:what|when|how|is|are|does|do|can|should|will|the\s+\d)", re.I)
 
 
 def clear_cut(question: str, q: Query, ev: Evidence) -> bool:
@@ -233,7 +242,7 @@ def clear_cut(question: str, q: Query, ev: Evidence) -> bool:
     that row is the answer, so it is given verbatim with no model call (faster, cheaper, and the same
     text for every wording). Lists, comparisons, changes and rows of an unasked product line still go
     to the model."""
-    if q.attribute != "rate" or not (q.terms or q.years) or q.list_intent or COMPARE_Q.search(question) \
+    if q.attribute != "rate" or not (q.terms or q.years or q.amounts) or q.list_intent or COMPARE_Q.search(question) \
             or SECOND_ASK.search(question) or len({w.rstrip("s") for w in _line_words(q)}) > 1:
         return False
     pool = [c for c in ev.chunks if supports(c, q)]

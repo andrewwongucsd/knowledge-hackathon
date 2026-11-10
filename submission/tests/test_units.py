@@ -364,7 +364,7 @@ class Rev23(unittest.TestCase):
                         ("Back in March 2030, what did checking pay?", "2030-03-31"),
                         ("As of August 2030, what was the APY?", None),          # after the newest crawl
                         ("What was the APY on 2030-01-10?", "2030-01-10"),
-                        ("What was the APY in December 2029?", None),            # before the first crawl
+                        ("What was the APY in December 2029?", "2029-12-31"),    # before the first crawl: kept
                         ("What is the APY in February 2030?", None),             # present tense, soft frame
                         ("Is the APY still the same as of February 2030?", "2030-02-28"),
                         ("What was the current APY as of February 2030?", "2030-02-28"),
@@ -398,7 +398,7 @@ class Rev23(unittest.TestCase):
         self.assertIsNone(date_asked("What was the APY in February 2030?", self._store(date(2030, 1, 10))))
         late = self._store(date(2030, 1, 15), date(2030, 3, 1), date(2030, 6, 15))
         self.assertEqual(date_asked("What was the APY in early January 2030?", late), "2030-01-15")   # nearest crawl
-        self.assertIsNone(date_asked("What was the APY on January 2, 2030?", late))                  # a day before it
+        self.assertEqual(date_asked("What was the APY on January 2, 2030?", late), "2030-01-02")    # before it: kept
 
     def test_an_article_published_after_the_pinned_crawl_is_read_from_the_newest(self):
         from contract import Page, Snapshot
@@ -1166,6 +1166,93 @@ class Rev38(unittest.TestCase):
         bare = parse_query("What's the rate? It's for a 12-month certificate.")
         self.assertIn("certificate", bare.category)
         self.assertEqual(bare.terms, {(12, "month")})
+
+
+class Rev39(unittest.TestCase):
+    """Amounts and tiers, calendar phrases, "by" and comparisons, sending a wire, one-word headings and product
+    tabs, dates before the first crawl (synthetic data only)."""
+
+    def test_amounts_that_are_not_balances_and_amounts_over(self):
+        self.assertEqual(parse_query("I can put $400 a month into a kayak certificate. What APY would I get?").amounts, [])
+        self.assertEqual(parse_query("I earn $70,000 a year. What's the 30-year canoe loan rate?").amounts, [])
+        self.assertEqual(parse_query("What's the canoe loan rate on a loan over $40,000?").amounts, [40000.01])
+        self.assertEqual(parse_query("I'm buying a $90,000 canoe with $10,000 down. What's the rate?").amounts, [90000.0])
+
+    def _system(self):
+        from contract import Page, Snapshot
+        md = ("# Canoe Loan Rates\n\n| Term | Rate | APR |\n|---|---|---|\n"
+              "| 30-Year Canoe Loan $500,000 or less | 6.50% | 6.60% |\n| 30-Year Canoe Loan $200,000 or less | 6.30% | 6.40% |\n"
+              "| 30-Year Canoe Loan $80,000 or less | 6.10% | 6.20% |\n\n"
+              "# Kayak Certificate Specials\n\n| Term | Dividend Rate | APY | Min. to Earn |\n|---|---|---|---|\n"
+              "| 9 Month Kayak Certificate Special | 3.10% | 3.15% | $1,000 |\n"
+              "| 9 Month Kayak Jumbo Certificate Special | 3.40% | 3.45% | $90,000 |\n\n"
+              "Rates are effective as of 02/01/2030.\n")
+        ks = build()
+        ks.ingest(Snapshot("s1", "2030-03-01", [Page("https://example.org/rates", "Rates | Example", md, "2030-03-01T09:00:00Z")]))
+        ks.ingest(Snapshot("s2", "2030-06-15", [Page("https://example.org/rates", "Rates | Example", md, "2030-06-15T09:00:00Z")]))
+        return ks
+
+    def test_the_tightest_tier_and_a_rows_minimum(self):
+        ks = self._system()
+        loan = ks.answer("What's the 30-year canoe loan rate for $70,000?").text
+        self.assertIn("6.10%", loan)
+        self.assertNotIn("6.50%", loan)
+        small = ks.answer("What's the 9-month kayak certificate special APY for $5,000?").text
+        self.assertIn("3.15%", small)
+        self.assertNotIn("3.45%", small)
+        big = ks.answer("What's the 9-month kayak certificate special APY for $95,000?").text
+        self.assertIn("3.45%", big)
+        self.assertNotIn("3.15%", big)
+        self.assertNotIn("3.45%", ks.answer("What's the 9-month kayak certificate special APY, not the jumbo?").text)
+
+    def test_a_date_before_the_first_crawl_reads_it_only_if_the_rate_was_in_effect(self):
+        ks = self._system()
+        self.assertIn("3.15%", ks.answer("What was the 9-month kayak certificate special APY for $5,000 on February 10, 2030?").text)
+        early = ks.answer("What was the 9-month kayak certificate special APY for $5,000 in January 2030?")
+        self.assertFalse(early.confident)                      # those rates took effect on February 1
+        self.assertFalse(ks.answer("What was the 9-month kayak certificate special APY for $5,000?", "2030-01-15").confident)
+
+    def test_calendar_phrases(self):
+        from solution import calendar_phrases
+        for text, want in (("On Labor Day 2030, what was it?", "On September 2, 2030, what was it?"),
+                           ("In Q2 2030, what?", "In June 2030, what?"),
+                           ("During the second half of 2030, what?", "During December 2030, what?"),
+                           ("In the fall of 2030, what?", "In November 2030, what?"),
+                           ("What was it in 2030-04?", "What was it in April 2030?")):
+            self.assertEqual(calendar_phrases(text), want)
+        for text in ("My fall 2030 transcript", "the 48-month APR for a 2011-12 model year canoe"):
+            self.assertEqual(calendar_phrases(text), text)       # not a date
+
+    def test_by_opens_a_moment_and_two_dated_comparisons(self):
+        from types import SimpleNamespace as NS
+        from solution import change_span, date_asked
+        st = NS(views=[NS(taken_on=date(2030, 1, 10)), NS(taken_on=date(2030, 3, 1)), NS(taken_on=date(2030, 6, 15))])
+        self.assertEqual(date_asked("By April 2030, what was the kayak APY?", st), "2030-04-30")
+        self.assertIsNone(date_asked("The special had to be opened by April 30, 2030 — what's its APY?", st))
+        self.assertEqual(change_span("Was the kayak APY the same on February 1, 2030 and on April 1, 2030?", st),
+                         (date(2030, 2, 1), date(2030, 4, 1)))
+        self.assertIsNone(change_span("Is the 9-month kayak certificate different from the 18-month one? I opened mine "
+                                      "on February 1, 2030 and it matures April 1, 2031.", st))
+
+    def test_sending_a_wire_is_never_the_incoming_fee(self):
+        from ingest import Chunk
+        from retrieve import supports
+        q = parse_query("How much does it cost to send a canoe wire?")
+        incoming = Chunk(1, "example.org/fees", "document", "Incoming canoe wire $10.00 each", "Fees Incoming canoe wire $10.00 each")
+        outgoing = Chunk(2, "example.org/fees", "document", "Domestic canoe wire $20.00 each", "Fees Domestic canoe wire $20.00 each")
+        self.assertFalse(supports(incoming, q))
+        self.assertTrue(supports(outgoing, q))
+
+    def test_one_word_headings_and_product_tabs(self):
+        md = ("- [Rowboat Certificate Rates](https://example.org/rates#)\n\nSpecial\n\n| Term | APY |\n|---|---|\n| 9 Month | 3.15% |\n\n"
+              "Standard\n\n| Term | APY |\n|---|---|\n| 12 Month | 2.95% |\n\n"
+              "- [Canoe Account Rates](https://example.org/rates#)\n\nHarbor Choice\n\n| Balance | APY |\n|---|---|\n| $5,000+ | 0.55% |\n")
+        p = Parser()
+        p.domains = {"example.org"}
+        rows = [c for c in p.parse("example.org/rates", "https://example.org/rates", "Rates", md).chunks if c.is_row]
+        self.assertTrue(rows[0].text.startswith("Special"))                       # names a kind of product already
+        self.assertTrue(rows[1].text.startswith("Standard Certificate"))          # a one-word heading, under the tab
+        self.assertTrue(rows[2].text.startswith("Canoe Account Rates · Harbor Choice"))
 
 
 class Contract(unittest.TestCase):
