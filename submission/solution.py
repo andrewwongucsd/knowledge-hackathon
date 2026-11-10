@@ -112,7 +112,8 @@ def _respond(index: Index | None, synth: Synthesizer, question: str, search: str
     view = index.view
     q = parse_query(search or question)       # the model still sees the full question
     linking = LINK_Q.search(question) is not None
-    joining, _, wanted = joining_info(q) if linking else (False, set(), set())
+    vocab = _anchor_vocab(index) if linking else None
+    joining, _, wanted = joining_info(q, vocab) if linking else (False, set(), set())
     if joining and not wanted and _stem("join") not in q.tokens:
         q.expansion = q.expansion + [_stem("join")]        # "sign up as a member": the link to join
         q.tokens = q.tokens + [_stem("join")]
@@ -121,7 +122,7 @@ def _respond(index: Index | None, synth: Synthesizer, question: str, search: str
         carried = lambda u: sum(u in t for t in _page_texts(index).values())
         near, wide = ev.context or ev.chunks, [c for _, c in index.search(q.tokens, top=30)]
         joins = _join_chunks(index) if joining else []
-        link = pick_link(near, view, q, carried, joins) or pick_link(wide, view, q, carried, joins)
+        link = pick_link(near, view, q, carried, joins, vocab) or pick_link(wide, view, q, carried, joins, vocab)
         if link:
             vp = link_source(link, near + wide + joins, view)
             return Answer(text=f"You can find that at {link}.", confident=True,
@@ -389,26 +390,31 @@ JOIN_ACT = re.compile(
     r"\b(?:(?:apply(?:ing)?|sign(?:ing)?\s+up|register(?:ing)?|enrol+(?:ing)?)\s+(?:for|to)\s+"
     r"(?:(?:a|an|the|my|\w+['’]s|\w+)\s+)?membership" + _AFTER_MEMBERSHIP +
     r"|(?:be|become|becoming|sign(?:ing)?\s+up\s+as|register(?:ing)?\s+as|enrol+(?:ing)?\s+as)\s+an?\s+(?:(\w+(?:\s+\w+)?)\s+)?member\b"
-    r"|membership\s+application)", re.I)
+    r"|membership\s+application"
+    r"|open(?:ing)?\s+(?:my|your|a|an|their|his|her)\s+first\s+account\b)", re.I)    # a first account: joining
+# "join the newsletter / webinar / committee": joining something else, unless it is the institution itself
+JOIN_OBJECT = re.compile(r"\bjoin(?:ing)?\s+(?:the|our|your|a|an)\s+(?!credit\s+unions?\b)(\w+)", re.I)
 JOIN_BARE = re.compile(r"\bjoin(?:ing)?\b|\bmembership" + _AFTER_MEMBERSHIP, re.I)
 # picking up an application where one left off is continuing it ("complete a new application" is not)
 RESUME = re.compile(r"\b(?:continu\w*|resum\w*|finish\w*|complet\w*\s+(?:my|the|our)\b|pick(?:ing)?\s+"
                     r"(?:it\s+|this\s+|that\s+)?(?:back\s+)?up|get\s+back\s+to|return\s+to)", re.I)
 JOIN_WORDS = {_stem(w) for w in ("join", "member", "membership", "become")}
-JOIN_ACT_WORDS = JOIN_WORDS | set(tokenize("apply sign up register enrol enroll application"))
+JOIN_ACT_WORDS = JOIN_WORDS | set(tokenize("apply sign up register enrol enroll application open first account"))
 # words that frame a request rather than say what it is about
 FRAME_TALK = set(tokenize("if am so also but didn doesn don isn wasn just then than very really click go send let type enter first "
                           "lets help used using before after since early late last week end beginning start started "
-                          "middle mid")) | {_stem(w) for w in FRAME_WORDS} | {_stem(w) for w in GENERIC}
+                          "middle mid she he her him his hers someone somebody anybody people"))
+FRAME_TALK |= {_stem(w) for w in FRAME_WORDS} | {_stem(w) for w in GENERIC}
 MONTH_WORD = re.compile(rf"^(?:{MONTH_RE})$", re.I)
 FACT_RARE = 0.01        # a question word on under 1% of chunks names the fact asked about
 
 
-def joining_info(q) -> tuple[bool, set, set]:
+def joining_info(q, vocab=None) -> tuple[bool, set, set]:
     """(is the question about joining, the words asked, what else is asked beyond joining). Joining: an action
     ("apply for membership", "become / sign up as a member", "membership application"), or a bare "join" or
     "membership" when nothing else is asked. A member of a kind ("a board member") is not joining. "Picking an
-    application back up" asks to continue it."""
+    application back up" asks to continue it. With the site's link vocabulary, a word that at most one link
+    on the site names ("text it to my sister") can't be what a link is asked for."""
     site = {w.lower() for w in retrieve.SITE_WORDS}
     phrase, other_member = set(), False
     for m in JOIN_ACT.finditer(q.raw):
@@ -418,10 +424,28 @@ def joining_info(q) -> tuple[bool, set, set]:
     subject = set(q.tokens) - LINK_WORDS - CHAT_FILLERS - set(q.expansion)
     wanted = {w for w in subject - JOIN_WORDS - phrase - MEDIUM_WORDS - FRAME_TALK - site
               if not w[0].isdigit() and not MONTH_WORD.match(w)}
+    if vocab is not None:
+        wanted = {w for w in wanted if vocab.get(w, 0) >= 2}
     if RESUME.search(q.raw):
         wanted = (wanted - set(tokenize(" ".join(m.group(0) for m in RESUME.finditer(q.raw))))) | {_stem("continue")}
-    joining = not other_member and (bool(phrase) or (JOIN_BARE.search(q.raw) is not None and not wanted))
+    joins_other = any(m.group(1).lower() not in site for m in JOIN_OBJECT.finditer(q.raw))
+    joining = not other_member and (bool(phrase) or (JOIN_BARE.search(q.raw) is not None and not wanted
+                                                     and not joins_other))
     return joining, subject, wanted
+
+
+def _anchor_vocab(index: Index) -> Counter:
+    """How many link texts on the site (this view) contain each word. Built once per view."""
+    vocab = getattr(index, "_anchor_vocab", None)
+    if vocab is None:
+        vocab = Counter()
+        for vp in index.view.pages.values():
+            if vp.status != "missing":
+                for c in vp.page.chunks:
+                    for m in LINK_RE.finditer(c.text):
+                        vocab.update(set(tokenize(_clause(m.group(1)))))
+        index._anchor_vocab = vocab
+    return vocab
 
 
 def _join_chunks(index: Index) -> list:
@@ -444,12 +468,12 @@ def _clause(text: str) -> str:
     return re.split(r"[.!?;:—–|]|\s{2,}|\\\\", text)[-1]
 
 
-def pick_link(context: list[Chunk], view, q, carried=None, joins=()) -> str | None:
+def pick_link(context: list[Chunk], view, q, carried=None, joins=(), vocab=None) -> str | None:
     """The site's own link for what was asked (see _pick_any). A question about joining the credit union also
     reads the site's pages about joining, and prefers, in order: a link whose own words name more of what else
     was asked ("Continue my application" for picking one back up), an application portal given by a page about
     joining, then the usual order. When something else was asked and no link names it, the usual pick stands."""
-    joining, subject, wanted = joining_info(q)
+    joining, subject, wanted = joining_info(q, vocab)
     if not joining:
         return _pick_any(context, view, q, carried)
     join_keys = {c.key for c in joins}
@@ -457,7 +481,7 @@ def pick_link(context: list[Chunk], view, q, carried=None, joins=()) -> str | No
     site = {w.lower() for w in retrieve.SITE_WORDS}
     asked = set(q.tokens) | JOIN_WORDS | wanted
     pages: dict = {}
-    portals, given_by_join_page, exact, named = set(), set(), set(), {}
+    portals, given_by_join_page, exact, named, joining_portals = set(), set(), set(), {}, set()
     for c in list(context) + list(joins):
         for m in LINK_RE.finditer(c.text):
             link, anchor = m.group(2).rstrip("/"), set(tokenize(m.group(1)))
@@ -472,6 +496,8 @@ def pick_link(context: list[Chunk], view, q, carried=None, joins=()) -> str | No
                 portals.add(link)
                 if c.key in join_keys:
                     given_by_join_page.add(link)
+                if own & JOIN_WORDS:
+                    joining_portals.add(link)          # an application link that says it is for joining
             elif vp.status == "missing" or vp.page.kind == "article" or (vp.page.kind == "calculator"
                                                                          and not _asks_calculator(q)):
                 continue
@@ -484,7 +510,8 @@ def pick_link(context: list[Chunk], view, q, carried=None, joins=()) -> str | No
         return _pick_any(context, view, q, carried)
     def weight(u):
         return 0 if not carried else carried(f"({u})") if u in portals else carried(u)
-    best = max(pages, key=lambda u: (named[u], u in given_by_join_page, len(pages[u]), u in exact, weight(u)))
+    best = max(pages, key=lambda u: (named[u], u in given_by_join_page, u in joining_portals, len(pages[u]),
+                                     u in exact, weight(u)))
     if wanted and (named[best] == 0 or (best not in given_by_join_page and named[best] < len(wanted))):
         return _pick_any(context, view, q, carried)
     return best
@@ -516,9 +543,11 @@ def _pick_any(context: list[Chunk], view, q, carried=None) -> str | None:
     hosts = {k.split("/", 1)[0] for k in view.pages}
     pages: dict = {}
     portals, given_by_own_page = set(), set()
+    words: dict = {}                              # link -> its own words, where the text gives it
     for c in context:
         for m in LINK_RE.finditer(c.text):
             link, anchor = m.group(2).rstrip("/"), set(tokenize(m.group(1)))
+            words.setdefault(link.rstrip("/"), []).append(_last_clause(m.group(1)).lower())
             vp = view.pages.get(url_key(link))
             if vp is None:
                 carrier = view.pages.get(c.key)
@@ -538,7 +567,40 @@ def _pick_any(context: list[Chunk], view, q, carried=None) -> str | None:
         return None
     def weight(u):                 # a portal counts where it is written as a link, not inside longer links
         return 0 if not carried else carried(f"({u})") if u in portals else carried(u)
-    return max(pages, key=lambda u: (len(pages[u]), u in given_by_own_page, weight(u)))
+    best = max(pages, key=lambda u: (len(pages[u]), u in given_by_own_page, weight(u)))
+    return _own_line_page(best, words.get(best, []), view, q) or best
+
+
+OTHER_LINES = ("business", "jumbo")      # a line of products the question has to name to be asked about
+
+
+def _last_clause(text: str) -> str:
+    """A link's own words, ignoring the punctuation that ends them ("…a business auto loan for?")."""
+    return _clause(text.rstrip(" .!?;:"))
+
+
+def _own_line_page(link: str, own_words: list, view, q) -> str | None:
+    """A link the site words for another line ("a business auto loan") when the question names no such line:
+    the site's own live page whose title names everything asked, and not that line, is the answer instead
+    (rows of a line the question didn't name come last, so do its links). None keeps the link."""
+    asked = set(q.tokens)
+    lines = [w for w in OTHER_LINES if _stem(w) not in asked
+             and any(re.search(rf"\b{w}(?:es|s)?\b", t) for t in own_words)]
+    if not lines:
+        return None
+    site = {w.lower() for w in retrieve.SITE_WORDS}
+    product = set(q.tokens) - LINK_WORDS - CHAT_FILLERS - FRAME_TALK - site - set(q.expansion)
+    groups = [{w} | set(retrieve._SYN.get(w, ())) for w in product if not w[0].isdigit()]
+    if not groups:
+        return None
+    for key, vp in sorted(view.pages.items()):
+        title = (vp.page.title or "").lower()
+        named = set(tokenize(title)) - site
+        if (vp.status != "missing" and vp.page.kind not in ("article", "calculator") and named
+                and all(g & named for g in groups)
+                and not any(re.search(rf"\b{w}", f"{title} {key}") for w in lines)):
+            return key
+    return None
 
 
 def link_source(link: str, context: list[Chunk], view):

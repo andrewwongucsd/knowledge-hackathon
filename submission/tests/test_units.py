@@ -920,6 +920,60 @@ class Rev33(unittest.TestCase):
         self.assertEqual(parse_query("What are the money market rates?").category, set())
 
 
+class Rev34(unittest.TestCase):
+    """Chatty joining questions, links for another line, intro wording, "under $X" (synthetic data only)."""
+
+    def test_chatty_words_and_first_accounts(self):
+        from solution import joining_info
+        q = parse_query("What URL could I text my sister so she can sign up for membership online?")
+        self.assertTrue({"text", "sister"} <= joining_info(q)[2])                  # no link vocabulary given
+        joining, _, wanted = joining_info(q, {"text": 1, "board": 54})              # words no link names drop out
+        self.assertTrue(joining)
+        self.assertEqual(wanted, set())
+        self.assertTrue(joining_info(parse_query("What's the link to open my first account?"), {})[0])
+        self.assertFalse(joining_info(parse_query("What is the link to rename my first account?"), {})[0])
+        self.assertFalse(joining_info(parse_query("What is the link to join the newsletter?"), {})[0])
+
+    def _view(self):
+        from types import SimpleNamespace as NS
+        page = lambda key, kind, title: NS(status="fresh", snapshot_id="s1",
+                                           page=NS(kind=kind, key=key, url="https://" + key, title=title))
+        return NS(pages={k: page(k, kind, t) for k, kind, t in (
+            ("example.org/savings", "product", "Savings"), ("example.org/blog/tips", "article", "Tips"),
+            ("example.org/business/loans/vehicle", "product", "Business Vehicle Loans"),
+            ("example.org/personal/auto-loans", "product", "Auto Loans"))})
+
+    def test_a_joining_portal_beats_a_product_one(self):
+        from ingest import Chunk
+        from solution import pick_link
+        text = ("Open an account (example.org/savings). Open my account (join.example.org/products). "
+                "Become a member (join.example.org).")
+        ctx = [Chunk(1, "example.org/savings", "product", text, text)]
+        self.assertEqual(pick_link(ctx, self._view(), parse_query("What's the link to open my first account?")),
+                         "join.example.org")
+
+    def test_a_link_for_another_line_gives_way_to_the_page_for_what_was_asked(self):
+        from ingest import Chunk
+        from solution import _last_clause, pick_link
+        self.assertIn("business", _last_clause("Not sure? What can I use a business auto loan for?"))
+        text = "What can I use a business auto loan for? (example.org/business/loans/vehicle)"
+        ctx = [Chunk(1, "example.org/blog/tips", "article", text, text)]
+        view = self._view()
+        self.assertEqual(pick_link(ctx, view, parse_query("What's the link to apply for a car loan?")),
+                         "example.org/personal/auto-loans")
+        self.assertEqual(pick_link(ctx, view, parse_query("What's the link for business car loans?")),
+                         "example.org/business/loans/vehicle")
+
+    def test_intro_wording_and_amounts_below(self):
+        from retrieve import KIND_EV
+        self.assertIn(_stem("introductory"), parse_query("What is the intro rate on the harbor account?").tokens)
+        self.assertNotIn(_stem("introductory"), parse_query("What is the intro balance transfer fee?").tokens)
+        self.assertIsNotNone(KIND_EV.search("apy for the first 3 months"))
+        self.assertIsNone(KIND_EV.search("no payments for the first 3 months"))
+        self.assertEqual(parse_query("What is the rate for balances under $7,300?").amounts, [7299.99])
+        self.assertEqual(parse_query("What is the rate for a $7,300 balance?").amounts, [7300.0])
+
+
 class Contract(unittest.TestCase):
     def test_exactly_the_three_contract_methods(self):
         own = {n for n, v in vars(type(build())).items() if callable(v) and not n.startswith("__")}

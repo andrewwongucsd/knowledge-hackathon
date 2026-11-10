@@ -165,6 +165,8 @@ AND_OLDER_RE = re.compile(r"\b((?:19|20)\d\d)\s+(?:model\s+years?\s*)?\(?\s*(?:a
 AMT_RANGE_RE = re.compile(r"\$\s?([\d,]+(?:\.\d+)?)\s*[-–]\s*\$?\s?([\d,]+(?:\.\d+)?)")
 AMT_PLUS_RE = re.compile(r"\$\s?([\d,]+(?:\.\d+)?)\s*(?:\+|and (?:up|above|over))", re.I)
 AMT_LESS_RE = re.compile(r"\$\s?([\d,]+(?:\.\d+)?)\s+or less", re.I)
+# "a balance under $X" is a balance just below X: the tier that ends below X, not the one starting at X
+AMT_UNDER_RE = re.compile(r"\b(?:under|less\s+than|below)\s+\$\s?([\d,]+(?:\.\d+)?)\s*([kK])?\b", re.I)
 SOFT_QUALIFIERS = ("jumbo", "business", "traditional", "roth", "ira", "refinance", "hsa", "health")
 # A loan-type spec ("7/1", "10/6" adjustable rates): two small numbers, never part of a date.
 SPEC_RE = re.compile(r"(?<![\d/])(\d{1,2})/(\d{1,2})(?![\d/])")
@@ -188,7 +190,9 @@ MEMBERSHIP_Q = re.compile(r"\b(?:join(?:ing)?|membership|(?:be|become|becoming)\
 RATE_KINDS = r"intro(?:ductory)?|teaser"
 KIND_RATE = re.compile(rf"\b(?:{RATE_KINDS})\s+(?:(?:balance[- ]transfer|dividend|interest|annual percentage)\s+)?"
                        r"(?:apr|apy|rates?|yield|dividend)\b", re.I)
-KIND_EV = re.compile(rf"\b(?:{RATE_KINDS})\b", re.I)
+# ...and so is a rate stated "for the first N months" (a rate word just before it, so a payment holiday is not)
+KIND_EV = re.compile(rf"\b(?:{RATE_KINDS})\b|\b(?:rates?|ap[ry]s?|yields?|dividends?)\b[^.;|\n]{{0,30}}?"
+                     r"\bfor\s+(?:the\s+)?(?:1st|first)\s+\d+\s+months?\b", re.I)
 # ...unless the member names the offer itself ("the intro rate on the certificate special"): then the site's
 # "special" or "promo" on that product's own row or heading is the offer meant. Only "special" as a noun
 # counts, not "a special intro rate".
@@ -316,6 +320,8 @@ def parse_query(question: str) -> Query:
         q.years = {int(m.group(1)) for m in re.finditer(r"\b((?:19|20)\d\d)\b", norm)
                    if not re.search(rf"(?:{MONTH_RE})\s*(?:\d{{1,2}}(?:st|nd|rd|th)?,?\s*)?$", norm[:m.start()])}
     q.amounts = [_f(a) * (1000 if k else 1) for a, k in re.findall(r"\$\s?([\d,]+(?:\.\d+)?)\s*([kK])?\b", norm)]
+    below = {_f(a) * (1000 if k else 1) for a, k in AMT_UNDER_RE.findall(norm)}
+    q.amounts = [a - 0.01 if a in below else a for a in q.amounts]
     q.qualifiers = {w for w in SOFT_QUALIFIERS if re.search(rf"\b{w}\b", low)}
     if m := COUNT_Q.search(low):
         q.attribute, q.count_noun = "count", _stem(m.group(1))
@@ -368,6 +374,8 @@ def parse_query(question: str) -> Query:
         kinds = [m.span() for m in KIND_RATE.finditer(low)]
         if kinds and all(any(a <= s and e <= b for a, b in kinds) for s, e in (m.span() for m in RATE_Q.finditer(low))):
             q.rate_kind = "offer" if OFFER_NOUN.search(low) else "intro"
+            if _stem("intro") in q.tokens and _stem("introductory") not in q.tokens:
+                q.tokens.append(_stem("introductory"))     # "intro" is short for "introductory"
     if q.attribute in ("rate", "fee"):
         toks = re.findall(r"[a-z]+", low.replace("-", " "))
         for k, t in enumerate(toks):
