@@ -206,6 +206,16 @@ KIND_RATE_EV = re.compile(rf"\d+(?:\.\d+)?\s*%\s*\d?\s*(?:(?:{RATE_KINDS})\s+)?(
 NEGATED_QUALIFIER = re.compile(r"(?<!\bor\s)\b(?:not|non|excluding|except|other than|besides|without|rather than|instead of)"
                                r"[\s-]+(?:for\s+(?:(?:the|a|an|any|my|our)\s+)?|(?:the|a|an|any)\s+)?(%s)\b"
                                % "|".join(SOFT_QUALIFIERS), re.I)
+# After a question ("...? I keep my savings with you"): an aside that asks something too, opens a second request,
+# tells what the member has in mind, or tells about the member.
+ASIDE_ASKS = re.compile(r"\W*(?:also|and|or|plus|what|which|how|when|where|is|are|do|does|can|could|vs|versus)\b")
+ABOUT_ME = re.compile(r"\W*(?:i|we|my|our|i['’](?:ve|m|d|ll)|we['’](?:ve|re|d))\b")
+ASIDE_INTENT = re.compile(
+    r"\W*(?:i['’]?m\s+(?:looking|thinking|interested|considering|asking|planning|hoping|after|buying|financing|getting)"
+    r"|i\s+(?:want|need|mean|would|wanna|plan|prefer|am\s+(?:looking|buying|getting))|i['’]d\s+(?:want|like|prefer|need|be)"
+    r"|we\s+(?:want|need|would|are\s+(?:looking|buying))|we['’](?:d|re)\s+(?:want|like|looking|buying|thinking))\b")
+# a line the site may write either way: an "HSA" row says "Health Savings Account"
+LINE_ALIAS = {"hsa": r"\bhealth savings\b", "health": r"\bhsa\b"}
 
 
 def normalize_numbers(text: str) -> str:
@@ -316,15 +326,37 @@ def parse_query(question: str) -> Query:
     asked = re.match(r".*\?", question, re.S)           # "...? Asking for a friend." searches the question only
     q = Query(raw, tokenize(asked.group(0) if asked else question))
     q.text, q.excluded = question, excluded
-    q.terms = terms_in(low)
-    q.native_terms = native_terms(low)
+    # "...? I've been a member for 10 years": an aside after a question that has words of its own. Its product
+    # words never count, and when it only tells about the member (and shares no word with the question) neither
+    # do its terms, model years or product lines. An aside that asks something too, says what the member has
+    # in mind ("I'm looking at the 24-month term", "Five years"), or shares a word ("...auto loan? My car is a
+    # 2025") still counts; a bare question ("What's the rate? It's for a certificate") reads it all.
+    context = False
+    head = normalize_numbers(asked.group(0)).lower() if asked else low
+    tail = low[len(head):] if asked and low.startswith(head) else ""
+    words = low
+    if tail.strip() and not ASIDE_ASKS.match(tail) and not RATE_Q.search(tail) and not FEE_Q.search(tail):
+        quiet = {_stem(w) for w in GENERIC | FRAME_WORDS} | set(CHAT_FILLERS)
+        if any(t not in quiet and not t[0].isdigit() and not RATE_Q.fullmatch(t) and not FEE_Q.search(t) for t in q.tokens):
+            words = head
+            def own(text):
+                ws = set(tokenize(text))
+                ws |= {s for w in list(ws) for s in _SYN.get(w, ())}
+                return {w for w in ws if not w[0].isdigit()} - quiet - {_stem(w) for w in GENERIC_HEADS} - STOP
+            context = bool(ABOUT_ME.match(tail)) and not ASIDE_INTENT.match(tail) and not (own(tail) & own(head))
+    pinned = words == head and terms_in(head)          # a term in the question itself is never overridden
+    q.terms = terms_in(head) if pinned else terms_in(head if context else low)
+    q.native_terms = native_terms(head) if pinned else native_terms(head if context else low)
     if re.search(r"model|vehicle|\bcar\b|truck", low):     # model years only, never "as of March 2031"
         q.years = {int(m.group(1)) for m in re.finditer(r"\b((?:19|20)\d\d)\b", norm)
                    if not re.search(rf"(?:{MONTH_RE})\s*(?:\d{{1,2}}(?:st|nd|rd|th)?,?\s*)?$", norm[:m.start()])}
+    if q.years and tail.strip():
+        mine = {y for y in q.years if str(y) in head}
+        q.years = mine if (mine and words == head) or context else q.years
     q.amounts = [_f(a) * (1000 if k else 1) for a, k in re.findall(r"\$\s?([\d,]+(?:\.\d+)?)\s*([kK])?\b", norm)]
     below = {_f(a) * (1000 if k else 1) for a, k in AMT_UNDER_RE.findall(norm)}
     q.amounts = [a - 0.01 if a in below else a for a in q.amounts]
-    q.qualifiers = {w for w in SOFT_QUALIFIERS if re.search(rf"\b{w}\b", low)}
+    q.qualifiers = {w for w in SOFT_QUALIFIERS if re.search(rf"\b{w}\b", head if context else low)}
     q.excluded -= q.qualifiers          # a line named elsewhere without a negation is still asked about
     if m := COUNT_Q.search(low):
         q.attribute, q.count_noun = "count", _stem(m.group(1))
@@ -346,6 +378,8 @@ def parse_query(question: str) -> Query:
     q.list_intent = bool(LIST_Q.search(question)) or (OPTIONS_Q.search(question) is not None
                                                       and not (q.terms or q.years))
     syn = {**_SYN, **_HOWTO_SYN} if q.attribute in (None, "when") else _SYN
+    if q.attribute in ("rate", "fee"):
+        syn = {**syn, _stem("hsa"): [_stem("health")]}     # a rate row names the line in full
     for t in list(q.tokens):
         q.tokens += [x for x in syn.get(t, []) if x not in q.tokens]
     m = re.search(r"\b((?:[A-Z][\w'’.-]*\s+){0,3}[A-Z][\w'’.-]*)\s+[Bb]ranch\b", question)
@@ -379,8 +413,10 @@ def parse_query(question: str) -> Query:
             q.rate_kind = "offer" if OFFER_NOUN.search(low) else "intro"
             if _stem("intro") in q.tokens and _stem("introductory") not in q.tokens:
                 q.tokens.append(_stem("introductory"))     # "intro" is short for "introductory"
+    if q.attribute in ("rate", "fee") and (q.qualifiers & {"hsa"} or re.search(r"\bhealth savings\b", low)):
+        q.qualifiers |= {"hsa", "health"}                   # one line, written either way
     if q.attribute in ("rate", "fee"):
-        toks = re.findall(r"[a-z]+", low.replace("-", " "))
+        toks = re.findall(r"[a-z]+", words.replace("-", " "))
         for k, t in enumerate(toks):
             if re.fullmatch(PRODUCT_HEADS, t):
                 win = toks[max(0, k - 2):k]
@@ -432,7 +468,7 @@ def qualify(c: Chunk, q: Query) -> tuple[str, float]:
                 return "mismatch", 0.0
     for w in SOFT_QUALIFIERS:
         present = re.search(rf"\b{w}\b", low) is not None
-        if w in q.qualifiers and not present and c.is_row:
+        if w in q.qualifiers and not (present or (w in LINE_ALIAS and re.search(LINE_ALIAS[w], low))) and c.is_row:
             return "mismatch", 0.0
         if w not in q.qualifiers and present:
             factor *= 0.6

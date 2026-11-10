@@ -97,6 +97,18 @@ def _on_site(url: str, domains) -> bool:
     return bool(host) and any(host == d or host.endswith("." + d) for d in domains)
 
 
+TAB_LINK = re.compile(r"[-*]\s+\[([^\]]+)\]\(([^)\s]*#[^)\s]*)\)")     # "- [X Rates](<page>#)"
+PLAIN_WORDS = {"rate", "account", "loan", "card", "line", "home", "interest", "fixed", "standard", "new", "annual",
+               "percentage", "the", "and", "of", "for", "your", "our", "my"}
+
+
+def _says_less(text: str, tab: str) -> bool:
+    """A sub-heading that says less than the tab above it: every word of it is in the tab's name, and the tab
+    adds a word that names something ("Health"), not just "Rates"."""
+    words = lambda s: {w.lower().rstrip("s") for w in re.findall(r"[A-Za-z]+", s)}
+    return words(text) <= words(tab) and bool(words(tab) - words(text) - PLAIN_WORDS)
+
+
 def clean_inline(text: str, domains=()) -> str:
     text = re.sub(r"!\[[^\]]*\]\([^)]*\)", "", text)                      # images
 
@@ -186,7 +198,7 @@ class Parser:
         # PDF conversions leave HTML entities, sometimes double-escaped ("&amp;#45;" for "-").
         lines = html.unescape(html.unescape(md)).splitlines()
         chunks: list[Chunk] = []
-        section, caption = "", ""
+        section, caption, tabbed = "", "", ""
         i, short_buf = 0, []
 
         def flush_short():
@@ -203,7 +215,7 @@ class Parser:
                 while j < len(lines) and lines[j].strip().startswith("|"):
                     j += 1
                 chunks.extend(self._table(key, title, section, caption, lines, i, j))
-                caption = ""
+                caption, tabbed = "", ""
                 i = j
                 continue
             if not line:
@@ -227,8 +239,12 @@ class Parser:
             text = clean_inline(" ".join(block), self.domains)
             if len(re.findall(r"[A-Za-z]{2,}", text)) < 2 and not re.search(r"\d", text):
                 continue                                # "\# # #", lone bullets, stray markup
+            # an in-page tab ("- [Health Savings Rates](<this page>#)") names what follows it: a sub-heading that
+            # says less ("Savings Rates") is the tab's
+            tab = TAB_LINK.fullmatch(block[0]) if len(block) == 1 else None
+            above, tabbed = tabbed, (clean_inline(tab.group(1), self.domains) if tab and url_key(tab.group(2)) == key else "")
             if len(text) < 60 and not re.search(r"\d(?!\d*(?:st|nd|rd|th)\b)", text) and len(block) == 1:
-                caption = text                          # e.g. "Savings Rates" or "1st Choice Checking" above a table
+                caption = above if above and _says_less(text, above) else text   # e.g. "Savings Rates" above a table
             money_lines = [b for b in block if re.search(r"\$\s?\d|\d%", b)]
             if len(block) >= 3 and len(money_lines) * 2 >= len(block):
                 flush_short()                           # fee schedules: one fact per line

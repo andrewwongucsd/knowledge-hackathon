@@ -1121,6 +1121,53 @@ class Rev37(unittest.TestCase):
                          "apply.example.org/loan-application-personal/personal-loan")
 
 
+class Rev38(unittest.TestCase):
+    """Tabs that name a table under a plainer heading; one line written two ways; asides after a question
+    (synthetic data only)."""
+
+    def test_a_tab_names_the_table_under_a_plainer_heading(self):
+        md = ("## Rates\n\n- [Kayak Savings Rates](https://example.org/personal/kayak-savings-account-options#)\n\n"
+              "Saving Rates\n\n| Balance | Dividend Rate | APY |\n| --- | --- | --- |\n| $40,000+ | 0.45% | 0.45% |\n\n"
+              "- [Canoe Loan Rates](https://example.org/personal/kayak-savings-account-options#)\n\n"
+              "Canoe Loans\n\n| Term | Rate | APR |\n| --- | --- | --- |\n| 36 Months | 6.00% | 6.10% |\n")
+        p = Parser()
+        p.domains = {"example.org"}
+        rows = [c for c in p.parse("example.org/personal/kayak-savings-account-options",
+                                   "https://example.org/personal/kayak-savings-account-options", "Rates", md).chunks if c.is_row]
+        self.assertIn("Kayak Savings Rates", rows[0].text)             # a long tab line still counts
+        self.assertIn("Canoe Loans", rows[1].text)                     # the tab adds only "Rates": the heading stays
+
+    def test_one_line_written_two_ways(self):
+        from ingest import Chunk
+        from retrieve import qualify
+        q = parse_query("What's the HSA rate on $45,000?")
+        self.assertTrue({"hsa", "health"} <= q.qualifiers)
+        row = Chunk(1, "example.org/rates", "product", "Health Savings Account — $40,000+: 0.45%",
+                    "Rates Health Savings Account — $40,000+: 0.45%", is_row=True, cells=["$40,000+", "0.45%"], value_cols=[1])
+        self.assertNotEqual(qualify(row, q)[0], "mismatch")
+        self.assertEqual(parse_query("How do I open an HSA?").qualifiers, {"hsa"})   # prose questions unchanged
+
+    def test_an_aside_about_the_member_is_context(self):
+        p = parse_query("What's the 17-month certificate special APY? I keep my personal savings with you.")
+        self.assertNotIn("savings", p.category)
+        self.assertNotIn("personal", p.descriptors)
+        self.assertEqual(p.terms, {(17, "month")})
+        self.assertEqual(parse_query("What are the canoe loan rates? I've been a member for 10 years.").terms, set())
+        self.assertNotIn("business", parse_query("What's the canoe loan rate? My business banks elsewhere.").qualifiers)
+        self.assertEqual(parse_query("What's the 60-month canoe loan APR? I have a 36-month car loan with you.").terms,
+                         {(60, "month")})                               # a term in the question is never overridden
+
+    def test_an_aside_that_says_what_is_meant_still_counts(self):
+        self.assertEqual(parse_query("What's the certificate rate? I'm looking at the 24-month term.").terms, {(24, "month")})
+        self.assertEqual(parse_query("Can you tell me the rate on a certificate? Five years.").terms, {(60, "month")})
+        self.assertEqual(parse_query("What's the 12-month certificate rate? Also the 24-month.").terms,
+                         {(12, "month"), (24, "month")})
+        self.assertEqual(parse_query("What's the auto loan APR? My car is a 2025.").years, {2025})
+        bare = parse_query("What's the rate? It's for a 12-month certificate.")
+        self.assertIn("certificate", bare.category)
+        self.assertEqual(bare.terms, {(12, "month")})
+
+
 class Contract(unittest.TestCase):
     def test_exactly_the_three_contract_methods(self):
         own = {n for n, v in vars(type(build())).items() if callable(v) and not n.startswith("__")}
