@@ -106,7 +106,7 @@ class KnowledgeSystem:
         _own_site(self._store)
         if not self._indexes:
             return []
-        found = find_conflicts(self._indexes[-1].view)
+        found = find_conflicts(self._indexes[-1].view, [ix.view for ix in self._indexes[:-1]])
         return [Conflict(topic=str(f["topic"]), values=[str(v) for v in f["values"]],
                          sources=[Source(url=str(u), snapshot_id=str(s)) for u, s in f["sources"]],
                          resolution=str(f["resolution"]), reason=str(f["reason"])) for f in found]
@@ -518,22 +518,137 @@ MONTH_PAIR = re.compile(rf"\b(?:between|from)\s+({_MONTH})\.?\s+(?:and|to)\s+(?:
 SPAN_FROM = re.compile(r"\b(?:since|after|from)\s+(?:\S+\s+){0,2}$", re.I)
 
 
+# "What was it in May and what is it now?", "Has it changed since the middle of May?", "…when I first checked in May":
+# one past moment, and "now" (or "since" it), asks for the site at both. A moment is a date, a day without a year
+# ("May 12"), or a month alone; the newest crawl is "now".
+NOW_REF = re.compile(r"\b(?:now|currently|today|at present|these days|latest(?:\s+update)?|most\s+recent(?:ly)?|newest)\b", re.I)
+FIRST_CHECKED = re.compile(r"\b(?:first\s+checked|when\s+i\s+first|at\s+first|originally)\b", re.I)
+AS_OF_PIN = re.compile(r"\bas\s+(?:of|at)\b", re.I)
+SINCE_RE = re.compile(r"\bsince\b", re.I)
+# "is it still the same as it was in August?": the past moment set against the newest crawl, with no "now" said
+SAME_AS = re.compile(r"\b(?:still\s+(?:the\s+)?same|(?:the\s+)?same\s+as|unchanged)\b", re.I)
+# a season is a stretch of months: "when I first looked in the spring" is the first crawl in March to May
+SEASON = re.compile(r"\b(?:(?P<q>early|late|mid)[\s-]+|(?:in|since|from|during|last|this|over)\s+(?:the\s+)?|the\s+)"
+                    r"(?P<s>spring|summer|fall|autumn)\b", re.I)
+SEASON_MONTHS = {"spring": (3, 5), "summer": (6, 8), "fall": (9, 11), "autumn": (9, 11)}
+# a value that can change, said without a rate, fee or count: "Did the maximum grant change since May?"
+CHANGED_WORDS = re.compile(r"\b(?:chang\w*|gone\s+up|go(?:es)?\s+up|went\s+up|go(?:es)?\s+down|went\s+down|gone\s+down|increas\w*|"
+                           r"decreas\w*|rise[ns]?|rose|fell|fall(?:en)?|drop(?:ped|s)?|lower(?:ed)?|higher|rais(?:e[ds]?|ing)|differ\w*|"
+                           r"same|unchanged)\b", re.I)
+_MONTH_FULL = "|".join(MONTHS)                      # in full: "APR" is a loan term, "may" a verb
+MONTH_ONLY = re.compile(rf"\b(?:(?:the\s+)?(?P<q1>start|beginning|middle|end)\s+of\s+|(?P<q2>early|mid|late)[\s-]+)?"
+                        rf"(?P<m>{_MONTH_FULL})\b(?!\.?\s*\d)", re.I)
+MONTH_DAY = re.compile(rf"\b(?P<m>{_MONTH_FULL})\.?\s+(?P<d>\d{{1,2}})(?:st|nd|rd|th)?\b(?!\s*,?\s*\d)", re.I)
+MAY_AFTER = re.compile(r"\b(?:in|since|from|between|of|by|back|and|to)\s+$", re.I)     # "May I ask…" is no month
+MONTH_QUALIFIER = re.compile(r"(?:(?:the\s+)?(?P<q1>start|beginning|middle|end)\s+of|(?P<q2>early|mid|late)[\s-]*)\s*$", re.I)
+NEAR_FIRST_CRAWL_DAYS = 45      # a dated day this close before the first crawl is read as the first crawl
+
+
+def _month_moment(store: Store, year: int, month: int, qualifier: str, first_checked: bool) -> date | None:
+    """The day a month (with a qualifier) names, as a moment to read the site at; None outside the crawls' months.
+    The start of a month, "early", or "when I first checked" is the first crawl in it (or the latest before it);
+    the middle is the 15th; the end, "late" or a month alone is its last day."""
+    views = store.views
+    start, end = date(year, month, 1), date(year, month, calendar.monthrange(year, month)[1])
+    if end < views[0].taken_on.replace(day=1) or start > views[-1].taken_on:
+        return None
+    if qualifier in ("start", "beginning", "early") or first_checked:
+        inside = [v.taken_on for v in views if start <= v.taken_on <= end]
+        before = [v.taken_on for v in views if v.taken_on <= start]
+        return inside[0] if inside else (before[-1] if before else views[0].taken_on)
+    return date(year, month, 15) if qualifier in ("middle", "mid") else end
+
+
+def _season_moment(store: Store, season: str, qualifier: str, first_checked: bool) -> date | None:
+    """The day a season names: the first crawl in it (early, or "when I first looked"), else its last day."""
+    views = store.views
+    year = views[-1].taken_on.year
+    first_month, last_month = SEASON_MONTHS[season]
+    start, end = date(year, first_month, 1), date(year, last_month, calendar.monthrange(year, last_month)[1])
+    if end < views[0].taken_on.replace(day=1) or start > views[-1].taken_on:
+        return None
+    if qualifier == "early" or first_checked:
+        inside = [v.taken_on for v in views if start <= v.taken_on <= end]
+        before = [v.taken_on for v in views if v.taken_on <= start]
+        return inside[0] if inside else (before[-1] if before else views[0].taken_on)
+    return start + (end - start) // 2 if qualifier == "mid" else end
+
+
+def _then_now_span(question: str, original: str, store: Store) -> tuple | None:
+    """(then, None): one past moment against the newest crawl. Fires on an explicit "now" (not pinned by "as of"),
+    on "since <moment>", or on "when I first checked"; and only for a value that can change (a rate, fee or count,
+    or a change verb). A month before the first crawl's month or after the newest crawl is no moment."""
+    first_checked = bool(FIRST_CHECKED.search(question))
+    pinned = AS_OF_PIN.search(question)
+    if not (((NOW_REF.search(question) or SAME_AS.search(question)) and not pinned) or SINCE_RE.search(question) or first_checked):
+        return None
+    pq = parse_query(original)
+    if not (pq.attribute in ("rate", "fee", "count") or (pq.attribute is None and CHANGED_WORDS.search(question))):
+        return None
+    views = store.views
+    first, newest = views[0].taken_on, views[-1].taken_on
+    days = []
+    for m in DATE_PHRASE.finditer(question):
+        d = _phrase_date(m.group(1))
+        if d is None:
+            continue
+        if _DAY_PRECISE.search(m.group(1)):
+            if d >= first:
+                days.append(d)
+            elif (first - d).days <= NEAR_FIRST_CRAWL_DAYS:
+                days.append(first)
+        else:                                       # "the middle of May 2026"
+            q = MONTH_QUALIFIER.search(question[:m.start(1)])
+            moment = _month_moment(store, d.year, d.month, ((q.group("q1") or q.group("q2")) if q else "").lower(), first_checked)
+            if moment:
+                days.append(moment)
+    if not days:                                    # "May 12": the crawl year
+        for m in MONTH_DAY.finditer(question):
+            try:
+                d = date(newest.year, MONTHS[m.group("m").lower()], int(m.group("d")))
+            except (ValueError, KeyError):
+                continue
+            if first <= d <= newest:
+                days.append(d)
+            elif 0 < (first - d).days <= NEAR_FIRST_CRAWL_DAYS:
+                days.append(first)                  # "around May 11", the day before the first crawl
+    if not days:
+        for m in SEASON.finditer(question):
+            moment = _season_moment(store, m.group("s").lower(), (m.group("q") or "").lower(), first_checked)
+            if moment:
+                days.append(moment)
+    if not days:
+        for m in MONTH_ONLY.finditer(question):
+            q = (m.group("q1") or m.group("q2") or "").lower()
+            if m.group("m").lower() == "may" and not (q or MAY_AFTER.search(question[:m.start()])):
+                continue
+            moment = _month_moment(store, newest.year, MONTHS[m.group("m").lower()], q, first_checked)
+            if moment:
+                days.append(moment)
+    days = sorted(set(days))
+    if not days:
+        return None
+    return (days[0], days[-1]) if len(days) >= 2 else (days[0], None)
+
+
 def change_span(question: str, store: Store) -> tuple | None:
     """(start, end) dates of a change the question asks about; end None means "now". A month alone means
-    the site as it stood by the end of that month."""
+    the site as it stood by the end of that month. Two dated months ("between May and June 2026"), or one
+    moment against now ("since the middle of May", "what was it in June and what is it now?")."""
+    original = question
     question = calendar_phrases(question, _now(store), _crawls(store))
-    if len(store.views) < 2 or not (CHANGE_ASK.search(question) or
-                                    (COMPARE_ASK.search(question) and len(terms_in(question.lower())) <= 1)):
+    if len(store.views) < 2:
         return None
-    found = [(m.start(1), d) for m in DATE_PHRASE.finditer(question) if (d := _phrase_date(m.group(1)))]
-    if len(found) < 2 and (mp := MONTH_PAIR.search(question)) and (d := _phrase_date(f"{mp.group(1)} {mp.group(2)}")):
-        found.append((mp.start(1), d))
-    days = sorted({d for _, d in found})
-    if len(days) >= 2:
-        return days[0], days[-1]
-    if len(days) == 1 and SPAN_FROM.search(question[:found[0][0]]):
-        return days[0], None
-    return None
+    if CHANGE_ASK.search(question) or (COMPARE_ASK.search(question) and len(terms_in(question.lower())) <= 1):
+        found = [(m.start(1), d) for m in DATE_PHRASE.finditer(question) if (d := _phrase_date(m.group(1)))]
+        if len(found) < 2 and (mp := MONTH_PAIR.search(question)) and (d := _phrase_date(f"{mp.group(1)} {mp.group(2)}")):
+            found.append((mp.start(1), d))
+        days = sorted({d for _, d in found})
+        if len(days) >= 2:
+            return days[0], days[-1]
+        if len(days) == 1 and SPAN_FROM.search(question[:found[0][0]]):
+            return days[0], None
+    return _then_now_span(question, original, store)
 
 
 def _respond_change(first: Index, last: Index, synth: Synthesizer, question: str) -> Answer:

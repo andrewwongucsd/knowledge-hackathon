@@ -6,6 +6,7 @@ import sys
 import unittest
 from datetime import date
 from pathlib import Path
+from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[2]          # kit root: submission/tests/ -> submission/ -> root
 sys.path[:0] = [str(ROOT / "submission"), str(ROOT / "harness")]
@@ -1924,6 +1925,171 @@ class Rev44(unittest.TestCase):
         self.assertIn("June 30, 2031", ks.answer("Is the Canoeco office inside the grocery store still operating today?").text)
         self.assertNotIn("First Name", self._ks([("contact", forms), ("faq", "# Help\n\nTo update your phone number, sign in and open your profile settings page.\n")])
                          .answer("How do I change the phone number on my account?").text)
+
+
+class Rev46(unittest.TestCase):
+    """Then-versus-now questions, descriptors that describe, vehicle and refinance wording, conflicts for an ended offer,
+    an article's rate and the recognition streak (synthetic data only)."""
+
+    RATES = ("# Kayak Rates\n\n## Regular Certificates\n\n| Term | APY |\n|---|---|\n| 6 Month | {a}% |\n| 12 Month | {b}% |\n\n"
+             "## Special Certificates\n\n| Term | APY |\n|---|---|\n| 10 Month Special | {c}% |\n| 17 Month Special | {d}% |\n\n"
+             "## Kayak Mortgages\n\n| Product | Rate |\n|---|---|\n| 30-Year Fixed Purchase | 3.85% |\n\nPromotional rates may change at any time.\n")
+
+    def _crawls(self, versions):
+        from contract import Page, Snapshot
+        ks = build()
+        for n, (day, vals) in enumerate(versions, 1):
+            ks.ingest(Snapshot(f"s{n}", day, [Page("https://example.org/rates", "Rates | Example", self.RATES.format(**vals), day + "T09:00:00Z")]))
+        return ks
+
+    def _timeline(self):
+        return self._crawls([("2030-05-10", dict(a="1.10", b="1.20", c="1.30", d="1.40")),
+                             ("2030-05-20", dict(a="1.15", b="1.25", c="1.35", d="1.45")),
+                             ("2030-06-12", dict(a="1.60", b="1.70", c="1.80", d="1.90")),
+                             ("2030-09-02", dict(a="2.60", b="2.70", c="2.80", d="2.90"))])
+
+    def test_one_past_moment_and_now_are_two_snapshots(self):
+        from solution import change_span
+        store = self._timeline()._store
+        span = lambda q: change_span(q, store)
+        d = lambda y, m, dd: date(y, m, dd)
+        self.assertEqual(span("What was the 12-month kayak certificate APY in June 2030 and what is it now?"), (d(2030, 6, 30), None))
+        self.assertEqual(span("Has the 12-month certificate rate changed since the middle of May 2030?"), (d(2030, 5, 15), None))
+        self.assertEqual(span("Has the 12-month certificate rate changed since the middle of May?"), (d(2030, 5, 15), None))
+        self.assertEqual(span("How much did the 12-month APY go up since the start of May?"), (d(2030, 5, 10), None))
+        self.assertEqual(span("The 12-month APY looked lower when I first checked in May. What is it now?"), (d(2030, 5, 10), None))
+        self.assertEqual(span("What was the 12-month APY back in May, and what is it now?"), (d(2030, 5, 31), None))
+        self.assertEqual(span("Has the 12-month APY changed since May 12?"), (d(2030, 5, 12), None))
+        self.assertEqual(span("What changed about the 12-month APY between late May and the latest update?"), (d(2030, 5, 31), None))
+        self.assertEqual(span("Did the maximum grant change since June?"), (d(2030, 6, 30), None))     # no rate, a change verb
+        self.assertEqual(span("The 12-month APY looked lower when I first looked in the spring. What is it now?"), (d(2030, 5, 10), None))
+        self.assertEqual(span("Is the 10-month special APY still the same as it was in August?"), (d(2030, 8, 31), None))    # no "now" said
+        self.assertEqual(span("How much higher is the 12-month APY now than it was in June?"), (d(2030, 6, 30), None))
+        self.assertEqual(span("My cousin got a rate around May 8. What was the 12-month APY then and what is it today?"), (d(2030, 5, 10), None))
+
+    def test_questions_that_are_not_then_versus_now_are_left_alone(self):
+        from solution import change_span
+        store = self._timeline()._store
+        for q in ("May I ask what the 12-month APY is today?",                        # a verb, not the month
+                  "What APR do you charge on a 36-month loan right now?",             # "APR" is no month
+                  "I'm buying a house in March. What's the 12-month APY today?",       # before the crawls
+                  "I plan to open a certificate next February. What is the 12-month APY currently?",
+                  "Right now, as of June 2030, what's the 12-month APY?",              # one pinned moment
+                  "What is the 12-month APY as of June 2030?",
+                  "What is the 12-month APY since I opened my account?",
+                  "How long has the 17-month special been available since it launched in May?",   # no value that changes
+                  "How much did a canoe cost in 2029?",
+                  "Is the 17-month special different from the regular 12-month certificate? I opened mine in May.",   # two products
+                  "What was the 12-month APY in the summer?",                              # no second moment
+                  "Do rates fall in the fall?",
+                  "Compare the 6-month and 12-month APY."):
+            self.assertIsNone(change_span(q, store), q)
+
+    def test_the_then_and_now_answers_come_from_the_two_snapshots(self):
+        ks = self._timeline()
+        text = ks.answer("What was the 12-month certificate APY back in May, and what is it now?").text
+        self.assertIn("1.25%", text)            # the later May crawl
+        self.assertIn("2.70%", text)
+        self.assertNotIn("1.70%", text)         # June is neither moment
+        text = ks.answer("The 12-month certificate looked lower when I first checked in May. What is it now?").text
+        self.assertIn("1.20%", text)            # the first crawl in May
+        self.assertIn("2.70%", text)
+        self.assertNotIn("1.25%", ks.answer("What is the 12-month certificate APY as of June 2030?").text)   # an as-of question is unchanged
+
+    def test_describing_words_are_dropped_only_when_the_site_has_no_such_line(self):
+        ks = self._timeline()
+        said = lambda q: ks.answer(q)
+        self.assertIn("2.90%", said("What APY does the regular 17-month certificate special pay?").text)    # the standard special
+        self.assertIn("2.70%", said("What's the regular 12-month certificate APY?").text)
+        self.assertFalse(said("What's the 17-month regular certificate APY?").confident)    # 17 months is only a special
+        self.assertFalse(said("What APY does the 6-month special certificate pay?").confident)            # specials exist, not at 6 months
+        self.assertFalse(said("What is the 12-month promotional certificate APY?").confident)
+        self.assertFalse(said("What is the standard 12-month special certificate APY?").confident)
+        self.assertIn("3.85%", said("What is the special 30-year fixed mortgage rate?").text)              # no mortgage is ever a special
+        self.assertIn("2.80%", said("What is the 10-month special certificate APY, not the regular one?").text)
+
+    def test_a_vehicle_word_pins_the_loan_when_a_model_year_is_asked(self):
+        from contract import Page, Snapshot
+        md = ("# Kayak Loans\n\n## Auto and Vehicle Loans\n\n| Model Year | Term | APR |\n|---|---|---|\n| 2016 (and older) | 48 Months | 8.10% |\n"
+              "| 2017-24 | 60 Months | 5.20% |\n| 2017-24 | 72 Months | 5.40% |\n\n"
+              "## Boat Loans\n\n| Amount | Term | APR |\n|---|---|---|\n| $40,000+ | 72 Months | 7.30% |\n")
+        ks = build()
+        ks.ingest(Snapshot("s1", "2030-06-15", [Page("https://example.org/loans", "Loans | Example", md, "2030-06-15T09:00:00Z")]))
+        self.assertIn("8.10%", ks.answer("What's the APR for a 48-month loan on a 2015 vehicle?").text)
+        self.assertIn("5.20%", ks.answer("What's the APR for a 60-month loan on a 2020 car?").text)
+        self.assertFalse(ks.answer("What's the APR for a 72-month loan on a 2016 or older vehicle?").confident)   # no such auto row
+        self.assertIn("7.30%", ks.answer("What's the APR on a 72-month boat loan?").text)
+        self.assertIn("snowmobile", parse_query("Got a 2020 snowmobile to finance over 60 months. What's the APR?").descriptors)
+
+    def test_refinancing_is_the_refinance_rows_unless_it_is_ruled_out(self):
+        for q in ("What's the APR for refinancing a 30-year loan?", "What are the refi rates for a 30-year loan?",
+                  "What is the 30-year rate if I refinance?"):
+            self.assertIn("refinance", parse_query(q).qualifiers, q)
+        for q in ("What is the 30-year rate for a purchase, not refinancing?", "I'm not refinancing, I'm buying. What is the 30-year rate?",
+                  "What is the 30-year rate without refinancing?", "What is the 30-year rate for buying instead of refinancing?",
+                  "What is the 30-year rate excluding refinance?"):
+            self.assertNotIn("refinance", parse_query(q).qualifiers, q)
+        self.assertNotIn("refinance", parse_query("Is there an application fee when refinancing?").qualifiers)     # a fee question
+
+    def _crawl_pair(self, before, after):
+        from contract import Page, Snapshot
+        ks = build()
+        for n, (day, pages) in enumerate((("2030-05-10", before), ("2030-06-20", after)), 1):
+            ks.ingest(Snapshot(f"s{n}", day, [Page(f"https://example.org/{u}", f"{u} | Example", md, day + "T09:00:00Z") for u, md in pages.items()]))
+        return ks
+
+    def test_an_ended_offer_that_another_live_page_still_advertises_is_a_conflict(self):
+        offer = "# Paddle Bonus\n\nBoost your APY to 7.77% with a canoe savings account.\n\n" + "\n\n".join(
+            f"Offer rule number {w}: members who qualify for the paddle bonus must keep the new money on deposit for the whole term." for w in
+            ("one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten", "eleven", "twelve", "thirteen", "fourteen")) + "\n"
+        footer = "\n\nAll accounts at example credit union are insured and members never pay anything for opening a basic account here.\n"
+        ended = "![Expired](https://example.org/x.png)\n\n# Sorry ... this offer has ended.\n\nBut your momentum doesn't have to. Call us today and talk.\n"
+        cross = "# Other\n\n" + "\n\n".join(f"Cross sell line number {w} that also happens to talk about the paddle bonus members get today." for w in
+                                         ("one", "two", "three", "four", "five", "six", "seven", "eight")) + "\n"
+        ks = self._crawl_pair({"offer-new": offer, "offer-members": offer, "cross": cross, "other": "# Other\n\nHello there." + footer},
+                              {"offer-new": ended, "offer-members": offer, "cross": cross, "other": "# Other\n\nHello there." + footer})
+        found = [c for c in ks.conflicts() if "offer has ended" in c.values]
+        self.assertEqual(len(found), 1)
+        self.assertTrue(any(v.startswith("7.77%") for v in found[0].values))
+        urls = [s.url for s in found[0].sources]
+        self.assertIn("https://example.org/offer-members", urls)
+        self.assertIn("https://example.org/offer-new", urls)
+        self.assertNotIn("https://example.org/cross", urls)            # eight shared sentences are not enough
+        self.assertIn("ended", found[0].resolution)
+        # a notice with no earlier offer, or an offer nobody repeats, is no conflict
+        alone = self._crawl_pair({"offer-new": offer}, {"offer-new": ended})
+        self.assertEqual([c for c in alone.conflicts() if "offer has ended" in c.values], [])
+        fresh = self._crawl_pair({"a": "# A\n\nSorry, this offer has ended."}, {"a": "# A\n\nSorry, this offer has ended."})
+        self.assertEqual([c for c in fresh.conflicts() if "offer has ended" in c.values], [])
+
+    def test_an_article_quoting_another_rate_than_the_table_is_a_conflict(self):
+        table = "# Rates\n\n| Product | Rate | APR |\n|---|---|---|\n| Kayak Starter Paddle Program | 4.100% | 4.150% |\n| Canoe Loan | 5.000% | 5.050% |\n"
+        wrong = "# Release\n\nThe Kayak Starter Paddle Program offers members a special rate of 4.300% APR*.\n"
+        same = "# Release 2\n\nThe Kayak Starter Paddle Program offers members a rate of 4.150% APR.\n"
+        other = "# Release 3\n\nOur flagship savings offers 9.900% APY for balances over the minimum to every member.\n"
+        ks = self._crawl_pair({"rates": table}, {"rates": table, "newsroom/release": wrong, "newsroom/release-2": same, "newsroom/release-3": other})
+        found = [c for c in ks.conflicts() if "Starter" in c.topic]
+        self.assertEqual(len(found), 1)
+        self.assertEqual((found[0].values, found[0].resolution), (["4.150%", "4.300%"], "4.150%"))
+        self.assertTrue(found[0].topic.endswith("APR"))
+        self.assertEqual([c for c in ks.conflicts() if "9.900%" in " ".join(c.values)], [])
+
+    def test_the_recognition_streak_is_its_own_conflict_and_conflicts_are_typed(self):
+        from unittest import mock
+        import conflicts
+        entry = {"topic": 'How many times Acme recognized the bank: "the Nth time Acme recognized the bank"',
+                 "values": ["fifth", "fourth"], "sources": [("example.org/a", "s1")], "resolution": "fifth", "reason": "newest",
+                 "_strength": 1, "_count": False, "_phrases": {}, "_streaks": ["third (For a third year in a row, Acme named the bank)"]}
+        view = SimpleNamespace(pages={}, taken_on=date(2030, 6, 1))
+        with mock.patch.object(conflicts, "table_conflicts", return_value=[]), \
+                mock.patch.object(conflicts, "statement_conflicts", return_value=[dict(entry)]):
+            found = conflicts.find_conflicts(view)
+        self.assertEqual([f["values"] for f in found], [["fifth", "fourth"], ["fifth", "third (For a third year in a row, Acme named the bank)"]])
+        self.assertTrue(found[1]["topic"].startswith("How many times Acme recognized the bank"))
+        ks = self._crawl_pair({"a": "# A\n\nHello there friends."}, {"a": "# A\n\nHello there friends."})
+        for c in ks.conflicts():
+            self.assertIsInstance(c, Conflict)
+            self.assertTrue(all(isinstance(v, str) for v in c.values))
 
 
 class Contract(unittest.TestCase):

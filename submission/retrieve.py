@@ -115,7 +115,7 @@ DEPOSIT_NAMED = re.compile(r"\b(?:savings|checking|certificates?|cds?|money\s+ma
 FEE_WORD = re.compile(r"\b(?:fees?|costs?|charges?|charged|price)\b", re.I)
 # a rate question naming no product line but a vehicle is about a loan on it; never one about saving
 DEPOSIT_CUE = re.compile(r"\b(?:apy|dividends?|sav(?:e|es|ing|ings)|certificates?|cds?|deposits?|money\s+market|hsas?|iras?)\b", re.I)
-VEHICLE = re.compile(r"\b(cars?|vehicles?|trucks?|pickups?|suvs?|vans?|motorcycles?|boats?)\b", re.I)
+VEHICLE = re.compile(r"\b(cars?|vehicles?|trucks?|pickups?|suvs?|vans?|motorcycles?|boats?|snowmobiles?|atvs?|utvs?|watercraft)\b", re.I)
 RV = re.compile(r"\b(?:rvs?|recreational\s+vehicles?|campers?|motor\s*homes?)\b", re.I)
 # "does any savings tier pay 0.45%?" asks about a rate without the word (cash back and points are not rates)
 PLAIN_DESCRIPTORS = {"regular", "basic", "standard", "plain", "normal", "ordinary", "simple", "everyday", "share", "personal"}
@@ -540,11 +540,35 @@ def parse_query(question: str) -> Query:
     raw_low = q.raw.lower()
     _read_hours(q, raw_low)
     _read_counts(q, raw_low)
+    _read_vehicle_year(q, raw_low)
+    _read_refinance(q, raw_low)
     if q.list_intent and q.attribute == "rate" and (q.terms or q.years or q.amounts) and VALUE_ASKED.search(raw_low) \
             and not re.match(LIST_ASK, q.raw, re.I):
         q.list_intent = False                           # a value asked of one pinned row is not a list
     _read_contact(q, raw_low)
     return q
+
+
+# A vehicle word names the loan when a model year is asked: "a 72-month loan on a 2016 or older vehicle" is the auto
+# table's question (it has no such row), not a boat or RV loan's.
+def _read_vehicle_year(q: Query, low: str) -> None:
+    if q.attribute == "rate" and q.years and q.category == {"loan"} and not q.descriptors and (v := VEHICLE.search(low)):
+        word = v.group(1).lower()
+        word = word[:-1] if word.endswith("s") else word
+        q.descriptors = {word} | ({"vehicle"} if word in ("car", "vehicle", "truck", "pickup", "suv", "van") else set())
+
+
+# "refinancing", "refinanced", "refi" ask for the refinance rows of a rate question, unless the member says they are not
+# ("purchase, not refinancing", "I'm not refinancing", "without refinancing", "instead of a refinance").
+REFINANCE_WORD = re.compile(r"\brefinanc\w*|\brefi\b", re.I)
+REFINANCE_NEGATED = re.compile(
+    r"\b(?:not|non|no|never|excluding|except|without|rather\s+than|instead\s+of|other\s+than)\s+(?:(?:a|an|the|my|any)\s+)?(?:\w+\s+)?"
+    r"(?:refinanc\w*|refi)\b|\b(?:i['’]?m|am|are|we['’]?re)\s+not\s+(?:\w+\s+)?(?:refinanc\w*|refi)\b", re.I)
+
+
+def _read_refinance(q: Query, low: str) -> None:
+    if q.attribute == "rate" and REFINANCE_WORD.search(low) and not REFINANCE_NEGATED.search(low):
+        q.qualifiers = set(q.qualifiers) | {"refinance"}
 
 
 def _read_contact(q: Query, low: str) -> None:
@@ -1146,6 +1170,38 @@ def site_branch(index: Index, name: str) -> bool:
     return False
 
 
+# Words that describe a product rather than name it. "special" is plain English in "a special mortgage rate" unless the
+# site sells specials of that kind; "regular" means "the standard one" in "the regular 17-month special".
+ADJECTIVES = {"special", "promotional", "promo", "limited", "featured", "current", "latest", "new"}
+OFFER_WORDS = {"special", "promotional", "promo", "limited", "featured"}       # one family: a row with any carries them all
+SPECIAL_ASKED = re.compile(r"\b(?:special|promo\w*)\b", re.I)
+NOT_SPECIAL = re.compile(r"\bnot\s+(?:the\s+)?(?:special|promo\w*)", re.I)
+
+
+def drop_describing_words(index: Index, q: Query) -> set:
+    """The question's descriptors without the ones that only describe. An adjective goes when no row of the asked kind
+    carries it (or its family) at any term; so "a 6-month special certificate" still declines where the site has
+    specials of other terms. A plain word ("regular") goes when a special is asked for and a special row that agrees
+    with the asked term, year and amount lacks it."""
+    desc = set(q.descriptors)
+    if q.attribute != "rate" or not desc or not q.category:
+        return desc
+    kind = [{pos for pos, _ in index.postings.get(_stem(w), [])} for w in q.category]
+    rows = [(c, c.index_text.lower()) for pos in set.intersection(*kind) if (c := index.chunks[pos]).is_row]
+    if not rows:
+        return desc
+    carries = lambda low, d: d in low or any(x in low for x in SYNONYMS.get(d, ()))
+    special = SPECIAL_ASKED.search(q.raw) and not NOT_SPECIAL.search(q.raw)
+    agreeing = [low for c, low in rows if re.search(r"special|promo", low) and qualify(c, q)[0] != "mismatch"] if special else []
+    drop = set()
+    for d in desc:
+        if d in ADJECTIVES and not any(carries(low, w) for _, low in rows for w in (OFFER_WORDS if d in OFFER_WORDS else {d})):
+            drop.add(d)
+        if d in PLAIN_DESCRIPTORS and agreeing and not any(carries(low, d) for low in agreeing):
+            drop.add(d)
+    return desc - drop
+
+
 def select(index: Index, q: Query, k: int = 8) -> Evidence:
     view = index.view
     if q.soft_hours:
@@ -1157,6 +1213,7 @@ def select(index: Index, q: Query, k: int = 8) -> Evidence:
             q.attribute, q.qualifiers = q.read_as
             q.places, q.compare, q.need_schedule, q.soft_hours = [], False, False, False
             q.tokens = [t for t in q.tokens if t != "hour"]
+    q.descriptors = drop_describing_words(index, q)
     # A product word the site never uses ("share certificate") is a synonym, not a requirement.
     q.descriptors = {d for d in q.descriptors if _stem(d) in index.postings}
     if q.category and q.descriptors & PLAIN_DESCRIPTORS:

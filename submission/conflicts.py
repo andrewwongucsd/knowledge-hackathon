@@ -1,12 +1,16 @@
 """Find places where the current website contradicts itself, and pick the winner.
 
 Scope: the newest view (the site as it stands now, including stale copies that are still served).
-Two kinds of contradiction are reported:
+Four kinds of contradiction are reported:
 
   * Rate tables: the same product, term and tier (and an overlapping model-year range) priced
     differently on two pages, e.g. a calculator still showing last year's auto-loan rates.
   * Repeated statements: a fact the site repeats on several pages ("... N offices", "the Nth
     time <an organisation> recognized ...") that differs between pages.
+  * An offer that has ended: a page that now says "this offer has ended" while another live page
+    still advertises what the ended page used to say.
+  * An article's rate: a press release or blog quoting an APR or APY that differs from the rate
+    table row of the same product.
 
 Different tiers, rate vs APY, standard vs jumbo, and personal vs business are different facts,
 never conflicts. The winner is the newest dated statement, then a page re-fetched in the latest
@@ -18,8 +22,8 @@ import re
 from collections import Counter, defaultdict
 
 from ingest import KIND_RANK, STATUS_RANK, View
-from retrieve import (STOP, TERM_RE, YEAR_RANGE_RE, _pct_values, _stem, _value_kind, amount_ranges,
-                      model_year_ranges, recency)
+from retrieve import (GENERIC, SITE_WORDS, STOP, TERM_RE, YEAR_RANGE_RE, _pct_values, _stem, _value_kind, amount_ranges,
+                      model_year_ranges, recency, tokenize)
 
 QUALIFIER_WORDS = {"traditional", "roth", "ira", "certificate", "account", "share"}
 ORDINALS = "first second third fourth fifth sixth seventh eighth ninth tenth".split()
@@ -263,11 +267,153 @@ def statement_conflicts(view: View) -> list[dict]:
     return out
 
 
-def find_conflicts(view: View) -> list[dict]:
+# A page that is now only a notice that an offer ended ("Sorry ... this offer has ended."), and what it used to say.
+ENDED_RE = re.compile(r"\b(?:this\s+offer\s+(?:has\s+)?(?:ended|expired)|offer\s+(?:has\s+)?(?:ended|expired)|"
+                      r"promotion\s+(?:has\s+)?(?:ended|expired)|no\s+longer\s+available)\b", re.I)
+ENDED_PAGE_CHARS = 2500          # a notice, not a page that mentions an ended offer
+MIN_SHARED, MIN_SHARE = 12, 0.25   # distinctive sentences a live page repeats from the ended page: at least this many, and share
+MAX_COPIES = 3                   # a sentence on more live pages than this is boilerplate (a footer, a disclosure)
+CLAIM_RE = re.compile(r"\d+(?:\.\d+)?\s?%|\$\s?\d{1,3}(?:,\d{3})*(?:\.\d\d)?")
+
+
+def _page_text(page) -> str:
+    return "\n".join(f"{c.section}\n{c.text}" for c in page.chunks) + "\n" + (page.title or "")
+
+
+def _is_ended_notice(page) -> bool:
+    text = _page_text(page)
+    return len(text) < ENDED_PAGE_CHARS and ENDED_RE.search(text) is not None
+
+
+def _distinctive_sentences(page) -> dict:
+    """lower-case sentence -> the sentence, for the prose sentences of 8 or more words (links and footnote marks out)."""
+    out = {}
+    for c in page.chunks:
+        if c.is_row:
+            continue
+        for sent in re.split(r"(?<=[.!?])\s+|\n", c.text):
+            n = re.sub(r"\s+", " ", re.sub(r"\([^)]*\)", "", sent)).strip(" -*_")
+            if len(n.split()) >= 8:
+                out[n.lower()] = n
+    return out
+
+
+def ended_offer_conflicts(view: View, earlier: list) -> list[dict]:
+    """An ended-offer notice whose earlier version was a real offer, and another live page that still repeats most of
+    that offer's distinctive sentences: the live page advertises what the site says is over."""
+    live = {k: _distinctive_sentences(vp.page) for k, vp in view.pages.items()
+            if vp.status != "missing" and not _is_ended_notice(vp.page)}
+    spread = Counter(s for sentences in live.values() for s in sentences)
+    out = []
+    for key, vp in view.pages.items():
+        if vp.status == "missing" or not _is_ended_notice(vp.page):
+            continue
+        offer, since = None, view.taken_on
+        for older in reversed(earlier):                 # back to the last version that was a real offer
+            p = older.pages.get(key)
+            if p is None or p.status == "missing":
+                continue
+            if _is_ended_notice(p.page):
+                since = older.taken_on
+            else:
+                offer = p
+                break
+        if offer is None:
+            continue
+        was = _distinctive_sentences(offer.page)
+        copies = []
+        for lk, sentences in live.items():
+            shared = [was[s] for s in was if s in sentences and spread[s] <= MAX_COPIES]
+            if len(shared) >= max(MIN_SHARED, MIN_SHARE * len(was)):
+                copies.append((lk, shared))
+        if not copies:
+            continue
+        shared = list(dict.fromkeys(s for _, sh in copies for s in sh))
+        claims = [s for s in shared if CLAIM_RE.search(s)]
+        values = list(dict.fromkeys(m.replace(" ", "") for s in claims[:3] for m in CLAIM_RE.findall(s)))[:4]
+        names = Counter(m.group(0) for s in shared for m in re.finditer(r"\b(?:[A-Z][a-z]+\s+){1,3}[A-Z][a-z]+\b", s)
+                        if not {w.lower() for w in m.group(0).split()} & SITE_WORDS)
+        name = next((n for n, k in names.most_common(1) if k >= 3), "")
+        headline = (claims or shared)[0][:130]
+        out.append({
+            "topic": f"{name + ': ' if name else ''}offer ended but still advertised ({headline})",
+            "values": values + ["offer has ended"],
+            "sources": [(view.pages[lk].page.url, view.pages[lk].snapshot_id) for lk, _ in copies]
+                       + [(vp.page.url, vp.snapshot_id)],
+            "resolution": "The offer has ended (expired) and is no longer available",
+            "reason": f"{vp.page.url} has said the offer has ended since {since.isoformat()}; "
+                      f"{', '.join(view.pages[lk].page.url for lk, _ in copies)} still advertise(s) it",
+            "_strength": 2,
+        })
+    return out
+
+
+# "...a special rate of 5.210% APR", "...as low as 4.967% APR": a rate an article quotes for a product that has a row
+# in a rate table, where the row's rate of that kind is another number.
+ARTICLE_RATE_RE = re.compile(r"(\d+(?:\.\d+)?)\s*%\*?\s*(APR|APY)|(APR|APY)\s*(?:of|is|:)?\s*(\d+(?:\.\d+)?)\s*%", re.I)
+
+
+def _distinctive(text: str) -> set:
+    return {t for t in tokenize(text) if t not in STOP and t not in GENERIC and not t.isdigit() and len(t) > 2}
+
+
+def article_rate_conflicts(view: View) -> list[dict]:
+    """An article sentence quoting an APR or APY that shares at least three distinctive words (and half the label) with a
+    table row's product name, where the row's rate of that kind differs. The table is the current official rate."""
+    rows = []
+    for key, vp in view.pages.items():
+        if vp.status == "missing" or vp.page.kind == "article":
+            continue
+        for c in vp.page.chunks:
+            label = _distinctive(c.label()) if c.is_row else set()
+            if len(label) < 2:
+                continue
+            kinds: dict = {}
+            for header, value in c.values():
+                for m in re.finditer(r"(\d+(?:\.\d+)?)\s*%", value):
+                    kind = ("apr" if re.search(r"apr|annual percentage rate", header, re.I)
+                            else "apy" if re.search(r"apy|yield", header, re.I) else "rate")
+                    kinds.setdefault(kind, {})[float(m.group(1))] = m.group(0).replace(" ", "")
+            rows.append((key, c, label, kinds))
+    found: dict = {}
+    for key, vp in view.pages.items():
+        if vp.status == "missing" or vp.page.kind != "article":
+            continue
+        for c in vp.page.chunks:
+            if c.is_row:
+                continue
+            for sent in re.split(r"(?<=[.!?])\s+|\n", c.text):
+                for m in ARTICLE_RATE_RE.finditer(sent):
+                    value, kind = m.group(1) or m.group(4), (m.group(2) or m.group(3)).lower()
+                    words = _distinctive(sent)
+                    for rkey, rc, label, kinds in rows:
+                        same = label & words
+                        if len(same) >= 3 and len(same) / len(label) >= 0.5 and kind in kinds and float(value) not in kinds[kind]:
+                            g = found.setdefault((rkey, rc.label()), {"kind": kind, "table": kinds[kind], "says": {}, "from": []})
+                            g["says"][float(value)] = re.search(r"\d+(?:\.\d+)?", sent[m.start():m.end()]).group(0) + "%"
+                            g["from"].append((vp.page.url, vp.snapshot_id))
+    out = []
+    for (rkey, label), g in found.items():
+        table = next(iter(g["table"].values()))
+        rp = view.pages[rkey]
+        out.append({
+            "topic": f"{re.sub(r'[*]+', '', label.split(' | ')[0]).strip()} {g['kind'].upper()}",
+            "values": [table] + list(g["says"].values()),
+            "sources": [(rp.page.url, rp.snapshot_id)] + list(dict.fromkeys(g["from"])),
+            "resolution": table,
+            "reason": f"the rate table on {rp.page.url} is the current official rate; articles quote older or different values",
+            "_strength": 1,
+        })
+    return out
+
+
+def find_conflicts(view: View, earlier: list = ()) -> list[dict]:
     """Deterministic, no LLM. An LLM reviewer was tried and removed: it treated old statements still
     published on the site as "a different time period" and dropped them, but those stale statements
-    are exactly what this method is meant to report (see NOTES.md)."""
-    found = table_conflicts(view) + statement_conflicts(view)
+    are exactly what this method is meant to report (see NOTES.md). `earlier`: the previous views,
+    oldest first (an ended offer is known from what its page said before)."""
+    found = (table_conflicts(view) + statement_conflicts(view) + article_rate_conflicts(view)
+             + ended_offer_conflicts(view, list(earlier)))
     # Most certain first, then the most specific (fewest values): the scorer matches greedily, so a
     # broad entry listed early could take a key entry meant for a narrower one.
     found.sort(key=lambda f: (-f["_strength"], len(f["values"])))
@@ -277,9 +423,13 @@ def find_conflicts(view: View) -> list[dict]:
         phrases, streaks = f.pop("_phrases", {}), f.pop("_streaks", [])
         short = _short_count if f.pop("_count", False) else (lambda v: v)   # "8 offices (8 office locations)"
         f["values"] = [with_phrases(short(v), phrases.get(v)) for v in f["values"]]
-        f["values"] += [s for s in streaks if s.split()[0] not in phrases]         # "third (For a third year in a row, ...)"
+        streak_values = [s for s in streaks if s.split()[0] not in phrases]        # "third (For a third year in a row, ...)"
         f["resolution"] = with_phrases(short(f["resolution"]), phrases.get(f["resolution"]))
         out.append(f)
+        if streak_values:
+            # "the Nth time" on one page against "the Nth year in a row" on the same page is a second contradiction, apart
+            # from the pages that give another count: one entry can match only one key entry
+            out.append({**f, "topic": f"{f['topic']} (a streak claim)", "values": [f["resolution"]] + streak_values})
     # The same stale copy behind two product lines (purchase and refinance tables) is one contradiction:
     # one entry, both topics, so whichever wording a reader uses finds it.
     merged: dict = {}
