@@ -99,11 +99,23 @@ OPTIONS_Q = re.compile(r"\boptions\b", re.I)
 PRODUCT_HEADS = r"loans?|mortgages?|certificates?|cds?|accounts?|cards?|savings|checking|visa|mastercard|discover|amex|heloc|line"
 
 RATE_Q = re.compile(r"\b(rates?|apr|apy|interest|dividends?|yield)\b", re.I)
-# "what does a savings account pay?" asks about a rate without the word (never "…pay in fees")
-DEPOSIT_PAYS = re.compile(r"\bwhat\s+(?:does|did|do|will|would)\s+(?:a|an|the|my|your)?\s*(?:[\w-]+\s+){0,3}"
-                          r"(?:savings|checking|certificates?|cds?|money\s+market|accounts?)\s+(?:account\s+)?(?:pay|earn|yield)s?\b|"
-                          r"\bwhat\s+(?:is|was|are|were)\s+(?:a|an|the|my|your)?\s*(?:[\w-]+\s+){0,4}"
-                          r"(?:savings|checking|certificates?|cds?|money\s+market|accounts?|specials?)\s+(?:paying|earning|yielding)\b", re.I)
+# "what does a savings account pay?" / "how much does a 1-year certificate earn?" asks about a rate without the word
+# (never "…pay for", "…pay in fees")
+_DEPOSIT = r"(?:savings|checking|certificates?|cds?|money\s+market|accounts?|specials?|shares?|hsas?|iras?)"
+_NOT_PAY_FOR = r"(?!\s+(?:for|out|off|back)\b)"
+DEPOSIT_PAYS = re.compile(rf"\b(?:what|how\s+much)\s+(?:does|did|do|will|would|could|can)\s+(?:a|an|the|my|your|our)?\s*(?:[\w-]+\s+){{0,4}}?"
+                          rf"{_DEPOSIT}\s+(?:account\s+)?(?:pay|earn|yield)s?\b{_NOT_PAY_FOR}|"
+                          rf"\bwhat\s+(?:is|was|are|were)\s+(?:a|an|the|my|your)?\s*(?:[\w-]+\s+){{0,4}}{_DEPOSIT}\s+(?:paying|earning|yielding)\b", re.I)
+# ...or refers back to a deposit product named elsewhere in the question ("a 2-year CD — what does it earn?")
+VALUE_BACKREF = re.compile(rf"\b(?:what|how\s+much)\s+(?:does|did|do|will|would|could|can)\s+(?:it|that|this|they)\s+(?:pay|earn|yield)\b{_NOT_PAY_FOR}|"
+                           r"\bwhat(?:['’]s|\s+is|\s+are|\s+was)\s+(?:it|that|this|they)\s+(?:paying|earning|yielding)\b|"
+                           r"\b(?:what|how\s+much)\s+(?:\w+\s+){0,3}(?:would|will|could|can|do|did|should)\s+(?:i|we)\s+earn\b", re.I)
+DEPOSIT_NAMED = re.compile(r"\b(?:savings|checking|certificates?|cds?|money\s+market|hsas?|iras?)\b", re.I)
+FEE_WORD = re.compile(r"\b(?:fees?|costs?|charges?|charged|price)\b", re.I)
+# a rate question naming no product line but a vehicle is about a loan on it; never one about saving
+DEPOSIT_CUE = re.compile(r"\b(?:apy|dividends?|sav(?:e|es|ing|ings)|certificates?|cds?|deposits?|money\s+market|hsas?|iras?)\b", re.I)
+VEHICLE = re.compile(r"\b(cars?|vehicles?|trucks?|pickups?|suvs?|vans?|motorcycles?|boats?)\b", re.I)
+RV = re.compile(r"\b(?:rvs?|recreational\s+vehicles?|campers?|motor\s*homes?)\b", re.I)
 # "does any savings tier pay 0.45%?" asks about a rate without the word (cash back and points are not rates)
 PLAIN_DESCRIPTORS = {"regular", "basic", "standard", "plain", "normal", "ordinary", "simple", "everyday", "share", "personal"}
 PCT_PAID = re.compile(r"\b(?:pay|pays|paying|paid|earn|earns|earning)\s+(?:a\s+|an\s+)?\d+(?:\.\d+)?\s*(?:%|percent\b)"
@@ -144,7 +156,9 @@ PLACE_WORDS = re.compile(r"\b(?:branch|branches|location|locations|office|office
 ADDRESS_EV = re.compile(r"\b\d{2,6}\s+(?:[A-Z][\w.'’-]*\s+){1,4}(?:St|Street|Ln|Lane|Ave|Avenue|Dr|Drive|Rd|Road|"
                         r"Blvd|Way|Ct|Pl|Pkwy|Hwy|Highway|Square)\b\.?")
 DATE_EV = re.compile(rf"\b(?:{MONTH_RE})\s+\d{{1,2}},\s+20\d\d\b")
-FEE_EV = re.compile(r"\$\s?\d")
+# a fee is a dollar amount or a share of the amount ("1% of Amount", "5% of total for non-members")
+PCT_OF = r"\d+(?:\.\d+)?\s?%\*?\s+of\s+(?:the\s+|each\s+)?(?:[Aa]mount|[Tt]otal|[Tt]ransaction|[Pp]urchase|[Bb]alance|[Aa]dvance)s?\b"
+FEE_EV = re.compile(rf"\$\s?\d|{PCT_OF}")
 HOURS_EV = re.compile(r"\b\d{1,2}(?::\d{2})?\s*[ap]\.?\s?m\b|\bnoon\b", re.I)
 TERM_RE = re.compile(r"\b(\d{1,3})\s*-?\s*(month|mo|year|yr)s?\b", re.I)
 
@@ -344,6 +358,7 @@ class Query:
 
 
 def parse_query(question: str) -> Query:
+    question = written_amounts(question)  # "15k", "fifteen thousand dollars", "between 10k and 25k": dollar amounts
     raw = question                       # the model still sees the member's own words
     if RATE_Q.search(question) and ARM_RE.search(question):
         question = ARM_RE.sub("adjustable-rate mortgage", question)
@@ -378,7 +393,7 @@ def parse_query(question: str) -> Query:
     pinned = product_text == head and terms_in(head)          # a term in the question itself is never overridden
     q.terms = terms_in(head) if pinned else terms_in(head if context else low)
     q.native_terms = native_terms(head) if pinned else native_terms(head if context else low)
-    if re.search(r"model|vehicle|\bcar\b|truck", low):     # model years only, never "as of March 2031"
+    if re.search(r"model|vehicle|\bcar\b|truck|pickup|\bsuv|\bvan\b|motorcycle", low):   # model years only, never "as of March 2031"
         q.years = {int(m.group(1)) for m in re.finditer(r"\b((?:19|20)\d\d)\b", norm)
                    if not re.search(rf"(?:{MONTH_RE})\s*(?:\d{{1,2}}(?:st|nd|rd|th)?,?\s*)?$", norm[:m.start()])}
     if q.years and tail.strip():
@@ -399,7 +414,9 @@ def parse_query(question: str) -> Query:
     q.excluded -= q.qualifiers          # a line named elsewhere without a negation is still asked about
     if m := COUNT_Q.search(low):
         q.attribute, q.count_noun = "count", _stem(m.group(1))
-    elif RATE_Q.search(low) or PCT_PAID.search(low) or (DEPOSIT_PAYS.search(low) and not FEE_Q.search(low)):
+    elif RATE_Q.search(low) or PCT_PAID.search(low) or (DEPOSIT_PAYS.search(low) and not FEE_Q.search(low)) \
+            or ((DEPOSIT_PAYS.search(head) or (VALUE_BACKREF.search(head) and DEPOSIT_NAMED.search(head)))
+                and not FEE_WORD.search(head)):         # what a deposit pays or earns, even "how much does … pay"
         q.attribute = "rate"
     elif FEE_Q.search(low):
         q.attribute = "fee"
@@ -430,7 +447,9 @@ def parse_query(question: str) -> Query:
         q.entity_is_branch = q.entity is not None
     if not q.entity and PROPER_NAMES:          # "the elmwood branch / location / office", any case
         m = re.search(r"((?:[a-z][\w'’-]*\s+){1,3})(?:branch|location|office)\b", question.lower())
-        name = next((w for w in m.group(1).split() if w in PROPER_NAMES), None) if m else None
+        # the site's own name, possessive or not, is never a branch ("<Name>'s branch lobby hours")
+        name = next((w for w in m.group(1).split() if w in PROPER_NAMES
+                     and re.sub(r"['’]s$", "", w) not in BRANCH_NOT_NAMES), None) if m else None
         if name:
             q.entity, q.entity_is_branch = name, True
     if not q.entity and q.attribute in ("rate", "fee") and (m := PLACE_NAMED.search(question)) \
@@ -440,7 +459,8 @@ def parse_query(question: str) -> Query:
         q.attribute, q.count_noun = "count", _stem(m.group(1))
         q.tokens = [t for t in q.tokens if t not in ("number", "total")]
     # a named branch ("the elm-street branch", any case) keeps its own question type: "what time does it close?"
-    named = [w for w in re.findall(r"\b([a-z][\w'’-]*)\s+branch\b", low) if w not in BRANCH_NOT_NAMES | STOP]
+    named = [w for w in re.findall(r"\b([a-z][\w'’-]*)\s+branch\b", low)
+             if re.sub(r"['’]s$", "", w) not in BRANCH_NOT_NAMES | STOP]
     if q.attribute in (None, "when") and not q.entity and not named and HOURS_CUE.search(low):
         q.attribute = "hours"
         if "hour" not in q.tokens:
@@ -473,7 +493,63 @@ def parse_query(question: str) -> Query:
     if q.rate_kind and not q.category and MONEY_MARKET.search(low):
         # an intro or special rate on "the money market": that account is the product asked about
         q.category, q.descriptors = {"market"}, set(q.descriptors) | {"money"}
+    if q.attribute == "rate":
+        # "what does savings pay / earn": the verb asks for the rate, it names nothing to search for
+        q.tokens = list(dict.fromkeys(_stem("rate") if t in VALUE_VERB_STEMS else t for t in q.tokens))
+        if not q.category and not DEPOSIT_CUE.search(head):
+            # "finance a 2030 car for 7 years": a loan on that vehicle (an RV, camper or motorhome is an RV loan)
+            if RV.search(head):
+                q.category.add("loan")
+                q.descriptors = set(q.descriptors) | {"rv"}
+            elif v := VEHICLE.search(head):
+                word = v.group(1).lower()
+                word = word[:-1] if word.endswith("s") else word
+                q.category.add("loan")
+                q.descriptors = set(q.descriptors) | {word} | ({"vehicle"} if word in ("car", "vehicle", "truck", "pickup", "suv", "van") else set())
+    if q.attribute == "fee":
+        for t in list(q.tokens):                        # "overdraw" is searched as "overdraft" too
+            q.tokens += [x for x in FEE_SYN.get(t, []) if x not in q.tokens]
+        q.descriptors = {d for d in q.descriptors if _stem(d.lower()) not in HAPPENED}   # "a lost card": no product
     return q
+
+
+# Amounts written out: "15k", "15 thousand", "fifteen thousand dollars", "five grand", "7,500 dollars" (never "401k");
+# a range is one interval whose round upper bound is exclusive ("between $20,000 and $50,000" is the tier that ends below
+# $50,000; "20 to 50k" carries the unit to the bare small number). Plain numbers ("12 to 24 months") are no range.
+_AMT_N = r"(\d[\d,]*(?:\.\d+)?)"
+_THOUSAND = r"([kK]\b|\s*thousand\b)?"
+RANGE_Q = re.compile(rf"\bbetween\s+\$?{_AMT_N}\s*{_THOUSAND}\s+(?:and|to)\s+\$?{_AMT_N}\s*{_THOUSAND}(\s+dollars?\b)?|"
+                     rf"(\$)?{_AMT_N}\s*{_THOUSAND}\s*(?:-|–|\bto\b)\s*(\$)?{_AMT_N}\s*{_THOUSAND}(\s+dollars?\b)?", re.I)
+BARE_AMT = re.compile(r"(?<![$\d.,])\b(\d{1,3}(?:,\d{3})*(?:\.\d+)?)(?:\s?([kK])\b|\s?(thousand|grand)\b(?:\s+dollars?\b)?|"
+                      r"(?=\s*(?:dollars?|bucks)\b))", re.I)
+RETIREMENT_PLANS = ("401", "403", "457")
+
+
+def _range(m) -> str:
+    if m.group(1):
+        a, ka, b, kb = m.group(1), m.group(2), m.group(3), m.group(4)
+    else:
+        a, ka, b, kb = m.group(7), m.group(8), m.group(10), m.group(11)
+        if not (m.group(6) or m.group(9) or ka or kb or m.group(12)):
+            return m.group(0)
+    lo = _f(a) * (1000 if ka or (kb and _f(a) < 1000) else 1)
+    hi = _f(b) * (1000 if kb or (ka and _f(b) < 1000) else 1)
+    if hi <= lo:
+        return m.group(0)
+    if hi % 1000 == 0:
+        hi -= 0.01
+    return f"between ${lo:,.2f} and ${hi:,.2f}"
+
+
+def _bare_amount(m) -> str:
+    if (m.group(2) or m.group(3)) and m.group(1) in RETIREMENT_PLANS:
+        return m.group(0)
+    return f"${m.group(1)}k" if (m.group(2) or m.group(3)) else f"${m.group(1)}"
+
+
+def written_amounts(question: str) -> str:
+    text = normalize_numbers(question) if re.search(r"\b(?:thousand|grand)\b", question, re.I) else question
+    return BARE_AMT.sub(_bare_amount, RANGE_Q.sub(_range, text))
 
 
 def count_re(noun: str):
@@ -573,8 +649,14 @@ def supports(c: Chunk, q: Query) -> bool:
         have = c.tf if c.tf else Counter(tokenize(c.index_text))
         if not all(any(w in have for w in alts) for alts in q.subject):
             return False
+        # a state word ("lost") and the thing it happened to ("money order") on one fee item's own label
+        on_label = [a for a in q.subject if ON_LABEL in a or set(a) & HAPPENED]
+        if q.attribute == "fee" and on_label and not fee_evidence(c, q, on_label):
+            return False
     if q.attribute == "fee" and (WIRE.search(q.raw) or SEND_Q.search(q.raw)):
         way = wire_direction(q.raw)
+        if way == "abroad" and re.search(r"\bdomestic\b", text):
+            return False                # a wire sent abroad is never the domestic fee
         if way in ("out", "abroad") and re.search(r"\bincoming\b", text):
             return False                # sending a wire is never the incoming fee
         if way == "in" and WIRE.search(q.raw) and not re.search(r"\b(?:incoming|inbound|receiv\w*)\b", text):
@@ -599,8 +681,9 @@ def supports(c: Chunk, q: Query) -> bool:
         return bool(ADDRESS_EV.search(c.text))
     if q.attribute == "when":
         return bool(DATE_EV.search(c.text))
-    if q.attribute == "fee":            # like rates: fees are published in fee schedules and product
-        return c.kind != "article" and bool(FEE_EV.search(c.text))   # pages, not blog posts
+    if q.attribute == "fee":            # like rates: fees are published in fee schedules and product pages, not
+        # blog posts; a fee item, never a rate row's balance tier nor a threshold ("less than $5") unless one is asked
+        return c.kind != "article" and not rate_row(c) and fee_evidence(c, q)
     if q.attribute == "hours":
         return bool(HOURS_EV.search(c.text))
     return True
@@ -1040,8 +1123,12 @@ RECIPIENT = re.compile(r"\bto\s+(?:(?:a|an|the|my|his|her|their|our|your|someone
                        r"[A-Z][\w'’-]*(?:\s+[A-Z][\w'’-]*)*)")
 RECEIVE_Q = re.compile(r"\b(?:receiv\w*|incoming|inbound)\b", re.I)
 # Which way a wire goes (wire_direction). Several kinds asked about together are all answered.
-_WIRE_KIND = r"(?:incoming|inbound|outgoing|domestic|international|send(?:ing)?|receiv(?:e|ing))"
-WIRE_ALL = re.compile(rf"\b{_WIRE_KIND}\b\s*(?:,|/|\band\b|\bor\b|\bvs\.?|\bversus\b)\s*(?:\w+\s+)?{_WIRE_KIND}\b|"
+# two kinds asked together or compared: "domestic and international", "higher than domestic", "domestically versus
+# internationally", "an international wire? And a domestic one?"
+_WIRE_KIND = r"(?:incoming|inbound|outgoing|domestic(?:ally)?|international(?:ly)?|abroad|overseas|send(?:ing)?|receiv(?:e|ing))"
+WIRE_ALL = re.compile(rf"\b{_WIRE_KIND}\b(?:\s+[\w'’-]+){{0,4}}?\s*(?:,|/|\band\b|\bor\b|\bvs\.?|\bversus\b|\bthan\b|"
+                      rf"\bcompared\s+(?:to|with)\b|[?.]\s*(?:and|also|what\s+about|how\s+about)\b)"
+                      rf"\s*(?:(?:a|an|the|for|to|with)\s+)?(?:\w+\s+)?{_WIRE_KIND}\b|"
                       r"\bwire(?:\s+transfer)?\s+fees\b|\bfees\s+(?:for|on)\s+(?:\w+\s+)?wires\b", re.I)
 WIRE_IN = re.compile(r"\b(?:receiv\w*|incoming|inbound|coming\s+in|(?:wire[sd]?|wiring|send(?:s|ing)?|sent)\s+(?:me|us)|"
                      r"(?:get|gets|getting|got|deposit\w*)\s+(?:a|an|the)\s+(?:\w+\s+)?wire)\b", re.I)
@@ -1065,54 +1152,173 @@ CHAT_FILLERS = {_stem(w) for w in ("pls", "plz", "thx", "thanks", "thank", "ty",
 # who ("someone who isn't a member") and how soon ("a debit card fast") are never what a fee is charged for
 NOT_FEE_SUBJECT = {_stem(w) for w in ("someone", "somebody", "anyone", "anybody", "everyone", "everybody", "person",
                                       "people", "fast", "quick", "quickly", "soon", "urgent", "urgently", "immediately",
-                                      "yesterday", "today", "tonight", "tomorrow", "recently", "earlier", "already")}
+                                      "yesterday", "today", "tonight", "tomorrow", "recently", "earlier", "already",
+                                      "ago", "few", "couple", "several", "later", "last", "next", "week", "weeks", "day",
+                                      "days", "hi", "hello", "hey", "howdy")}
+# words that never say what a fee is for, nor name one
+FUNCTION_WORDS = {_stem(w) for w in ("after", "before", "during", "until", "since", "while", "because", "if", "when",
+                                     "then", "also", "just", "only", "even", "about", "around", "per", "each", "every",
+                                     "both", "either", "neither", "some", "more", "most", "less", "least", "other",
+                                     "another", "same", "such", "than", "very", "really", "into", "onto", "over",
+                                     "under", "up", "down", "out", "off", "again", "once")}
+QUIET = STOP | GENERIC | FEE_WORDS | CHAT_FILLERS | SEND_WORDS | NOT_FEE_SUBJECT | FUNCTION_WORDS \
+    | {_stem(w) for w in ("will", "shall", "might", "must", "may", "she", "he", "him", "her", "ones")}
+# never what a fee is charged for, however rarely the site writes them ("if", "will", "under")
+NEVER_SUBJECT = FUNCTION_WORDS | {_stem(w) for w in ("will", "shall", "might", "must", "may", "ones")}
 # A relative clause after the thing a fee is asked about ("a check I wrote", "a check my wife wrote", "the card I've
-# used"): its verb, and its subject noun, say what was done with it. They are not required fee words unless the site
-# states a fee next to them ("…lost key $100": "a debit card I lost" still needs a fee for a lost card).
+# used"), a passive one ("a check written by me") or one without a subject ("a check that bounced"): its verb, and
+# its subject noun, say what was done with it (see rare_subject). The noun is never a function word ("a fee if I lose").
 REL_CLAUSE = re.compile(r"\b(?:a|an|the|this|that|my|your|our|his|her|their)\s+(?:[a-z][\w'’-]*\s+){0,2}?([a-z]+)\s+"
                         r"(?:that\s+|which\s+)?(?:(?:i|we|you|he|she|they)(?:['’](?:ve|d|ll))?|(?:my|our|his|her|their)\s+([a-z]+))\s+"
                         r"(?!(?:can|could|would|should|will|do|does|did|am|is|are|was|were|have|has|had|need|want|wants|might|"
                         r"must|may|plan|hope|get|got)\b)([a-z]+)\b", re.I)
+PASSIVE_BY = re.compile(r"\b(?:a|an|the|this|that|my|your|our|his|her|their)\s+(?:[a-z][\w'’-]*\s+){0,2}?([a-z]+)\s+"
+                        r"(?:that\s+(?:was|were|is|has\s+been)\s+)?([a-z]+)\s+by\s+((?:me|us|you|him|her|them)\b|"
+                        r"(?:my|our|his|her|their|your|a|an|the)\s+[a-z]+)", re.I)
+THAT_VERB = re.compile(r"\b(?:a|an|the|this|my|your|our|his|her|their)\s+(?:[a-z][\w'’-]*\s+){0,2}?([a-z]+)\s+(?:that|which)\s+"
+                       r"(?:(?:was|were|got|gets|is|are|has\s+been|have\s+been)\s+)?(?!(?:can|could|would|should|will|do|does|did|"
+                       r"am|is|are|was|were|have|has|had|need|needs|want|wants|might|must|may|i|we|you|he|she|they|my|our|"
+                       r"his|her|their)\b)([a-z]+)\b", re.I)
+NOT_HEAD = STOP | {"if", "when", "whenever", "because", "since", "so", "and", "or", "but", "then", "after", "before",
+                   "while", "unless", "until", "once", "though", "although", "where"}
 TIME_NOUNS = {"time", "times", "day", "days", "moment", "way", "week", "month", "year", "night", "morning"}
+# What happened to the thing ("a lost card", "a check that bounced", "my wallet was stolen"): a different service from
+# the thing's own fee, so the fee item must say it too (see rare_subject)
+HAPPENED = {_stem(w) for w in ("lost", "lose", "loses", "losing", "stolen", "stole", "bounced", "bounce", "bounces",
+                               "bouncing", "returned", "damaged", "forged", "expired")}
+_NP_WORDS = r"((?:(?!(?:and|or|but|so|if|when|to|for|on|in|at|with|from|after|before|because|while|how|what|is|was|are|" \
+            r"were)\b)[a-z][\w'’-]*\s*){1,5})"
+HAPPENED_ADJ = re.compile(r"\b(lost|lose|loses|losing|stolen|stole|bounced|bounce|bounces|bouncing|returned|damaged|forged|"
+                          r"expired)\s+" + _NP_WORDS, re.I)
+# Who and why: a person after a determiner ("my son", "a friend"), a who-clause ("my sister, who lives in …"), a purpose
+# phrase after the thing ("a cashier's check for his apartment deposit")
+PERSON = {_stem(w) for w in """son sons daughter daughters child children kid kids sister sisters brother brothers sibling
+siblings mother mom mum father dad parent parents wife husband spouse partner fiance fiancee boyfriend girlfriend grandson
+granddaughter grandchild grandchildren grandmother grandfather grandma grandpa grandparent grandparents aunt uncle cousin
+cousins nephew niece friend friends roommate neighbor neighbour tenant tenants landlord landlady contractor employer
+employee boss coworker colleague client customer family relative relatives caregiver babysitter nanny""".split()}
+PERSON_AFTER = re.compile(r"\b(?:my|your|his|her|our|their|a|an)\s+([a-z]+)(?:\s+([a-z]+))?", re.I)
+WHO_CLAUSE = re.compile(r"\b[a-z]+,?\s+(?:who|whom|whose)\b([^,.;?!—–]*)", re.I)
+PURPOSE = re.compile(r"\b([a-z][\w'’-]*)\s+for\s+(?:my|your|his|her|our|their|a|an|the)\s+((?:[a-z][\w'’-]*\s*){1,3})", re.I)
+NOT_PURPOSE_HEAD = FEE_WORDS | {_stem(w) for w in ("paid", "much", "is", "are", "was", "there", "it")}
+# Equivalents for fee questions only: what the member says and what a fee schedule writes
+FEE_SYN = {_stem(k): [_stem(x) for x in v] for k, v in {
+    "lose": ["lost"], "loses": ["lost"], "losing": ["lost"], "overdraw": ["overdraft"], "overdraws": ["overdraft"],
+    "overdrawn": ["overdraft"], "overdrew": ["overdraft"], "overdrawing": ["overdraft"], "expedite": ["rush"],
+    "expedited": ["rush"], "expediting": ["rush"], "overnight": ["rush"], "overnighted": ["rush"], "stopping": ["stop"],
+    "stopped": ["stop"], "keyed": ["key"], "bounced": ["returned"], "bounce": ["returned"], "bounces": ["returned"],
+    "bouncing": ["returned"], "notarize": ["notary"], "notarized": ["notary"], "notarizing": ["notary"],
+    "garnished": ["garnishment"], "garnish": ["garnishment"], "levied": ["levy"], "dormant": ["inactive"]}.items()}
+VALUE_VERB_STEMS = {_stem(w) for w in ("pay", "pays", "paying", "paid", "earn", "earns", "earning", "earned", "yield",
+                                       "yields", "yielding")}
+UNPRICED = "\x00unpriced"     # a required word the site prices nothing under: no chunk can carry it
+ON_LABEL = "\x00label"        # a group that must sit on the fee item's own label, with the state word
 QUESTION_START = r"(?:how|what|what['’]?s|when|where|which|who|why|is|are|do|does|did|can|could|will|would|should)\b"
-OPENER = re.compile(rf"^(?:(?:[^?.!:]*[!:]|[^?,]*,|[^?]*?\s[-–—]\s)\s*)+?(?={QUESTION_START})", re.I)
+# a comma before a relative "who" or "which" ("my sister, who lives in …") ends no aside
+_RELATIVE = r"(?:who|whom|whose|which|where|when)\b"
+OPENER = re.compile(rf"^(?:(?:[^?.!:]*[!:]|[^?,]*,(?!\s*{_RELATIVE})|[^?]*?\s[-–—]\s)\s*)+?(?={QUESTION_START})", re.I)
+CLAUSE_SPLIT = re.compile(rf"[;?!]|\.(?=\s+[A-Za-z]{{2,}})|\s[–—]\s|\s-\s(?={QUESTION_START})|"
+                          r",?\s+\b(?:so|and|but|because|if|when|since|then)\b", re.I)
 
 
 def asking_clause(text: str) -> str:
     """The question without a leading greeting or aside ("Hi! Quick question: how many ...", "I was
     wondering, what ..."): openers ending in "!", ":", "," or a spaced dash, up to a question word; and
-    without anything after its last question mark ("... have? Asking for a friend.")."""
-    text = OPENER.sub("", text)
-    asked = re.match(r".*\?", text, re.S)
-    return asked.group(0) if asked else text
+    without anything after its last question mark ("... have? Asking for a friend."). When what is left names
+    nothing ("…, who lives in Germany — what will that cost me?"), it refers back: the whole question is read."""
+    full = re.match(r".*\?", text, re.S)
+    full = full.group(0) if full else text
+    stripped = OPENER.sub("", text)
+    asked = re.match(r".*\?", stripped, re.S)
+    clause = asked.group(0) if asked else stripped
+    if clause != full and not any(t not in QUIET and not t[0].isdigit() for t in tokenize(clause)):
+        return full
+    return clause
 
 
 def rare_subject(index: Index, q: Query) -> list[list[str]]:
     """The specific things a fee or count question is about ("Springfield", "cashier's check"), each with
     its synonyms. A fee line or count that names none of them answers a different question, so the
-    honest answer is "isn't listed". Common words ("lost", "card") are not required."""
+    honest answer is "isn't listed". Common words ("card") are not required; who, why and when never are; what
+    happened to the thing ("lost", "bounced") is, on the same fee item as the thing, unless a specific fee is named
+    elsewhere in the question ("stop payment on a lost check")."""
     limit = RARE_SHARE * max(1, len(index.chunks))
+    full = re.match(r".*\?", q.raw, re.S)
+    full = full.group(0) if full else q.raw
     text = asking_clause(q.raw)                      # a greeting names nothing asked about
+    fee_said = _fee_line_words(index)
+    priced = lambda t: t in fee_said or any(x in fee_said for x in _SYN.get(t, []) + FEE_SYN.get(t, []))
+    clause_words = None                              # the asking clause's own words, when the lead-in is read too
+    if text != full and text in full:
+        if (set(tokenize(full[:full.index(text)])) - QUIET) & fee_said:
+            clause_words, text = set(tokenize(text)), full   # "For a cashier's check, what's the fee…": the topic
+    elif text == full and OPENER.sub("", full) != full:
+        clause_words = set(tokenize(OPENER.sub("", full)))   # "…, who lives in Germany — what will that cost me?"
     # words in parentheses restate the thing ("a teller's check (bank draft)"); a branch the site has doesn't
     # narrow a fee (see select)
     skip = {t for m in re.finditer(r"\(([^)]*)\)", text) for t in tokenize(m.group(1))} | ({_stem(w) for w in (q.place, "branch", "location", "office")} if q.place else set())
-    fee_said = _fee_line_words(index)
-    for m in REL_CLAUSE.finditer(text):
-        if m.group(1).lower() not in TIME_NOUNS:
-            skip |= {_stem(w.lower()) for w in (m.group(2), m.group(3)) if w and _stem(w.lower()) not in fee_said}
+    if clause_words is not None:                     # a lead-in word counts only if the site prices it
+        skip |= {t for t in set(tokenize(full)) - clause_words if not priced(t) and t not in HAPPENED}
+    amounts = _fee_amounts(index)
+    words = lambda s: set(tokenize(s or ""))
+    # a word naming one specific fee: its fee items carry one or two amounts ("stop" -> $30)
+    named = {t for t in tokenize(text) if t not in QUIET and t not in HAPPENED and not t[0].isdigit()
+             and any(1 <= len(amounts.get(x, ())) <= 2 for x in [t] + FEE_SYN.get(t, []))}
+    for m in PERSON_AFTER.finditer(text):           # "my son", "a friend": who, not what
+        for g in (1, 2):
+            if m.group(g) and _stem(m.group(g).lower()) in PERSON:
+                skip.add(_stem(m.group(g).lower()))
+                break
+    for m in WHO_CLAUSE.finditer(text):             # "my sister, who lives in Germany"
+        skip |= words(m.group(1)) - fee_said
+    for m in PURPOSE.finditer(text):                # "a cashier's check for his apartment deposit"
+        if _stem(m.group(1).lower()) not in NOT_PURPOSE_HEAD and m.group(1).lower() not in STOP:
+            skip |= words(m.group(2)) - fee_said
+    covered = set()
+    for pat, groups in ((REL_CLAUSE, (2, 3)), (PASSIVE_BY, (2, 3)), (THAT_VERB, (2,))):
+        for m in pat.finditer(text):
+            if m.group(1).lower() in TIME_NOUNS or m.group(1).lower() in NOT_HEAD:
+                continue
+            np = words(text[m.start():m.end(1)])
+            said = set().union(*(words(m.group(g)) for g in groups))
+            covered |= said & HAPPENED
+            if named - np - said:                    # "stop payment on a check I wrote / that bounced"
+                skip |= said
+            elif np & named:                         # "temporary drafts I wrote" (never "…I lost")
+                skip |= (said - HAPPENED) - fee_said
+    for m in HAPPENED_ADJ.finditer(text):           # "stop payment on a lost check", "drill my box open if I lost the key"
+        np, said = words(m.group(2)), words(m.group(1))
+        if said & covered:
+            continue
+        covered |= said
+        if named - np - said:
+            skip |= said
+    clauses = [set(tokenize(p)) for p in CLAUSE_SPLIT.split(text) if p and p.strip()]
+    for t in set(tokenize(text)) & HAPPENED - covered:
+        elsewhere = set().union(*[c for c in clauses if t not in c])
+        if named & elsewhere:                        # "My wallet was stolen. How much is a rush debit card?"
+            skip.add(t)
     wire = bool(WIRE.search(text))
     if wire:
         recipient = {t for m in RECIPIENT.finditer(text) for t in tokenize(m.group(0))} - {_stem("wire")}
         sent = {_stem("money"), _stem("funds")}                   # what is sent, not what is charged
         skip |= recipient | sent
         q.tokens = [t for t in q.tokens if t not in recipient | sent]
+    fee = q.attribute == "fee"
     out = []
     for t in dict.fromkeys(tokenize(text)):
         if t in GENERIC or t in FEE_WORDS or t in CHAT_FILLERS or t == q.count_noun or t[0].isdigit() or t in SEND_WORDS \
-                or t in skip or (q.attribute == "fee" and t in NOT_FEE_SUBJECT):
+                or t in skip or t in NEVER_SUBJECT or (fee and t in NOT_FEE_SUBJECT):
             continue                                # "send a wire": the fee line says what is sent, not "send"
-        if len(index.postings.get(t, ())) < limit:
-            out.append([t] + _SYN.get(t, []))
+        if len(index.postings.get(t, ())) < limit or (fee and t in HAPPENED):
+            out.append([t] + _SYN.get(t, []) + (FEE_SYN.get(t, []) if fee else []))
+    if fee and any(set(a) & HAPPENED for a in out):
+        # what it happened to ("a lost money order"): on the same fee item as the state word ("lost key" won't do)
+        req = {w for a in out for w in a}
+        things = {t for t in tokenize(text) if t in fee_said and t not in req and t not in skip and t not in QUIET
+                  and not t[0].isdigit()}
+        if things:
+            out.append(sorted(things) + [ON_LABEL])
     if wire:
         # only a word a wire's fee line can say ("international", "incoming") narrows a wire question; the rest
         # ("my brother", "for his wedding", "in Rivertown") is who and why
@@ -1131,6 +1337,12 @@ def rare_subject(index: Index, q: Query) -> list[list[str]]:
             out = [a for a in out if not set(a) & kinds] + [[_stem(w) for w in ("incoming", "inbound", "receive", "receiving")]]
         elif way == "abroad":
             out = [a for a in out if not set(a) & kinds] + [[_stem(w) for w in ("international", "foreign", "overseas")]]
+    if fee:
+        # a word the site prices nothing under: the fee isn't listed (a product's name, "HSA", may sit in its paragraph)
+        product = {_stem(w.lower()) for w in set(q.category) | set(q.descriptors) | set(q.qualifiers)}
+        product |= {s for w in list(product) for s in _SYN.get(w, [])}
+        if any(not set(a) & fee_said and not set(a) & product for a in out):
+            out.append([UNPRICED])
     return out
 
 
@@ -1183,20 +1395,93 @@ def names_abroad(text: str, frames=None) -> bool:
 WIRE_FEE_LINE = re.compile(r"\bwir(?:e|es)\b[^\n.$]{0,40}?\$\s?\d|\$\s?\d[\d,.]*[^\n.$]{0,15}\bwir(?:e|es)\b", re.I)
 
 
+# A fee item: one amount ("$N", "N% of the amount", a "Free" value inside a block) with its label (the text since the
+# previous item, from its last ";" or ". ", at most 60 characters in prose) and the rest of its clause, the lowercase
+# words, numbers and amounts up to ";", ". " or a capitalised word ("$10.00 or 3.00% … whichever is greater", "a $4 service
+# fee unless you keep a balance of $2,000+", "$10.00 for non-members"). A one-line block of a fee schedule ("Rush fee for
+# debit card $50.00* Foreign transaction fee 1% of Amount …") is several items.
+_FEE_AMOUNT = rf"(?:\$\s?\d[\d,]*(?:\.\d+)?|{PCT_OF}|(?<=[a-z]\s)Free(?=\s+[A-Z]))"
+FEE_ITEM = re.compile(_FEE_AMOUNT + r"\*?(?:\s*(?:[Ee]ach\b|[Pp]er\s+[\w/]+(?:\s+[a-z/]+)*))?(?:\s*\([^)]*\))?"
+                      r"((?:\s*(?:,(?!\s*[A-Z])|[a-z][\w'’/-]*\*?|\d[\d,.]*\s?%?|\$\s?\d[\d,.]*\*?|\([^)]*\)))*)")
+# a label ending this way makes its amount a condition ("…for transactions less than $5"), not a fee
+THRESHOLD = re.compile(r"\b(?:less|fewer|more|greater)\s+than\s*$|\b(?:under|below|over|above|at\s+least|minimum(?:\s+of)?|"
+                       r"min\.?)\s*$", re.I)
+ASKS_THRESHOLD = re.compile(r"\b(?:under|less\s+than|below|over|more\s+than|above|at\s+least)\s+\$|\b(?:maximum|minimum)\b", re.I)
+RATE_HEAD = re.compile(r"\b(?:apr|apy|rate|dividend|yield|annual\s+percentage)", re.I)
+
+
+def rate_row(c: Chunk) -> bool:
+    """A table row whose percentage sits under a rate header (APR, APY, dividend); "Foreign transaction fee | 1% of
+    Amount" is a fee row."""
+    return c.is_row and any("%" in v and RATE_HEAD.search(f"{h} {v}") for h, v in c.values())
+
+
+def fee_items(line: str) -> list[tuple[str, str, bool]]:
+    """(label words, item text, is a threshold) for each fee item of one line."""
+    out, start = [], 0
+    for m in FEE_ITEM.finditer(line):
+        label = line[start:m.start()].rstrip(" ;:|—–-")
+        cut = max(label.rfind(";"), label.rfind(". "))
+        label = label[cut + 1:] if cut >= 0 else label
+        if len(label) > 60:
+            label = label[-60:].split(" ", 1)[-1]
+        start = m.end()
+        out.append((f"{label} {m.group(1) or ''}", f"{label} {line[m.start():m.end()]}".strip(), bool(THRESHOLD.search(label))))
+    return out
+
+
+def _labels(c: Chunk):
+    """(label tokens, item text, is a threshold) for each fee item of a chunk. A table row's label cell is its label,
+    whole; a label under three words also takes the line before it ("Foreign currency exchange fee / (includes
+    Canadian checks) $35.00")."""
+    if c.is_row:
+        vals = " ".join(v for _, v in c.values())
+        if not rate_row(c) and (FEE_EV.search(vals) or re.search(r"\bfree\b|no\s+charge", vals, re.I)):
+            yield tokenize(f"{c.label()} {vals}"), f"{c.label()} {vals}", False
+        return
+    lines = c.text.split("\n")
+    for i, line in enumerate(lines):
+        for label, item, threshold in fee_items(line):
+            toks = tokenize(label)
+            if len(toks) < 3 and i:
+                toks = toks + tokenize(lines[i - 1])
+            yield toks, item, threshold
+
+
 def _fee_line_words(index: Index) -> set:
-    """Every word the site writes just before a dollar amount on one line ("Stop payment … $30.00", "lost key
-    $100.00"): the things it states a fee or price for. Built once per view."""
+    """Every word of every fee item on the site ("Stop payment … $30.00", "Re-key box due to lost key $100.00"): the
+    things it states a fee or price for; and, per word, the distinct amounts under $1,000 it is priced at. Built once
+    per view."""
     words = getattr(index, "_fee_words", None)
     if words is None:
-        words = set()
+        words, amounts = set(), {}
         for c in index.chunks:
-            if c.kind == "article" or "$" not in c.text:
+            if c.kind == "article" or rate_row(c):
                 continue
-            for line in c.text.split("\n"):
-                for m in re.finditer(r"\$\s?\d", line):
-                    words |= set(tokenize(line[max(0, m.start() - 40):m.start()]))
-        index._fee_words = words
+            for toks, item, threshold in _labels(c):
+                words |= set(toks)
+                if threshold:
+                    continue
+                m = re.search(r"\$\s?(\d[\d,]*(?:\.\d+)?)|(\d+(?:\.\d+)?)\s?%", item)
+                v = (float(m.group(1).replace(",", "")) if m.group(1) else "%" + m.group(2)) if m else "free"
+                if isinstance(v, float) and v >= 1000:      # a balance or loan amount, not a fee
+                    continue
+                for w in set(toks):
+                    amounts.setdefault(w, set()).add(v)
+        index._fee_words, index._fee_amounts = words, amounts
     return words
+
+
+def _fee_amounts(index: Index) -> dict:
+    _fee_line_words(index)
+    return index._fee_amounts
+
+
+def fee_evidence(c: Chunk, q: Query, groups=()) -> bool:
+    """A fee item of this chunk (a threshold only when the question asks one) whose label carries every group."""
+    allow = bool(ASKS_THRESHOLD.search(q.raw))
+    return any((not threshold or allow) and all(any(w in toks for w in alts) for alts in groups)
+               for toks, _, threshold in _labels(c))
 
 
 def _wire_line_words(index: Index) -> set:

@@ -1551,6 +1551,152 @@ class Rev42(unittest.TestCase):
         self.assertEqual(wire_direction("What's the fee when I send a wire to my account at another bank?"), "out")
 
 
+class Rev43(unittest.TestCase):
+    """What a fee is for (fee items, state words, clauses, who and why); rate cues, amounts in words, ranges,
+    vehicles; the asked kind of product missing; the site's own name before "branch" (synthetic data only)."""
+
+    FEES = ("# Fee Schedule\n\n| Service | Fee |\n|---|---|\n| Canoe check stop payment | $30.00 per item |\n"
+            "| Canoe check cashing | $8.00 each |\n| Official canoe check | $5.00 each |\n"
+            "| Re-key canoe locker due to lost key | $100.00 |\n| Kayak money order | $5.00 each |\n"
+            "| Paddle rush fee for harbor card | $50.00* |\n| Harbor transaction fee | 1% of Amount |\n"
+            "| Canoe locker 3 X 5 | $25.00 |\n| Canoe locker 5 X 10 | $60.00 |\n| Canoe locker past due late fee | $10.00 |\n"
+            "| Abandoned canoe account fee - unclaimed share fee before escheating to the harbor state | $50.00 |\n"
+            "| Domestic wire | $25.00 each |\n| International wire transfer | $55.00 each |\n| Incoming wire transfer | $10.00 |\n\n"
+            "Harbor Service Charges Harbor card transactions at Canoe ATMs Free Paddle ATM usage (after 8 free per month) "
+            "$0.50* per transaction Harbor exchange fee 2% of Amount\n\n"
+            "Other fees include: Canoe advance fee—$10.00 or 3.00% of the amount of each canoe advance, whichever is "
+            "greater; late payment fee—up to $15.00; returned payment fee—up to $25.00.\n\n"
+            "We won't charge canoe overdraft fees for transactions less than $5.\n\n"
+            "The Canoe Overdraft Privilege service fee is $30 per overdraft.\n\n"
+            "To waive the $2.00 monthly service fee, keep a balance of $2,500 in your kayak HSA.\n")
+
+    def _ks(self, md=None, url="https://example.org/canoe-credit-union-fees"):
+        from contract import Page, Snapshot
+        ks = build()
+        ks.ingest(Snapshot("s1", "2030-06-15", [Page(url, "Fees | Example", md or self.FEES, "2030-06-15T09:00:00Z")]))
+        return ks
+
+    def _subject(self, ks, text):
+        import retrieve
+        old, retrieve.RARE_SHARE = retrieve.RARE_SHARE, 0.5         # in a tiny index, make few-chunk words rare
+        try:
+            return {w for alts in retrieve.rare_subject(ks._indexes[-1], parse_query(text)) for w in alts}
+        finally:
+            retrieve.RARE_SHARE = old
+
+    def test_fee_items_labels_thresholds_and_tails(self):
+        from retrieve import fee_items
+        items = fee_items("Harbor card transactions at Canoe ATMs Free Paddle rush fee for kayak card $45.00* "
+                          "Harbor exchange fee 2% of Amount")
+        self.assertEqual(len(items), 3)
+        self.assertEqual(items[1][1], "Paddle rush fee for kayak card $45.00*")
+        self.assertEqual(items[2][1], "Harbor exchange fee 2% of Amount")
+        self.assertTrue(fee_items("We won't charge overdraft fees for transactions less than $5.")[0][2])
+        self.assertEqual(fee_items("Notary services $10.00 for non-members")[0][1], "Notary services $10.00 for non-members")
+        self.assertIn("whichever is greater", fee_items("Canoe advance fee—$10.00 or 3.00% of the amount, whichever is "
+                                                        "greater; late fee—up to $15.00")[0][1])
+
+    def test_a_lost_thing_needs_a_fee_for_that_lost_thing(self):
+        ks = self._ks()
+        declined = lambda q: not ks.answer(q).confident
+        self.assertTrue(declined("What's the fee for a lost kayak money order?"))       # only "lost key" is priced
+        self.assertTrue(declined("Is there a fee if I lose my harbor card?"))
+        self.assertTrue(declined("How much is a lost credit card?"))                   # "credit" only in the URL
+        self.assertIn("$100.00", ks.answer("How much is a lost canoe locker key?").text)
+        self.assertIn("$100.00", ks.answer("What's the fee if I lose my canoe locker key?").text)
+        self.assertIn("$30.00", ks.answer("What's the fee to stop payment on a lost canoe check?").text)
+        self.assertIn("$50.00", ks.answer("My harbor card was stolen. How much is a paddle rush fee for a harbor card?").text)
+        self.assertIn("$25.00", ks.answer("What's the fee if my canoe payment bounces?").text)    # bounced = returned
+        self.assertTrue(declined("A canoe check my tenant gave me bounced after I deposited it — what's your returned "
+                                 "deposited item fee?"))                                 # "after" names no fee
+
+    def test_what_was_done_with_it_and_who_and_why(self):
+        ks = self._ks()
+        self.assertNotIn(_stem("written"), self._subject(ks, "How much is it to stop payment on a canoe check written by me?"))
+        self.assertNotIn(_stem("bounced"), self._subject(ks, "What's the stop payment fee for a canoe check that bounced?"))
+        self.assertIn(_stem("wrote"), self._subject(ks, "What's the fee for a canoe check I wrote?"))   # nothing named
+        self.assertIn(_stem("lose"), self._subject(ks, "Is there a fee if I lose my harbor card?"))      # "if" is no noun
+        s = self._subject(ks, "My son needs an official canoe check for his apartment deposit — how much do you charge for one?")
+        self.assertNotIn(_stem("son"), s)
+        self.assertNotIn(_stem("apartment"), s)
+        s = self._subject(ks, "I'm sending a wire to my cousin, who lives in Germany — what will that cost me?")
+        self.assertNotIn(_stem("lives"), s)
+        self.assertIn(_stem("overdraft"), self._subject(ks, "What's the canoe fee each time I overdraw?"))
+        self.assertNotIn("\x00unpriced", self._subject(ks, "What's the monthly fee for a kayak HSA?"))   # a product word
+        self.assertIn("$5.00", ks.answer("My son needs an official canoe check for his apartment deposit — how much do you charge for one?").text)
+        self.assertIn("$55.00", ks.answer("I'm sending a wire to my cousin, who lives in Germany — what will that cost me?").text)
+        self.assertIn("$5.00", ks.answer("For a kayak money order, what's the fee?").text)
+        self.assertFalse(ks.answer("What does it cost to send money to Venmo?").confident)
+        self.assertIn("$2.00", ks.answer("What's the monthly fee for a kayak HSA?").text)
+
+    def test_fee_answers_name_one_fee(self):
+        ks = self._ks()
+        text = ks.answer("How much is a canoe locker?").text
+        self.assertIn("$25.00", text)
+        self.assertIn("$60.00", text)
+        self.assertNotIn("$10.00", text)                    # the late fee is another fee, not a size
+        self.assertIn("$50.00", ks.answer("What is the abandoned canoe account fee?").text)
+        self.assertIn("1% of Amount", ks.answer("What's the harbor transaction fee?").text)
+        self.assertIn("3.00%", ks.answer("What's the canoe advance fee?").text)
+        self.assertIn("$30", ks.answer("What's the canoe overdraft fee?").text)
+        self.assertIn("$5", ks.answer("Will I be charged a canoe overdraft fee for a transaction under $5?").text)
+        text = ks.answer("Is the international wire fee higher than domestic?").text
+        self.assertIn("$55.00", text)
+        self.assertIn("$25.00", text)
+        self.assertNotIn("$10.00", text)                    # only the two kinds named
+        text = ks.answer("What's the fee on an incoming wire versus an outgoing domestic one?").text
+        self.assertIn("$10.00", text)
+        self.assertIn("$25.00", text)
+        self.assertNotIn("$55.00", text)
+
+    def test_rate_cues_amounts_ranges_and_vehicles(self):
+        from retrieve import wire_direction
+        self.assertEqual(parse_query("What does the canoe HSA pay?").attribute, "rate")
+        self.assertEqual(parse_query("If I lock my money in a 2-year kayak CD, what does it earn?").attribute, "rate")
+        self.assertEqual(parse_query("How much does a one-year kayak certificate pay?").attribute, "rate")
+        self.assertNotEqual(parse_query("What does a canoe HSA pay for?").attribute, "rate")
+        self.assertNotIn(_stem("pay"), parse_query("What does a canoe savings account pay?").tokens)
+        self.assertEqual(parse_query("What does a canoe HSA pay on 15k?").amounts, [15000])
+        self.assertEqual(parse_query("What does a canoe HSA pay on fifteen thousand dollars?").amounts, [15000])
+        self.assertEqual(parse_query("What does a canoe HSA pay with five grand?").amounts, [5000])
+        self.assertEqual(parse_query("What does a canoe HSA pay on 7,500 dollars?").amounts, [7500])
+        self.assertEqual(parse_query("Can I roll my 401k into a canoe IRA? What's the rate?").amounts, [])
+        for text in ("canoe savings rate for a balance between $20,000 and $50,000?", "canoe savings rate for 20k to 50k?",
+                     "canoe savings rate for a balance between 20 and 50 thousand dollars?"):
+            self.assertEqual(parse_query(text).amounts, [20000, 49999.99], text)
+        self.assertEqual(parse_query("canoe savings rate for a $20k-$48,500 balance?").amounts, [20000, 48500])
+        self.assertEqual(parse_query("What's the canoe certificate rate for 12 to 24 months?").amounts, [])
+        self.assertIn("loan", parse_query("If I finance a 2030 car for 7 years, what APR is that?").category)
+        self.assertNotIn("loan", parse_query("What's the APY if I'm saving for a car?").category)
+        self.assertNotIn("loan", parse_query("What's the kayak rate? I have a 60-month car loan with you.").category)
+        self.assertIn("rv", parse_query("What's the rate on a camper?").descriptors)
+        self.assertEqual(parse_query("I'm financing a 2028 pickup over 84 months, what rate would I get?").years, {2028})
+        self.assertEqual(wire_direction("Is the international wire fee higher than domestic?"), "all")
+        self.assertEqual(wire_direction("Compare the fees for sending a wire domestically versus internationally"), "all")
+
+    def test_a_missing_kind_of_product_declines(self):
+        md = ("# Kayak Rates\n\n## Kayak Certificates\n\n| Term | APY |\n|---|---|\n| 12 Month | 3.10% |\n| 24 Month | 3.20% |\n\n"
+              "## Kayak Auto Loans\n\n| Term | APR |\n|---|---|\n| 84 Months | 6.15% |\n")
+        ks = self._ks(md, "https://example.org/rates")
+        self.assertFalse(ks.answer("What's the rate on an 84-month kayak certificate?").confident)
+        self.assertIn("3.20%", ks.answer("What's the 24-month kayak certificate rate?").text)
+
+    def test_the_sites_own_name_is_never_a_branch(self):
+        import retrieve
+        saved = (set(retrieve.SITE_WORDS), set(retrieve.PROPER_NAMES))
+        try:
+            retrieve.use_site_words({"canoeco"})
+            retrieve.use_proper_names({"canoeco's", "elmwood"})
+            q = parse_query("What are Canoeco's general branch lobby hours of operation?")
+            self.assertIsNone(q.entity)
+            self.assertEqual(q.attribute, "hours")
+            self.assertEqual(parse_query("When are Canoeco's branch lobbies usually open?").attribute, "hours")
+            self.assertEqual(parse_query("What are the hours of the elmwood branch?").entity, "elmwood")
+        finally:
+            retrieve.use_site_words(saved[0])
+            retrieve.use_proper_names(saved[1])
+
+
 class Contract(unittest.TestCase):
     def test_exactly_the_three_contract_methods(self):
         own = {n for n, v in vars(type(build())).items() if callable(v) and not n.startswith("__")}

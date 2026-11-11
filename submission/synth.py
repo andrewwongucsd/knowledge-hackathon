@@ -18,8 +18,8 @@ from ingest import Chunk, View, url_key
 from collections import Counter
 from types import SimpleNamespace
 
-from retrieve import (KIND_NAME, SOFT_QUALIFIERS, SYNONYMS, WIRE, WIRE_FEE_LINE, Evidence, Query, _asked, asked_kinds,
-                      kinds_in, names_line, on_other_line, other_kind, other_lines, product_name, qualify, supports,
+from retrieve import (ASKS_THRESHOLD, KIND_NAME, SOFT_QUALIFIERS, SYNONYMS, WIRE, WIRE_FEE_LINE, Evidence, Query, _asked,
+                      asked_kinds, fee_items, kinds_in, names_line, on_other_line, other_kind, other_lines, product_name, qualify, supports,
                       terms_in, tier_width, tokenize, wire_direction)
 
 REFUSAL = "That isn't listed on our website, so I can't confirm it. Please contact us and we can help."
@@ -130,6 +130,13 @@ def best_sentence(c: Chunk, q: Query) -> str:
     if q.attribute is None:                             # how-to and "what is…": the steps or the description
         return c.text.replace("\n", " ")[:PARAGRAPH_CHARS]   # span the paragraph, not one sentence of it
     sents = [s.strip() for s in re.split(r"(?<=[.!?])\s+(?=[A-Z0-9*])|\n", c.text) if s.strip()]
+    if q.attribute == "fee":
+        # a sentence holding several fees is quoted as one of them; a sentence with an amount is preferred, a
+        # threshold ("less than $5") only when the question asks one
+        allow = bool(ASKS_THRESHOLD.search(q.raw))
+        items = lambda s: [it for _, it, threshold in fee_items(s) if not threshold or allow]
+        sents = [p for s in sents for p in (items(s) if len(fee_items(s)) > 1 else [s])]
+        sents = [s for s in sents if items(s)] or sents
     qt = set(q.tokens)
 
     def score(s):
@@ -148,13 +155,17 @@ def _as_chunk(text: str, like: Chunk) -> Chunk:
     return Chunk(-1, like.key, like.kind, text, f"{like.index_text} {text}", section=like.section)
 
 
+WIRE_KIND_NAMED = {"incoming": r"\b(?:incoming|inbound|receiv\w*)\b", "domestic": r"\bdomestic\w*",
+                   "international": r"\b(?:international\w*|abroad|overseas|foreign)\b"}
+
+
 def extractive(q: Query, ev: Evidence, view: View) -> tuple[str, list[Chunk]]:
     pool = [c for c in ev.chunks if supports(c, q)] if q.attribute else ev.chunks
     if _leads_with_other_kind(q, ev):
         # "what's the kayak savings rate?" led by a certificate table under a savings heading: the asked line answers
         own = asked_line_row(q, ev, view)
         rest = [c for c in pool if c is not own and not (c.is_row and other_kind(c, q))]
-        pool = ([own] if own else []) + rest or pool
+        pool = ([own] if own else []) + rest      # never the other kind's row (see compose)
     if q.attribute == "fee":                   # a promotion's offer ("we'll give you $X") is never a fee
         pool = [c for c in pool if c.kind != "promo"] or pool
     if not pool:
@@ -168,6 +179,10 @@ def extractive(q: Query, ev: Evidence, view: View) -> tuple[str, list[Chunk]]:
             kind = next((k for k in ("incoming", "domestic", "international") if k in c.text.lower()), None)
             if kind and kind not in kinds and WIRE_FEE_LINE.search(c.text) and supports(c, q):
                 kinds[kind] = c
+        # two kinds named ("the incoming wire versus the outgoing domestic one"): just those two
+        named = {k for k, pat in WIRE_KIND_NAMED.items() if re.search(pat, q.raw, re.I)}
+        if len(named) > 1:
+            kinds = {k: c for k, c in kinds.items() if k in named}
         if len(kinds) > 1:
             lines = list(kinds.values())
             return " ".join(render_row(c) + "." if c.is_row else best_sentence(c, q) for c in lines), lines
@@ -187,7 +202,11 @@ def extractive(q: Query, ev: Evidence, view: View) -> tuple[str, list[Chunk]]:
                       and qualify(c, q)[0] != "mismatch" and not on_other_line(c, lines)
                       and not any(re.search(rf"\b{w}\b", f"{c.label()} {c.section}".lower()) for w in q.excluded)
                       and not (one_amount and tier_width(c, q) != tier_width(top, q))]
-        rows = [top] + same_table[:3]
+        if q.attribute == "fee":
+            # a fee table's other rows are other fees, unless they name the same service (safe deposit box sizes)
+            lead = lambda c: [w for w in tokenize(c.label()) if not w[0].isdigit()]
+            same_table = [c for c in same_table if lead(c) == lead(top)]
+        rows = [top] + same_table[:5 if q.attribute == "fee" else 3]
         if q.category and not _names(top, q.category):
             # The top row matched a value shared with a different product than the one the question
             # names ("savings"): also give the named product's own row from the evidence, so a value
@@ -524,6 +543,10 @@ class Synthesizer:
                 asked: date | None = None, lookup=None, second_look=None) -> tuple[str, list[Chunk], bool, str]:
         """Returns (text, cited chunks, confident, note)."""
         note = _stale_note(ev, view)
+        if _leads_with_other_kind(q, ev) and asked_line_row(q, ev, view) is None and not any(
+                not c.is_row and supports(c, q) and _mentions(f"{c.section} {c.text}".lower(), _line_words(q))
+                for c in ev.chunks):
+            return REFUSAL, [], False, note         # "an 84-month certificate" with only an 84-month loan row
         cooling = self._cooldown > 0
         self._cooldown = max(0, self._cooldown - 1)
         if self.enabled and not cooling and not clear_cut(question, q, ev):
