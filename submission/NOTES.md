@@ -60,8 +60,8 @@ The evaluation sets were rebuilt from the pages by independent agents after the 
 | 16 probes for the questions the previous version missed (branch hours by street or town, fee wordings, a status question, counts, a link) | no key 16 of 16 |
 | 66 fee, rate and wording cases from an adversarial review, judged against the pages | no key 66, with key 65 |
 | 75 wordings from this version's adversarial review of its own design (closing dates, "open" that is not hours, a greeting name, rate wordings, links) | 44 answers changed, none for the worse |
-| 60 questions written by an agent that had not seen the code (rewordings in members' own styles, "as of" dates, "what changed since…", refusals, tier traps); the changes were designed on this set | v21: no key 0.668, with key 0.765; now no key 0.79, with key 0.940; "what changed" questions 3.7 of 10 → 9 of 10 |
-| 60 more by a second such agent, seen only after the code was written | v21: no key 0.769, with key 0.784; now no key 0.816, with key 0.881; "what changed" questions 6 → 9.9 of 14; no question clearly worse (two near-misses that scored only the source credit now score nothing) |
+| 60 questions written by an agent that had not seen the code (rewordings in members' own styles, "as of" dates, "what changed since…", refusals, tier traps); the changes were designed on this set | v21: no key 0.668, with key 0.765; now no key 0.79, with key 0.940; "what changed" questions 3.7 → 9.4 of 10 |
+| 60 more by a second such agent, seen only after the code was written | v21: no key 0.769, with key 0.784; now no key 0.816, with key 0.881; "what changed" questions 6 → 11 of 14; no question clearly worse (two near-misses that scored only the source credit now score nothing) |
 | 16 probes for the questions v21 missed (the first set's failures) | no key: 0.41 → 0.88 |
 | Reviewer's 34 wordings that tried to break the design (negated "not refinancing", "special" certificates at other terms, months before the crawls, "May I…") | 33 answer exactly as v21 does; 1 differs by design |
 | Crash sweep: every kit question plus branch, wire, date and down-payment templates (1,111) | 0 errors |
