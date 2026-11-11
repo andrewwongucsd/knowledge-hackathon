@@ -98,6 +98,7 @@ def _on_site(url: str, domains) -> bool:
 
 
 TAB_LINK = re.compile(r"[-*]\s+\[([^\]]+)\]\(([^)\s]*#[^)\s]*)\)")     # "- [X Rates](<page>#)"
+CLOCK = re.compile(r"\b\d{1,2}(?::\d{2})?\s*[ap]\.?\s?m\b|\bnoon\b", re.I)    # a clock time: "7:45 a.m.", "noon"
 PLAIN_WORDS = {"rate", "account", "loan", "card", "line", "home", "interest", "fixed", "standard", "new", "annual",
                "percentage", "the", "and", "of", "for", "your", "our", "my"}
 
@@ -174,6 +175,9 @@ class Chunk:
     table_span: tuple | None = None          # (first, last) line of the source table
     tf: dict = field(default_factory=dict)   # filled by the retriever
     length: int = 0
+    free_row: bool = False        # a row of a fee table whose value says free (set by the retriever)
+    about: str = ""               # a schedule's page lead and the block above it: where and whose it is (retriever)
+    branch: str = ""              # ...and the town of its dateline
 
     def label(self) -> str:
         """The non-value cells of a table row, e.g. '2019-21 Model Year | 36 Months'."""
@@ -283,6 +287,8 @@ class Parser:
                 after = next((ln.strip() for ln in lines[j:] if ln.strip()), "")
                 if len(block) == 1 and re.fullmatch(r"[A-Z][A-Za-z]{2,}", text) and after.startswith("|"):
                     caption = _tab_caption(text, above, under)   # a one-word heading right above a table ("Regular")
+                elif len(block) == 1 and re.fullmatch(r"[A-Z][A-Za-z-]{2,}", text) and CLOCK.search(after):
+                    short_buf.append(text)              # a one-word label right above a schedule ("Lobby", "Drive-up")
                 continue                                # "\# # #", lone bullets, stray markup
             if len(text) < 60 and not re.search(r"\d(?!\d*(?:st|nd|rd|th)\b)", text) and len(block) == 1:
                 caption = _tab_caption(text, above, under)   # e.g. "Savings Rates" or "1st Choice Checking" above a table

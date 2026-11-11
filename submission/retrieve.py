@@ -15,7 +15,7 @@ import math
 import re
 from collections import Counter
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, timedelta
 
 from ingest import KIND_RANK, MONTH_RE, STATUS_RANK, Chunk, View
 from places import CITY_COMMA, CURRENCY, FOREIGN_SET, GIVEN_NAMES, NATIONAL_BANK, PLACE_RE, PROVINCE_SET
@@ -89,9 +89,10 @@ def use_site_words(words) -> None:
     COUNT_Q = re.compile(rf"\bhow many\s+(?:(?:{alt})\s+)?([a-z-]+)" if alt else r"\bhow many\s+([a-z-]+)", re.I)
     opt = rf"(?:(?:{alt})(?:['’]s)?\s+)?" if alt else ""
     COUNT_CUE = re.compile(rf"(?:^|\bthe\s+|\btotal\s+)number of\s+{opt}([a-z-]+)", re.I)
-    who, does = (f"you|{alt}", f"do you|does (?:{alt})") if alt else ("you", "do you")
-    LIST_Q = re.compile(rf"\bwhat (?:\w+ ){{0,3}}do (?:{who}) (?:offer|have)\b|"
-                        rf"\bwhich (?:\w+ ){{0,3}}(?:{does}) offer\b|\bwhat (?:kinds|types) of\b|{LIST_ASK}", re.I)
+    who = f"you|{alt}" if alt else "you"
+    LIST_Q = re.compile(rf"\b(?:what|which) (?:\w+ ){{0,3}}(?:do|does) (?:{who}) (?:offer|have|carry|provide)\b|"
+                        rf"\b(?:what|which) (?:\w+ ){{0,3}}(?:are|is) (?:available|offered)\b|\bwhat (?:kinds|types) of\b|"
+                        rf"\blist (?:the|your|all|every|out)\b|\bshow me all\b|{LIST_ASK}", re.I)
 
 
 LIST_ASK = r"^\s*(?:please\s+)?(?:list|show me all)\b"     # "list your card rates"
@@ -121,8 +122,13 @@ PLAIN_DESCRIPTORS = {"regular", "basic", "standard", "plain", "normal", "ordinar
 PCT_PAID = re.compile(r"\b(?:pay|pays|paying|paid|earn|earns|earning)\s+(?:a\s+|an\s+)?\d+(?:\.\d+)?\s*(?:%|percent\b)"
                       r"(?!.*\b(?:cash\s*back|reward(?:s)?|points)\b)", re.I)
 FEE_Q = re.compile(r"\b(fees?|cost|charge[sd]?|price)\b|\bhow much (is|are|was|were|does|do|did|for|will)\b|"
-                   r"\bhow much to (?:wire|send|mail|replace|rush|stop|cash|certify|transfer)\b", re.I)
-HOURS_Q = re.compile(r"\bhours?\b", re.I)
+                   r"\bhow much to (?:wire|send|mail|replace|rush|stop|cash|certify|transfer|get|have|order|buy|purchase|use|"
+                   r"notarize|fax|copy|drill|re-?key|reopen|print|exchange)\b|\bhow much would (?:it|that|you|they)\b|"
+                   r"\b(?:have|need)\s+to\s+pay\b(?!\s+(?:off|back|down))|\bfree\s+of\s+charge\b|\bat\s+no\s+(?:charge|cost)\b|"
+                   # "is it free to …", "are money orders free for members?", "what would I pay for …"
+                   r"\bis\s+it\s+free\b|\b(?:is|are)\s+[^?,.]{1,40}?\s+free(?=\s+(?:for|to|at|with|if|when)\b|\s*\?|\s*$)|"
+                   r"\bwhat\s+(?:would|will|do|did|should|must|might)\s+(?:i|we)\s+(?:have\s+to\s+|need\s+to\s+)?pay\s+(?:for|to)\b", re.I)
+HOURS_Q = re.compile(r"\bhours?\b|\b(?:lobby|lobbies|drive[- ]?(?:up|thru|through))\s+(?:times?|schedules?)\b|\bopening\s+times?\b", re.I)
 COUNT_Q = re.compile(r"\bhow many\s+([a-z-]+)", re.I)          # rebuilt with the site's name: use_site_words
 # Hours and counts asked without "hours" or "how many": "office hrs pls", "when is the walk-up window open?",
 # "total number of offices". Used only when nothing else claimed the question.
@@ -142,8 +148,9 @@ FRAME_WORDS = {"find", "get", "see", "use", "earn", "pay", "need", "open", "appl
                "kind", "kinds", "type", "types", "available", "charge", "much", "can", "online"}
 COUNT_CUE = re.compile(r"(?:^|\bthe\s+|\btotal\s+)number of\s+([a-z-]+)", re.I)
 WHEN_Q = re.compile(r"^\s*when\b|what date|\bby when\b", re.I)
-LIST_Q = re.compile(r"\bwhat (?:\w+ ){0,3}do (?:you) (?:offer|have)\b|"
-                    r"\bwhich (?:\w+ ){0,3}(?:do you) offer\b|\bwhat (?:kinds|types) of\b|" + LIST_ASK, re.I)
+LIST_Q = re.compile(r"\b(?:what|which) (?:\w+ ){0,3}(?:do|does) (?:you) (?:offer|have|carry|provide)\b|"
+                    r"\b(?:what|which) (?:\w+ ){0,3}(?:are|is) (?:available|offered)\b|\bwhat (?:kinds|types) of\b|"
+                    r"\blist (?:the|your|all|every|out)\b|\bshow me all\b|" + LIST_ASK, re.I)
 RATE_EV = re.compile(r"\d+(?:\.\d+)?\s*%\s*(?:APR|APY|annual percentage|fixed|variable|interest|dividend)|"
                      r"(?:APR|APY|rate of|rates? (?:as low as|start(?:ing)? at|from)|dividend rate)\s*(?:is|of|:)?\s*"
                      r"\d+(?:\.\d+)?\s*%", re.I)
@@ -151,7 +158,14 @@ ADDRESS_Q = re.compile(r"\baddress\b|\bwhere is\b|\blocated\b", re.I)
 # The member editing their own address is a how-to question, not "where is it": an edit verb on "my/our
 # (mailing...) address", or "change of address", and no branch, office or other place named.
 OWN_ADDRESS = re.compile(r"\b(?:updat|chang|edit|correct)\w*\s+(?:my|our)\s+(?:(?:home|mailing|email|e-mail|street|"
-                         r"billing|physical|contact)\s+)?address\b|\bchange of address\b", re.I)
+                         r"billing|physical|contact)\s+)?address\b|\bchange of address\b|"
+                         # "change the address or phone number on my account", "update my phone number",
+                         # "the address on file", "I have a new address. How do I update it?"
+                         r"\b(?:updat|chang|edit|correct)\w*\s+(?:the|my|our)\s+[^?.]*\b(?:address|phone\s+number|e-?mail)\b[^?.]*"
+                         r"\b(?:on|in|for)\s+(?:my|our)\s+(?:\w+\s+)?(?:accounts?|file|profile|records?)\b|"
+                         r"\b(?:updat|chang|edit|correct)\w*\s+(?:my|our)\s+(?:\w+\s+){0,2}?(?:(?:tele)?phone|cell|mobile|e-?mail)\b|"
+                         r"\b(?:address|phone\s+number|e-?mail)\s+(?:you\s+have\s+)?on\s+file\b|"
+                         r"\bnew\s+(?:address|phone\s+number|e-?mail)\b[^?]*\b(?:updat|chang)\w*\b", re.I)
 PLACE_WORDS = re.compile(r"\b(?:branch|branches|location|locations|office|offices|lobby|lobbies)\b", re.I)
 ADDRESS_EV = re.compile(r"\b\d{2,6}\s+(?:[A-Z][\w.'’-]*\s+){1,4}(?:St|Street|Ln|Lane|Ave|Avenue|Dr|Drive|Rd|Road|"
                         r"Blvd|Way|Ct|Pl|Pkwy|Hwy|Highway|Square)\b\.?")
@@ -351,6 +365,19 @@ class Query:
     expansion: list = field(default_factory=list)    # search words the wording implies ("eligible" for "who can join?")
     rate_kind: str | None = None                     # "intro": every rate asked about is an introductory rate;
                                                      # "offer": ...of a special or promo the question names
+    period: object = None                            # a count asked of a year: "last", "this", ... or a calendar year
+    series: list = field(default_factory=list)       # (year, sentence, chunk) per year the site states the count
+    no_year: bool = False                            # a year was asked and the site counts nothing for it
+    count_said: set = field(default_factory=set)     # words of how a count was asked that are no requirement ("staff": the
+                                                     # site says "employees"; "number" of; "team members")
+    focus: tuple | None = None                       # what a fee question is about (see fee_focus)
+    places: list = field(default_factory=list)       # hours: the towns and streets asked about, each a set of search words
+    compare: bool = False                            # hours: "do all branches keep the same hours?"
+    schedules: list = field(default_factory=list)    # hours: the schedules of the place or places asked about
+    soft_hours: bool = False                         # hours asked without the word: a schedule answers it, or it is
+    loose_hours: bool = False                        # ...read as it was before (read_as: attribute, qualifiers)
+    need_schedule: bool = False
+    read_as: tuple | None = None
 
     @property
     def numbers(self) -> set:
@@ -510,7 +537,212 @@ def parse_query(question: str) -> Query:
         for t in list(q.tokens):                        # "overdraw" is searched as "overdraft" too
             q.tokens += [x for x in FEE_SYN.get(t, []) if x not in q.tokens]
         q.descriptors = {d for d in q.descriptors if _stem(d.lower()) not in HAPPENED}   # "a lost card": no product
+    raw_low = q.raw.lower()
+    _read_hours(q, raw_low)
+    _read_counts(q, raw_low)
+    if q.list_intent and q.attribute == "rate" and (q.terms or q.years or q.amounts) and VALUE_ASKED.search(raw_low) \
+            and not re.match(LIST_ASK, q.raw, re.I):
+        q.list_intent = False                           # a value asked of one pinned row is not a list
+    _read_contact(q, raw_low)
     return q
+
+
+def _read_contact(q: Query, low: str) -> None:
+    """An address, phone number or email on the member's own account is their contact information: a how-to,
+    searched as such."""
+    if q.attribute is None and OWN_ADDRESS.search(low) and not PLACE_WORDS.search(low):
+        frame = {_stem(w) for w in ("file", "profile", "record", "records", "number", "new")}
+        q.tokens = [t for t in q.tokens if t not in frame]
+        add = [t for t in (_stem("contact"), _stem("information"), _stem("personal")) if t not in q.tokens]
+        q.expansion, q.tokens = q.expansion + add, q.tokens + add
+
+
+# ---- Hours: asked of a place, without the word, or of every branch ----------------------------------------------
+# A branch's schedule sits in a block that names neither its town nor its street; the page's lead paragraph does
+# (a dateline, "located at …"). So a schedule is bound to its page's lead (see _about) and a place asked about is
+# matched against both. A question about hours with no place named gets one schedule, the same for every wording.
+_DAY = r"(?:mon|tues|wednes|thurs|fri|satur|sun)days?"
+_VISIT = r"(?:open|close[sd]?|closing|when|until|use|available|stop|visit|come|go)"
+_FAC = r"(?:lobby|lobbies|drive[- ]?(?:up|thru|through)s?|branch(?:es)?|offices?|locations?)"
+_OPENS = r"(?:open|opens|opened|close|closes|closed|closing|shut|shuts)"
+_WHEN_DAY = rf"(?:{_DAY}|today|tomorrow|tonight|weekends?|weekdays?|late|later|early|earlier|until|till|after|before|past|at\s+\d|holidays?)"
+FACILITY = re.compile(rf"\b{_FAC}\b", re.I)
+# "what time is it open on Fridays": a weaker cue, trusted only when the question also names a place
+HOURS_LOOSE = re.compile(rf"\bwhat time\b(?!\s+(?:frame|period|limit)s?\b)|\bhow (?:late|early)\b|"
+                         rf"\b{_DAY}\b.*\b{_VISIT}\b|\b{_VISIT}\b.*\b{_DAY}\b|"
+                         r"\bwhen\s+(?:is|are|can|could|may)\b[^?]*\b(?:open|use|visit|stop|come|go)\b", re.I)
+STATUS_EV = re.compile(r"\b(?:will\s+close|closed|closes|closing|closure|will\s+end|ended|ends|expired|expires|discontinued|"
+                       r"no\s+longer|reopen\w*|will\s+open|opened|last\s+day|final\s+day)\b", re.I)
+STATUS_DATE = re.compile(r"\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)[a-z]*\.?\s+\d{1,2},\s+20\d\d\b")
+_PLACE_NOUN = r"(?:branch(?:es)?|locations?|offices?|lobb(?:y|ies)|drive[- ]?ups?)"
+SAME_Q = re.compile(r"\b(?:same|identical|differ\w*|vary|varies|varying|uniform|consistent|change|depend\w*)\b", re.I)
+ALL_PLACES = re.compile(rf"\b(?:all|every|each|any|both|different|other|various)\s+(?:of\s+)?(?:[\w'’-]+\s+){{0,2}}?{_PLACE_NOUN}\b|"
+                        rf"\b(?:by|per|across|between|among|depending\s+on|based\s+on)\s+(?:the\s+|each\s+|which\s+)?{_PLACE_NOUN}\b|"
+                        r"\b(?:branch|location|office)\s+to\s+(?:branch|location|office)\b|\beverywhere\b|\b(?:branches|locations|offices)\b", re.I)
+STREET_WORDS = {"avenue", "ave", "road", "rd", "street", "st", "blvd", "boulevard", "drive", "dr", "lane", "ln", "highway",
+                "hwy", "way", "court", "ct", "place", "pl", "e", "w", "n", "s"}
+MONTH_WORDS = set("january february march april may june july august september october november december".split())
+NOT_PLACE = {"i", "lobby", "drive-up", "drive", "atm", "atms", "branch", "branches", "office", "location", "hours"}
+DAY_LINE = re.compile(r"(?mi)^(?:[A-Za-z-]+\s)?(?:Mon|Tues|Wednes|Thurs|Fri|Satur|Sun)day(?:\s*[-–—]\s*\w+day)?\s*:")
+LOCATIVE = {"in", "at", "on", "near", "inside", "outside", "around", "by", "off"}
+AFTER_PLACE = {"branch", "branches", "location", "locations", "office", "offices", "lobby", "lobbies", "drive-up", "drive-thru",
+               "drive", "hours", "hrs", "atm", "atms", "is", "are", "open", "opens", "close", "closes", "closed", "area"}
+NUMBERED_ROADS = {"highway", "hwy", "route", "rt", "rte", "road", "rd", "county", "interstate"}
+ABBREV = set("jan feb mar apr jun jul aug sep sept oct nov dec mon tue tues wed thu thur thurs fri sat sun am pm".split())
+_STRONG: tuple | None = None
+
+
+def hours_strong(low: str) -> bool:
+    """Hours asked without the word: when the lobby, the drive-up, a branch, "you" or the site itself opens or closes."""
+    global _STRONG
+    if _STRONG is None or _STRONG[0] != frozenset(SITE_WORDS):
+        site = "|".join(sorted(map(re.escape, SITE_WORDS))) or r"(?!x)x"
+        fac = rf"(?:(?:the|your|our|a|an|that|this|any|each|every|all|(?:{site})(?:['’]s)?)\s+)?(?:[\w.'’-]+\s+){{0,8}}?{_FAC}"
+        subj = (rf"(?:(?:you|we)\s+(?:[\w-]+\s+)?|(?:{site})\s+(?:(?:in|on|at|near|inside)\s+(?:[\w.,'’-]+\s+){{1,7}}?)?|"
+                rf"{fac}\s+(?:[\w-]+\s+){{0,2}}?)")
+        _STRONG = (frozenset(SITE_WORDS), re.compile(
+            rf"\bhrs\b|"
+            rf"\b(?:what\s+time|how\s+(?:late|early|long)|when|(?:un)?till?\s+when)\s+(?:do|does|is|are|will|can|could|did)\s+{subj}{_OPENS}\b|"
+            rf"\b(?:is|are|will)\s+{subj}(?:open|closed)\b(?=[^?]*\b{_WHEN_DAY}\b)|"
+            rf"\b(?:can|could|may)\s+(?:i|we)\s+(?:visit|come|stop|go|use|get)\b[^?]*\b{_FAC}\b[^?]*\b{_WHEN_DAY}\b|"
+            rf"\bwhen\s+(?:can|could|may)\s+(?:i|we)\s+(?:visit|come|stop|go|use|get)\b[^?]*\b{_FAC}\b|"
+            rf"\b(?:do|does)\s+{subj}(?:open|close)\b[^?]*\b(?:same|different)\s+times?\b|"
+            rf"\bwhat\s+time\b(?!\s+(?:frame|period|limit)s?\b)[^?]*\b{_FAC}\b", re.I))
+    return _STRONG[1].search(low) is not None
+
+
+def place_phrases(question: str) -> list:
+    """The towns and streets a question names, each as a set of search words: capitalised runs and street words
+    ("Elm Point Road", "Harbor") that the wording marks as a place: by a street word, by "in / at / on / near" before
+    it (past "the" or "your"), or by branch, lobby, drive-up, hours, "is" or "opens" after it. A numbered road
+    keeps its number ("Highway 12"); each town of a list ("A, B, or C") is one. A name in a greeting, a weekday or month, AM/PM, the site's own name, the
+    region after a town and its comma ("Elmville, Ohio": unless a list of towns goes on), and anything in an
+    all-caps or title-case question mark nothing."""
+    words = re.findall(r"[A-Za-z][\w'’-]*\.?|\d+|[,.?!:;—–-]", question)
+    alpha = [w for w in words if w[0].isalpha() and len(w.strip(".")) > 3]
+    if alpha and all(w[0].isupper() for w in alpha):
+        return []
+    plain = lambda w: re.sub(r"['’]s$", "", w.lower().strip("."))
+    out, run, start = [], [], True
+    region_from = skip_to = last_end = -1
+
+    def flush(end):
+        nonlocal last_end
+        if run:
+            first = end - len(run)
+            every = {t for w in run for t in tokenize(w)}
+            core = {t for w in run for t in tokenize(w) if plain(w) not in STREET_WORDS}
+            j = first - 1
+            while j >= 0 and plain(words[j]) in ("the", "a", "an", "your", "our", "my", "that", "this"):
+                j -= 1
+            before = plain(words[j]) if j >= 0 else ""
+            nxt = [plain(w) for w in words[end:end + 2] if w[0].isalnum()] if end < len(words) and words[end][0].isalnum() else []
+            after = next((w for w in nxt if not re.fullmatch(_DAY, w)), "")
+            item = last_end >= 0 and (first - 1 == last_end and words[last_end] == "," or
+                                      first - 2 == last_end and words[first - 1].lower() in ("or", "and", "&"))   # "A, B, or C"
+            if core and (core != every or before in LOCATIVE or after in AFTER_PLACE or item
+                         or run[-1].lower().endswith(("'s", "’s"))):
+                out.append(core)
+                last_end = end
+            run.clear()
+    for i, w in enumerate(words):
+        if w[0].isdigit():
+            if run and plain(run[-1]) in NUMBERED_ROADS:
+                run.append(w)
+            else:
+                flush(i)
+            start = False
+            continue
+        if not w[0].isalpha():
+            had_run = bool(run)
+            flush(i)
+            if w == "," and had_run:
+                region_from = i + 1
+            start = start or w in ".?!:"
+            continue
+        if i == region_from and w[0].isupper():
+            j = i
+            while j < len(words) and words[j][0].isalpha() and words[j][0].isupper():
+                j += 1
+            if (words[j].lower() if j < len(words) else "") not in (",", "or", "and", "&"):
+                skip_to = j                     # "<Town>, <Region>": the region is no place; "A, B, or C" is a list
+        if i < skip_to:
+            start = False
+            continue
+        low = plain(w)
+        nxt_raw = words[i + 1] if i + 1 < len(words) else ""
+        nxt = nxt_raw.lower().strip(".")
+        proper = low in PROPER_NAMES or (w[0].isupper() and not start and not (w.isupper() and len(w) > 1))
+        street = low in STREET_WORDS and bool(run)
+        skip = (low in BRANCH_NOT_NAMES or low in MONTH_WORDS or low in NOT_PLACE or low in STOP or low in ABBREV
+                or re.fullmatch(_DAY, low) is not None)
+        if low in STREET_WORDS and not run and w[0].isupper() and (nxt_raw[:1].isupper() or nxt in PROPER_NAMES
+                                                                   or (nxt.isdigit() and low in NUMBERED_ROADS)):
+            run.append(w)
+        elif (proper and not skip) or street:
+            run.append(w)
+        else:
+            flush(i)
+        start = False
+    flush(len(words))
+    return [p for p in out if p]
+
+
+def _prose(c: Chunk) -> bool:
+    """A paragraph of sentences, not a line of links."""
+    return not c.is_row and len(re.findall(r"[A-Za-z]{2,}", re.sub(r"\([^)]*\)", " ", c.text))) >= 15
+
+
+def _about(index: Index) -> None:
+    """Bind each schedule (a block with two or more weekday lines and clock times) to its page's lead paragraph, which
+    names the town and the street, and to the block above it; the dateline town is the schedule's branch name. Only
+    on a page whose schedules form one run after the lead. Fills index._schedules (those on live pages)."""
+    if getattr(index, "_about_done", False):
+        return
+    index._schedules = []
+    for vp in index.view.pages.values():
+        chunks = vp.page.chunks
+        hrs = [i for i, c in enumerate(chunks) if not c.is_row and len(DAY_LINE.findall(c.text)) >= 2 and HOURS_EV.search(c.text)]
+        if not hrs:
+            continue
+        lead = next((i for i, c in enumerate(chunks) if _prose(c) and len(DAY_LINE.findall(c.text)) < 2), None)
+        one = hrs[-1] - hrs[0] <= 2 and lead is not None and lead < hrs[0]
+        for i in hrs:
+            prev = chunks[i - 1].text if i else ""
+            chunks[i].about = f"{chunks[lead].text if one else ''} {prev}"
+            m = re.match(r"\s*([A-Z][A-Z .'’-]{2,}?),\s", chunks[lead].text) if one else None
+            chunks[i].branch = m.group(1).title() if m else ""
+            if vp.status != "missing":
+                index._schedules.append(chunks[i])
+    index._about_done = True
+
+
+def dated_status(index: Index, q: Query) -> bool:
+    """Does a passage naming the asked place state, with a full date, that it opens, closes or ends?"""
+    named = set().union(*q.places)
+    for pos in sorted({pos for t in named for pos, _ in index.postings.get(t, [])}):
+        if any(STATUS_EV.search(s) and STATUS_DATE.search(s) for s in re.split(r"(?<=[.!?])\s+", index.chunks[pos].text)):
+            return True
+    return False
+
+
+def _read_hours(q: Query, low: str) -> None:
+    """Hours asked without the word ("when does the lobby close?": answered from a schedule, else read as before: see
+    select), the place asked about, and a comparison of every branch."""
+    strict = hours_strong(low)
+    site = any(re.search(rf"\b{re.escape(w)}\b", low) for w in SITE_WORDS)
+    loose = bool(not strict and (FACILITY.search(low) or site) and HOURS_LOOSE.search(low) and place_phrases(q.raw))
+    if q.attribute in (None, "when", "hours") and not HOURS_Q.search(low) and not FEE_Q.search(low) and (strict or loose):
+        q.soft_hours, q.loose_hours, q.read_as = True, loose, ("when" if WHEN_Q.search(low) else None, set(q.qualifiers))
+        q.attribute = "hours"
+        if "hour" not in q.tokens:
+            q.tokens.append("hour")
+    q.places = place_phrases(q.raw) if q.attribute == "hours" else []
+    if q.attribute == "hours" and not q.places and q.entity and q.entity_is_branch:
+        q.places = [{_stem(q.entity)}]               # "the harbor branch", in any case
+    if q.places:                                     # "Highway 12" is not a product qualifier
+        q.qualifiers = {w for w in q.qualifiers if not any(_stem(w) in p for p in q.places)}
+    q.compare = bool(q.attribute == "hours" and not q.places and SAME_Q.search(low) and ALL_PLACES.search(low))
 
 
 # Amounts written out: "15k", "15 thousand", "fifteen thousand dollars", "five grand", "7,500 dollars" (never "401k");
@@ -555,6 +787,80 @@ def written_amounts(question: str) -> str:
 def count_re(noun: str):
     """'12 offices', '350 members' — a count, never a year like 'In 2025,'."""
     return re.compile(rf"(?<![\d,.$])(?!(?:19|20)\d\d\b)\d[\d,]*\+?\s+(?:[a-z’'-]+\s+){{0,2}}{noun}")
+
+
+# A count asked of a year ("how many … last year", "… in 2023"): the site states such counts as dated sentences, one per
+# year, so the answer is the sentence for the asked year (see select and count_sentence).
+PERIOD_Q = re.compile(r"\b(last|this|past|previous|prior)\s+year\b|\b(?:in|during|for|of)\s+((?:19|20)\d\d)\b", re.I)
+YEAR_IN = re.compile(r"\b(?:in|during|for)\s+((?:19|20)\d\d)\b", re.I)
+PERIOD_WORDS = {_stem(w) for w in ("last", "this", "past", "previous", "prior", "year")}
+CLAUSE_END = re.compile(r",\s+|;\s+|\s[—–]\s")
+# what a member calls the people who work there, and the site's word for them
+COUNT_SYN = {_stem(w): _stem("employees") for w in ("staff", "staffers", "workers", "personnel")}
+COUNT_OF = re.compile(r"\bhow many\s+of\s+(?:the|your|our|its|their|those|these)\s+([a-z-]+)", re.I)
+WHAT_NUMBER = re.compile(r"\bwhat\s+number\s+of\s+(?:(?:the|your|our)\s+)?((?:[a-z-]+\s+)?[a-z-]+)", re.I)
+TEAM_MEMBERS = re.compile(r"\bhow many\s+(?:of\s+(?:the|your|our)\s+)?(?:[a-z]+\s+)?(?:team|staff|crew)\s+members?\b", re.I)
+# a value (rate, APY) asked of one row a term, model year or amount pins is no list ("what APY does <Name> offer on its
+# 17-month special?")
+VALUE_ASKED = re.compile(r"\b(?:what|which)\s+(?:\w+\s+){0,2}?(?:rates?|apr|apy|dividends?|yield|interest)\b", re.I)
+
+
+def _spells(acronym: str, text: str) -> bool:
+    """Does the text spell the acronym out ("KRC" = "Kayak Repair Crew")?"""
+    return re.search(r"\b" + r"[\w'’-]*\s+".join(re.escape(ch) for ch in acronym.upper()) + r"[\w'’-]*", text) is not None
+
+
+def _acronyms(q: Query) -> dict:
+    return {_stem(w.lower()): w for w in re.findall(r"\b[A-Z]{2,5}\b", q.raw)}
+
+
+def count_sentence(c: Chunk, q: Query) -> tuple:
+    """(the sentence or bullet of the chunk that counts the asked noun, the year it is stated for, how many of the
+    question's words the counting clause itself names). A count in one clause and the topic in another doesn't
+    qualify: "40 workers paddled a total of 900 hours, with many using their <benefit>" counts paddlers."""
+    pat = count_re(q.count_noun)
+    parts = [p.strip().lstrip("-• ").strip() for p in re.split(r"(?<=[.!?])\s+(?=[A-Z0-9*])|\n|\s+[-•]\s+(?=[A-Z0-9])", c.text)]
+    cand = [p for p in parts if p and pat.search(p.lower())]
+    if not cand:
+        return None, None, 0
+    words = [t for t in dict.fromkeys(q.tokens) if t not in GENERIC and t not in PERIOD_WORDS and t not in LIGHT_VERBS
+             and t != q.count_noun and not t.isdigit()]
+    acr = _acronyms(q)
+
+    def cover(p):
+        m = pat.search(p.lower())
+        cuts = [0] + [x.end() for x in CLAUSE_END.finditer(p)] + [len(p) + 1]
+        clause = next(p[a:b] for a, b in zip(cuts, cuts[1:]) if a <= m.start() < b)
+        have = set(tokenize(clause))
+        return sum(t in have or (t in acr and _spells(acr[t], clause)) for t in words)
+    best = max(cand, key=cover)
+    m = YEAR_IN.search(best) or YEAR_IN.search(c.section or "")
+    return re.sub(r"\s*\([^()]*$", "", best), (int(m.group(1)) if m else None), cover(best)
+
+
+def _read_counts(q: Query, low: str) -> None:
+    """How many …: the counted noun as the site says it, and the year asked."""
+    if q.attribute is None and (m := WHAT_NUMBER.search(low)):
+        noun = next((w for w in m.group(1).split() if w not in SITE_WORDS and w not in STOP), None)
+        if noun:
+            q.attribute, q.count_noun = "count", _stem(noun)
+            q.count_said.add(_stem("number"))
+            q.tokens = [t for t in q.tokens if t != _stem("number")]
+    if q.attribute == "count" and TEAM_MEMBERS.search(low):
+        q.count_noun = _stem("staff")                # "team members": the people who work there
+        q.count_said |= {_stem(w) for w in ("team", "crew", "member")}
+        q.tokens = [t for t in q.tokens if t not in q.count_said]
+    m = COUNT_OF.search(low)
+    if m and q.attribute == "count" and q.count_noun in (_stem("of"), "of"):
+        q.count_noun = _stem(m.group(1))
+    if q.attribute == "count" and q.count_noun in COUNT_SYN:
+        asked, q.count_noun = q.count_noun, COUNT_SYN[q.count_noun]
+        q.count_said.add(asked)
+        q.tokens = list(dict.fromkeys(q.count_noun if t == asked else t for t in q.tokens))
+        if q.count_noun not in q.tokens:
+            q.tokens.append(q.count_noun)
+    m = PERIOD_Q.search(low) if q.attribute == "count" else None
+    q.period = (int(m.group(2)) if m.group(2) else m.group(1)) if m else None
 
 
 def qualify(c: Chunk, q: Query) -> tuple[str, float]:
@@ -636,7 +942,15 @@ def supports(c: Chunk, q: Query) -> bool:
             own = c.index_text[:max(0, len(c.index_text) - len(c.text))] + " " + (c.label() if c.is_row else "")
             if q.category and not names_line(own.lower(), q):
                 return False
-    if q.entity and (q.entity not in text or (q.entity_is_branch and "branch" not in text)):
+    if q.attribute == "hours" and q.places:
+        # a schedule block whose own text plus its page's lead names every word of the place asked about
+        named = set(tokenize(f"{c.index_text} {c.about}"))
+        if len(DAY_LINE.findall(c.text)) < 2 or not all(p <= named for p in q.places):
+            return False
+    elif q.attribute == "hours" and q.need_schedule:
+        if len(DAY_LINE.findall(c.text)) < 2:           # asked without the word "hours": only a schedule answers
+            return False
+    elif q.entity and (q.entity not in text or (q.entity_is_branch and "branch" not in text)):
         return False
     # a descriptor is present as itself or as the site's word for it ("car" loan -> "Auto" rows)
     if q.descriptors and not any(d in text or any(s in text for s in SYNONYMS.get(d, ())) for d in q.descriptors):
@@ -647,7 +961,8 @@ def supports(c: Chunk, q: Query) -> bool:
         return False
     if q.subject:                       # fee/count: every rare word asked about (or a synonym) is there
         have = c.tf if c.tf else Counter(tokenize(c.index_text))
-        if not all(any(w in have for w in alts) for alts in q.subject):
+        acr = _acronyms(q)
+        if not all(any(w in have or (w in acr and _spells(acr[w], c.text)) for w in alts) for alts in q.subject):
             return False
         # a state word ("lost") and the thing it happened to ("money order") on one fee item's own label
         on_label = [a for a in q.subject if ON_LABEL in a or set(a) & HAPPENED]
@@ -683,7 +998,7 @@ def supports(c: Chunk, q: Query) -> bool:
         return bool(DATE_EV.search(c.text))
     if q.attribute == "fee":            # like rates: fees are published in fee schedules and product pages, not
         # blog posts; a fee item, never a rate row's balance tier nor a threshold ("less than $5") unless one is asked
-        return c.kind != "article" and not rate_row(c) and fee_evidence(c, q)
+        return c.kind not in ("article", "calculator") and not rate_row(c) and fee_evidence(c, q)
     if q.attribute == "hours":
         return bool(HOURS_EV.search(c.text))
     return True
@@ -833,6 +1148,15 @@ def site_branch(index: Index, name: str) -> bool:
 
 def select(index: Index, q: Query, k: int = 8) -> Evidence:
     view = index.view
+    if q.soft_hours:
+        _about(index)
+        q.need_schedule = True
+        if not any(supports(c, q) for c in index._schedules) and (q.loose_hours or not q.places or dated_status(index, q)):
+            # no schedule answers it, and the wording or a dated statement about the place says it asks something
+            # else ("when is the <Name> branch open until?"): the question as it read before
+            q.attribute, q.qualifiers = q.read_as
+            q.places, q.compare, q.need_schedule, q.soft_hours = [], False, False, False
+            q.tokens = [t for t in q.tokens if t != "hour"]
     # A product word the site never uses ("share certificate") is a synonym, not a requirement.
     q.descriptors = {d for d in q.descriptors if _stem(d) in index.postings}
     if q.category and q.descriptors & PLAIN_DESCRIPTORS:
@@ -852,6 +1176,8 @@ def select(index: Index, q: Query, k: int = 8) -> Evidence:
         q.tokens = [t for t in q.tokens if t not in (_stem(q.place), _stem("branch"), _stem("location"), _stem("office"))]
     if q.attribute in ("fee", "count") and not q.subject:
         q.subject = rare_subject(index, q)
+        if q.count_said:                    # "staff": the site says "employees"; the asked word is no requirement
+            q.subject = [a for a in q.subject if not q.count_said & set(a)]
     hits = index.search(q.tokens, top=400)
     if q.attribute == "count" and q.count_noun:
         # BM25 ranks long boilerplate ("... N members and M offices") low for a
@@ -861,6 +1187,22 @@ def select(index: Index, q: Query, k: int = 8) -> Evidence:
                  if index.chunks[pos].id not in have and pat.search(index.chunks[pos].text.lower())]
     if q.attribute == "rate" and q.category:
         hits += product_page_rates(index, q, hits)
+    focus = fee_focus(index, q) if q.attribute == "fee" and not WIRE.search(q.raw) else None
+    if focus and focus[0]:
+        # fee items naming what was asked, wherever the word search ranked them; below every real hit on score, so
+        # they win only by naming more of what was asked
+        have, where = {c.id for _, c in hits}, _fee_where(index)
+        low = min((s for s, _ in hits), default=1.0) * 0.5
+        for pos in sorted({p for a, _ in focus[0].values() for x in a for p in where.get(x, ())}):
+            if index.chunks[pos].id not in have:
+                hits.append((low, index.chunks[pos]))
+    if q.attribute == "hours":
+        _about(index)
+        if q.places:                    # the schedules of the place asked about, wherever the word search ranked them
+            have, floor = {c.id for _, c in hits}, _bm25_floor(hits)
+            hits += [(floor, c) for c in index._schedules if c.id not in have and supports(c, q)]
+        q.schedules = (list(index._schedules) if q.compare
+                       else [c for c in index._schedules if supports(c, q)] if q.places else [])
     scored = []
     for s, c in hits:
         if c.expired_on and c.expired_on < view.taken_on:
@@ -878,10 +1220,16 @@ def select(index: Index, q: Query, k: int = 8) -> Evidence:
         if supports(c, q):
             factor *= 1.4
         scored.append((s * factor, c))
-    scored.sort(key=lambda sc: (-sc[0], sc[1].id))
+    cover = {}
+    if focus and focus[0]:
+        cover = {c.id: chunk_cover(c, q, focus)[:3] for _, c in scored if supports(c, q)}
+        cover = {i: v for i, v in cover.items() if v[1]}
+    rank = lambda sc: (tuple(-x for x in cover.get(sc[1].id, (0, 0, 0))), -sc[0], sc[1].id)
+    scored.sort(key=rank)
+    every = list(scored)                # every hit, for the counts of each year (see below)
     if q.attribute in ("rate", "fee"):  # rate tables must not be crowded out by prose that says "mortgage"
         rows = [sc for sc in scored if sc[1].is_row][:40]
-        scored = sorted(rows + [sc for sc in scored if not sc[1].is_row][:30], key=lambda sc: (-sc[0], sc[1].id))
+        scored = sorted(rows + [sc for sc in scored if not sc[1].is_row][:30], key=rank)
     else:
         scored = scored[:60]
     kept, dropped = suppress_stale(scored, view, q)
@@ -900,7 +1248,7 @@ def select(index: Index, q: Query, k: int = 8) -> Evidence:
         deduped.append((s, c))
     kept = deduped
 
-    if q.attribute == "hours" and not q.entity:
+    if q.attribute == "hours" and not q.entity and not q.places:
         # "General" hours = what most branches share: weight a schedule by how common its times are.
         def times(c):
             return {re.sub(r"\W", "", m.lower()) for m in HOURS_EV.findall(c.text)}
@@ -909,6 +1257,17 @@ def select(index: Index, q: Query, k: int = 8) -> Evidence:
             freq.update(ts)
         kept = sorted(((s * (1 + 0.1 * sum(freq[t] for t in times(c))) if supports(c, q) else s, c)
                        for s, c in kept), key=lambda sc: (-sc[0], sc[1].id))
+    if q.attribute == "hours" and not q.entity and not q.places and not q.compare:
+        top = next((c for _, c in kept if supports(c, q)), None) or next((c for _, c in hits if supports(c, q)), None)
+        if q.need_schedule or (top is not None and len(DAY_LINE.findall(top.text)) >= 2):
+            # one schedule for every wording: the one whose times the most branches share
+            clock = lambda c: {re.sub(r"\W", "", m.lower()) for m in HOURS_EV.findall(c.text)}
+            every_s = [c for c in index._schedules if supports(c, q)]
+            share = Counter(t for c in every_s for t in clock(c))
+            if every_s:
+                best = min(every_s, key=lambda c: (-sum(share[t] for t in clock(c)), c.id))
+                kept = [(kept[0][0] if kept else 1.0, best)] + [sc for sc in kept if sc[1].id != best.id]
+                q.need_schedule = True
     if q.attribute in ("count", "when"):
         # Facts that change over time: among chunks relevant enough to the question, newest first.
         # "Relevant enough" = covers as many of the question's words as the best chunk does, so a
@@ -931,6 +1290,31 @@ def select(index: Index, q: Query, k: int = 8) -> Evidence:
                 stale = [sc for sc in kept if counts(sc[1]) and not counts(sc[1]) & win]
                 dropped += stale
                 kept = [sc for sc in kept if sc not in stale]
+    if q.attribute == "count" and q.period:
+        # Counts stated per year ("N employees … in 2024", "M … in 2023") are not stale copies of each other: the
+        # asked year's sentence answers; a relative year ("last year") the site doesn't count gets the years it does,
+        # newest first; a calendar year it doesn't count gets none.
+        found = []
+        for s, c in every:
+            if supports(c, q):
+                sent, year, cov = count_sentence(c, q)
+                if sent and year:
+                    found.append((cov, year, sent, s, c))
+        top = max((f[0] for f in found), default=0)
+        by_year = {}
+        for cov, year, sent, s, c in found:
+            if cov and cov == top:
+                by_year.setdefault(year, (sent, s, c))
+        if by_year:
+            now = (view.taken_on + timedelta(days=30)).year
+            want = q.period if isinstance(q.period, int) else {"last": now - 1, "past": now - 1, "previous": now - 1,
+                                                               "prior": now - 1, "this": now}[q.period]
+            years = [want] if want in by_year else [] if isinstance(q.period, int) else sorted(by_year, reverse=True)[:3]
+            q.no_year = not years
+            q.series = [(y, by_year[y][0], by_year[y][2]) for y in years]
+            ids = {c.id for _, _, c in q.series}
+            dropped = [sc for sc in dropped if sc[1].id not in ids]
+            kept = [(by_year[y][1], by_year[y][2]) for y in years] + [sc for sc in kept if sc[1].id not in ids]
     per_page: Counter = Counter()
     chosen, overflow = [], []
     for s, c in kept:
@@ -1151,6 +1535,7 @@ NOT_PLACE_NAMES = {"main", "home", "head", "corporate", "post", "box", "back", "
 CHAT_FILLERS = {_stem(w) for w in ("pls", "plz", "thx", "thanks", "thank", "ty", "asap")}
 # who ("someone who isn't a member") and how soon ("a debit card fast") are never what a fee is charged for
 NOT_FEE_SUBJECT = {_stem(w) for w in ("someone", "somebody", "anyone", "anybody", "everyone", "everybody", "person",
+                                      "something", "anything", "everything", "stuff",
                                       "people", "fast", "quick", "quickly", "soon", "urgent", "urgently", "immediately",
                                       "yesterday", "today", "tonight", "tomorrow", "recently", "earlier", "already",
                                       "ago", "few", "couple", "several", "later", "last", "next", "week", "weeks", "day",
@@ -1163,8 +1548,12 @@ FUNCTION_WORDS = {_stem(w) for w in ("after", "before", "during", "until", "sinc
                                      "under", "up", "down", "out", "off", "again", "once")}
 QUIET = STOP | GENERIC | FEE_WORDS | CHAT_FILLERS | SEND_WORDS | NOT_FEE_SUBJECT | FUNCTION_WORDS \
     | {_stem(w) for w in ("will", "shall", "might", "must", "may", "she", "he", "him", "her", "ones")}
+# verbs that say little about what is asked ("what does it cost to take …", "how many used …"): never required
+LIGHT_VERBS = {_stem(w) for w in """take takes took taken taking use uses used using get gets got gotten getting make makes
+made making do does did done doing have has had having give gives gave given giving go goes went gone going receive receives
+received receiving put puts putting utilize utilizes utilized utilizing""".split()}
 # never what a fee is charged for, however rarely the site writes them ("if", "will", "under")
-NEVER_SUBJECT = FUNCTION_WORDS | {_stem(w) for w in ("will", "shall", "might", "must", "may", "ones")}
+NEVER_SUBJECT = FUNCTION_WORDS | {_stem(w) for w in ("will", "shall", "might", "must", "may", "ones")} | LIGHT_VERBS
 # A relative clause after the thing a fee is asked about ("a check I wrote", "a check my wife wrote", "the card I've
 # used"), a passive one ("a check written by me") or one without a subject ("a check that bounced"): its verb, and
 # its subject noun, say what was done with it (see rare_subject). The noun is never a function word ("a fee if I lose").
@@ -1208,7 +1597,8 @@ FEE_SYN = {_stem(k): [_stem(x) for x in v] for k, v in {
     "expedited": ["rush"], "expediting": ["rush"], "overnight": ["rush"], "overnighted": ["rush"], "stopping": ["stop"],
     "stopped": ["stop"], "keyed": ["key"], "bounced": ["returned"], "bounce": ["returned"], "bounces": ["returned"],
     "bouncing": ["returned"], "notarize": ["notary"], "notarized": ["notary"], "notarizing": ["notary"],
-    "garnished": ["garnishment"], "garnish": ["garnishment"], "levied": ["levy"], "dormant": ["inactive"]}.items()}
+    "garnished": ["garnishment"], "garnish": ["garnishment"], "levied": ["levy"], "dormant": ["inactive"],
+    "overseas": ["foreign"], "foreign": ["overseas"], "abroad": ["foreign", "international"]}.items()}
 VALUE_VERB_STEMS = {_stem(w) for w in ("pay", "pays", "paying", "paid", "earn", "earns", "earning", "earned", "yield",
                                        "yields", "yielding")}
 UNPRICED = "\x00unpriced"     # a required word the site prices nothing under: no chunk can carry it
@@ -1308,7 +1698,7 @@ def rare_subject(index: Index, q: Query) -> list[list[str]]:
     out = []
     for t in dict.fromkeys(tokenize(text)):
         if t in GENERIC or t in FEE_WORDS or t in CHAT_FILLERS or t == q.count_noun or t[0].isdigit() or t in SEND_WORDS \
-                or t in skip or t in NEVER_SUBJECT or (fee and t in NOT_FEE_SUBJECT):
+                or t in skip or t in NEVER_SUBJECT or (fee and t in NOT_FEE_SUBJECT) or (q.period and t in PERIOD_WORDS):
             continue                                # "send a wire": the fee line says what is sent, not "send"
         if len(index.postings.get(t, ())) < limit or (fee and t in HAPPENED):
             out.append([t] + _SYN.get(t, []) + (FEE_SYN.get(t, []) if fee else []))
@@ -1436,8 +1826,11 @@ def _labels(c: Chunk):
     Canadian checks) $35.00")."""
     if c.is_row:
         vals = " ".join(v for _, v in c.values())
-        if not rate_row(c) and (FEE_EV.search(vals) or re.search(r"\bfree\b|no\s+charge", vals, re.I)):
+        if not rate_row(c) and FEE_EV.search(vals):
             yield tokenize(f"{c.label()} {vals}"), f"{c.label()} {vals}", False
+        elif c.free_row:                                    # "Debit card transactions at <our> ATMs | Free"
+            vals = " ".join(c.cells[1:])
+            yield tokenize(f"{c.cells[0]} {vals}"), f"{c.cells[0]} {vals}", False
         return
     lines = c.text.split("\n")
     for i, line in enumerate(lines):
@@ -1448,22 +1841,44 @@ def _labels(c: Chunk):
             yield toks, item, threshold
 
 
+NO_CHARGE = re.compile(r"\bfree\b|\bno\s+(?:charge|cost|fee)\b", re.I)
+
+
+def _mark_free_rows(index: Index) -> None:
+    """In a fee table (two or more rows with a dollar amount), a row whose other cells say "Free" or "no charge" is
+    itself a fee line: what costs nothing is priced too."""
+    for vp in index.view.pages.values():
+        tables: dict = {}
+        for c in vp.page.chunks:
+            if c.is_row and not rate_row(c):
+                tables.setdefault(c.table_span, []).append(c)
+        for rows in tables.values():
+            if sum(bool(FEE_EV.search(" ".join(v for _, v in r.values()))) for r in rows) >= 2:
+                for r in rows:
+                    rest = " ".join(r.cells[1:])
+                    if len(r.cells) >= 2 and not FEE_EV.search(rest) and NO_CHARGE.search(rest) and len(rest.split()) <= 10:
+                        r.free_row = True
+
+
 def _fee_line_words(index: Index) -> set:
     """Every word of every fee item on the site ("Stop payment … $30.00", "Re-key box due to lost key $100.00"): the
     things it states a fee or price for; and, per word, the distinct amounts under $1,000 it is priced at. Built once
     per view."""
     words = getattr(index, "_fee_words", None)
     if words is None:
+        _mark_free_rows(index)
         words, amounts = set(), {}
         for c in index.chunks:
-            if c.kind == "article" or rate_row(c):
+            if c.kind in ("article", "calculator") or rate_row(c):     # a calculator's figures are examples
                 continue
             for toks, item, threshold in _labels(c):
                 words |= set(toks)
                 if threshold:
                     continue
                 m = re.search(r"\$\s?(\d[\d,]*(?:\.\d+)?)|(\d+(?:\.\d+)?)\s?%", item)
-                v = (float(m.group(1).replace(",", "")) if m.group(1) else "%" + m.group(2)) if m else "free"
+                if not m:                                   # "Free": a price of nothing is no amount
+                    continue
+                v = float(m.group(1).replace(",", "")) if m.group(1) else "%" + m.group(2)
                 if isinstance(v, float) and v >= 1000:      # a balance or loan amount, not a fee
                     continue
                 for w in set(toks):
@@ -1482,6 +1897,82 @@ def fee_evidence(c: Chunk, q: Query, groups=()) -> bool:
     allow = bool(ASKS_THRESHOLD.search(q.raw))
     return any((not threshold or allow) and all(any(w in toks for w in alts) for alts in groups)
                for toks, _, threshold in _labels(c))
+
+
+# What a fee question is about. Its words that some fee line prices split into the thing asked ("money order",
+# "foreign transaction": primary, double weight in the asking clause, not the lead-in) and who or which product
+# ("non-member", "debit card", "a box of": secondary). A fee line is ranked by the primary words it names, then by
+# the side it is on, then by the word search: "a money order for a non-member" is the money order's line, not the
+# line that happens to say "non-member".
+WHO_WORDS = PERSON | {_stem(w) for w in ("member", "members", "nonmember", "nonmembers")}
+NEG_WORDS = {"non", "not"}
+NEGATED = re.compile(r"\bnon\b|\bnot\b|n['’]t\b|\banother\b|\bother\b|\bsomeone\s+else", re.I)
+QUANTITY_OF = re.compile(r"\b(box|book|pack|set|sheet|bunch|couple|pair|lot|number|kind|type|sort)e?s?\s+of\b", re.I)
+FOCUS_QUIET = QUIET | LIGHT_VERBS | {_stem(w) for w in FRAME_WORDS} | {_stem(w) for w in ("free", "new", "need", "needs", "want")}
+
+
+def fee_focus(index: Index, q: Query) -> tuple:
+    """(primary {word: (alternatives, weight)}, secondary {word: alternatives}, side): side is "own" ("a <Name> ATM",
+    "your own"), "other" ("non", "not", "another", "someone else's"), "both", or None when the question states none."""
+    if q.focus is not None:
+        return q.focus
+    fee_said = _fee_line_words(index)
+    full = re.match(r".*\?", q.raw, re.S)
+    full = full.group(0) if full else q.raw
+    clause = set(tokenize(OPENER.sub("", full)))
+    product = {_stem(w.lower()) for w in set(q.category) | set(q.descriptors) | set(q.qualifiers) | PLAIN_DESCRIPTORS}
+    product |= {s for w in list(product) for s in _SYN.get(w, [])}
+    quantity = {_stem(m.group(1).lower()) for m in QUANTITY_OF.finditer(full)}
+    alts = lambda t: [t] + _SYN.get(t, []) + FEE_SYN.get(t, [])
+    primary, secondary = {}, {}
+    for t in dict.fromkeys(tokenize(full)):
+        if t in FOCUS_QUIET or t[0].isdigit() or t in NEG_WORDS or not any(x in fee_said for x in alts(t)):
+            continue
+        if t in product or t in WHO_WORDS or t in quantity:
+            secondary[t] = alts(t)
+        else:
+            primary[t] = (alts(t), 2 if t in clause else 1)
+    said = [re.sub(r"['’]s$", "", w) for w in re.findall(r"[a-z][\w'’-]*", full.lower())]
+    mine = {"your", "our", "own"} | set(SITE_WORDS)
+    # "a <Name> ATM", "your ATM"; "a non-<Name> ATM" is the other side
+    own = any(_stem(w) in primary and mine & {p for x in said[max(0, i - 2):i] if not x.startswith("non-") for p in x.split("-")}
+              for i, w in enumerate(said))
+    own = own or re.search(r"\b(?:your|our)\s+own\b|-owned\b", full.lower()) is not None
+    both = own and re.search(r"\b(?:another|other)\b|\bnon-?[a-z]", full.lower()) is not None
+    q.focus = (primary, secondary, "both" if both else "other" if NEGATED.search(full) else "own" if own else None)
+    return q.focus
+
+
+def fee_cover(toks, focus: tuple, priced: bool = True) -> tuple:
+    """(weight of the primary words the fee item names, how many, whether it is on the side asked, secondary words).
+    With no side asked, a priced item is on it and a free one is not."""
+    primary, secondary, side = focus
+    toks = set(toks)
+    hit = [w for a, w in primary.values() if any(x in toks for x in a)]
+    sec = sum(any(x in toks for x in a) for a in secondary.values())
+    return (sum(hit), len(hit), int(("non" in toks) == (side == "other")) if side in ("own", "other") else int(priced), sec)
+
+
+def chunk_cover(c: Chunk, q: Query, focus: tuple) -> tuple:
+    allow = bool(ASKS_THRESHOLD.search(q.raw))
+    return max((fee_cover(toks, focus, bool(re.search(r"[$%]", item))) for toks, item, thr in _labels(c) if not thr or allow),
+               default=(0, 0, 0, 0))
+
+
+def _fee_where(index: Index) -> dict:
+    """word -> positions of the chunks whose fee items carry it. Built once per view."""
+    where = getattr(index, "_fee_pos", None)
+    if where is None:
+        _fee_line_words(index)
+        where = {}
+        for pos, c in enumerate(index.chunks):
+            if c.kind in ("article", "calculator") or rate_row(c):
+                continue
+            for toks, _, thr in _labels(c):
+                for w in set(toks):
+                    where.setdefault(w, set()).add(pos)
+        index._fee_pos = where
+    return where
 
 
 def _wire_line_words(index: Index) -> set:

@@ -272,7 +272,7 @@ class Rev21(unittest.TestCase):
         self.assertEqual(parse_query("office hrs pls?").attribute, "hours")
         self.assertEqual(parse_query("When is the main office open?").attribute, "hours")
         self.assertIsNone(parse_query("What time period does the special cover?").attribute)
-        self.assertNotEqual(parse_query("What time does the elm branch close?").attribute, "hours")
+        self.assertEqual(parse_query("What time does the elm branch close?").attribute, "hours")   # a named branch has hours
         q = parse_query("Total number of offices?")
         self.assertEqual((q.attribute, q.count_noun), ("count", _stem("offices")))
 
@@ -1695,6 +1695,235 @@ class Rev43(unittest.TestCase):
         finally:
             retrieve.use_site_words(saved[0])
             retrieve.use_proper_names(saved[1])
+
+
+class Rev44(unittest.TestCase):
+    """Branch hours by place and without the word, every branch compared, fee wordings and what a fee is about,
+    counts by year, list, contact and link wordings, status passages (synthetic data only)."""
+
+    LARK = ("# Canoeco opens a new branch\n\n"
+            "LARKSPUR, Ohio–Canoeco Credit Union opened its new branch in Larkspur this week, with local leaders cutting a "
+            "ribbon and members touring the lobby, the drive-up lanes and the hands-on learning area.\n\n"
+            "The Larkspur branch is located at 410 Quartz Road. Branch hours are:\n\n"
+            "**Lobby**\n\nMonday-Friday: 9 a.m.-4 p.m.\n\nSaturday: 10 a.m.-noon\n\nSunday: Closed\n\n"
+            "**Drive-up**\n\nMonday-Friday: 7 a.m.-6:40 p.m.\n\nSaturday: Closed\n\nSunday: Closed\n\n"
+            "**ABOUT CANOECO:**\n\nCanoeco is a not-for-profit financial cooperative owned by its members.\n")
+    MILL = ("# Canoeco celebrates the Millbrook branch\n\n"
+            "MILLBROOK, Ohio–Canoeco Credit Union celebrated the completion of its remodeled Millbrook branch with a ribbon "
+            "cutting attended by members, staff and the local chamber of commerce.\n\n"
+            "The Millbrook branch is located at 77 Harbor Highway 12, and the phone number is (555) 010-0123. Branch hours are:\n\n"
+            "**Lobby** Monday-Thursday: 7:15 a.m.-3:45 p.m.\n\nFriday: 7:15 a.m.-4:20 p.m.\n\nSaturday: 9 a.m.-1 p.m.\n\nSunday: Closed\n\n"
+            "**Drive-up** Monday-Friday: 7 a.m.-6:40 p.m.\n\nSaturday: 9 a.m.-1 p.m.\n\nSunday: Closed\n\n"
+            "**ABOUT CANOECO:**\n\nCanoeco is a not-for-profit financial cooperative owned by its members.\n")
+    CLOSE = ("# Canoeco plans to close its Elmwood branch\n\n"
+             "ELMWOOD, Ohio–Canoeco Credit Union will close its Elmwood branch inside the grocery store on June 30, 2031. "
+             "Members can use the Larkspur or Millbrook branches, and the branch staff will move to them.\n")
+    FEES = ("# Fee Schedule\n\n## Account services\n\n| Service | Fee |\n|---|---|\n| Canoe check-cashing fee (non member) | $8.00 each |\n"
+            "| Kayak money orders | $5.00 each |\n| Canoe notary services | $10.00 for non-members |\n| Locker drill open | $175.00 |\n"
+            "| Signature guarantee | Available at no charge for members only |\n\n"
+            "## Debit card service charges\n\n| Service | Fee |\n|---|---|\n| Foreign transaction fee | 1% of Amount |\n"
+            "| Rush fee for debit card | $50.00* |\n| Debit card transactions at Canoeco ATMs | Free |\n"
+            "| Non-Canoeco ATM usage (after 8 free per month) | $0.50* per transaction |\n")
+    CALC = "# Payment calculator\n\nTry an example: 24 months of canoe payments, fee $3.00 each, notary $99.00 example.\n"
+
+    def _ks(self, pages, date="2031-06-15"):
+        from contract import Page, Snapshot
+        ks = build()
+        ks.ingest(Snapshot("s1", date, [Page(f"https://canoeco.example.org/{p}", f"{p} | Canoeco", md, date + "T09:00:00Z")
+                                        for p, md in pages]))
+        return ks
+
+    def _branches(self):
+        return self._ks([("news/larkspur", self.LARK), ("news/millbrook", self.MILL), ("news/elmwood", self.CLOSE)])
+
+    def test_a_label_above_a_schedule_is_kept_and_other_one_word_lines_are_not(self):
+        page = Parser().parse("example.org/a", "https://example.org/a", "A",
+                              "# Branch\n\n**Lobby**\n\nMonday-Friday: 9 a.m.-4 p.m.\n\nSaturday: Closed\n\n**Hello**\n\nSome words here for you.\n")
+        text = "\n".join(c.text for c in page.chunks)
+        self.assertIn("Lobby", text)
+        self.assertNotIn("Hello", text)
+
+    def test_a_schedule_is_bound_to_its_pages_lead(self):
+        import retrieve
+        index = self._branches()._indexes[-1]
+        retrieve._about(index)
+        self.assertEqual(sorted(c.branch for c in index._schedules), ["Larkspur", "Millbrook"])
+        larkspur = next(c for c in index._schedules if c.branch == "Larkspur")
+        self.assertIn("410 Quartz Road", larkspur.index_text + larkspur.about)         # the street, and the lead's town
+        self.assertIn("LARKSPUR, Ohio", larkspur.about)
+        # a page with no lead paragraph before its schedules binds nothing
+        bare = self._ks([("hours", "# Hours\n\n**Lobby**\n\nMonday-Friday: 9 a.m.-4 p.m.\n\nSaturday: Closed\n")])._indexes[-1]
+        retrieve._about(bare)
+        self.assertEqual([c.branch for c in bare._schedules], [""])
+
+    def test_place_phrases(self):
+        from retrieve import place_phrases
+        cases = {"What are the lobby hours at the Quartz Road branch?": [{"quartz"}],
+                 "What are the hours of the Canoeco on Harbor Highway 12?": [{"harbor", "12"}],
+                 "When is the Millbrook drive-up open on Saturdays?": [{"millbrook"}],
+                 "What are the hours at the Millbrook, Ohio branch?": [{"millbrook"}],
+                 "What are the hours at the Millbrook, Oh. branch?": [{"millbrook"}],
+                 "Hours at the Millbrook, Larkspur, or Elmwood branch?": [{"millbrook"}, {"larkspur"}, {"elmwood"}],
+                 "Hi, I'm Sarah. What are your lobby hours?": [],
+                 "What are your Sat hours?": [],
+                 "Is the drive-up open until 6 PM on Fridays?": [],
+                 "WHAT ARE YOUR LOBBY HOURS": [],
+                 "What Are The Lobby Hours At The Quartz Road Branch?": []}
+        for question, want in cases.items():
+            self.assertEqual(place_phrases(question), want, question)
+
+    def test_hours_cues(self):
+        hours = lambda q: parse_query(q).attribute == "hours"
+        for q in ("When does the lobby close?", "When do you close?", "What time do you open?", "How late is the drive-up open on Fridays?",
+                  "Can I visit the lobby on Saturday?", "When is the Millbrook drive-up open on Saturdays?",
+                  "Are you open on Sundays?", "Canoeco lobby times?", "What is the drive-up schedule?"):
+            self.assertTrue(hours(q), q)
+        for q in ("When are scholarship applications open?", "If I deposit a check at a branch on Friday, when will it be available?",
+                  "When is voting open for the board election?", "How much is the fee at a branch?", "What time period does the special cover?"):
+            self.assertFalse(hours(q), q)
+        self.assertTrue(parse_query("When does the lobby close?").soft_hours)       # asked without the word "hours"
+        self.assertFalse(parse_query("What are the lobby hours?").soft_hours)
+
+    def test_hours_of_a_place_and_a_facility(self):
+        ks = self._branches()
+        said = lambda q: ks.answer(q).text
+        self.assertEqual(said("What are the lobby hours at the Quartz Road branch?"),
+                         "Lobby Monday-Friday: 9 a.m.-4 p.m.; Saturday: 10 a.m.-noon; Sunday: Closed")
+        self.assertEqual(said("When is the Millbrook drive-up open on Saturdays?"), "Drive-up Saturday: 9 a.m.-1 p.m.")
+        self.assertEqual(said("What are the Millbrook, Ohio branch hours on weekdays?"),
+                         "Lobby Monday-Thursday: 7:15 a.m.-3:45 p.m.; Friday: 7:15 a.m.-4:20 p.m.; Drive-up Monday-Friday: 7 a.m.-6:40 p.m.")
+        self.assertIn("7:15 a.m.-3:45 p.m.", said("What are the hours of the Canoeco on Harbor Highway 12?"))
+        self.assertIn("Monday-Friday: 9 a.m.-4 p.m.", said("Hours at the Larkspur branch, the one on Quartz Road?"))
+        self.assertFalse(ks.answer("What are the hours at the Harborview branch?").confident)        # no such branch
+        self.assertFalse(ks.answer("What are the hours at the Millbrook, Ohio branch in Quartz Road?").confident)
+
+    def test_a_question_without_a_place_gets_one_schedule_for_every_wording(self):
+        ks = self._branches()
+        answers = {q: ks.answer(q).text for q in ("What are your lobby hours?", "When do you close?", "What time do you open?",
+                                                  "Are you open on Sundays?", "WHAT ARE YOUR LOBBY HOURS", "Hi, I'm Sarah. What are your lobby hours?")}
+        whole = {a.split("Drive-up")[0].rstrip("; ") for a in answers.values()}
+        self.assertEqual(len(whole), 1)                          # the same branch's lobby, however it was asked
+
+    def test_every_branch_is_compared_when_the_branches_are_asked_about(self):
+        ks = self._branches()
+        text = ks.answer("Do all Canoeco branches keep the same lobby hours?").text
+        self.assertTrue(text.startswith("No, hours differ by branch."))
+        self.assertIn("Larkspur: Lobby Monday-Friday: 9 a.m.-4 p.m.", text)
+        self.assertIn("Millbrook: Lobby Monday-Thursday: 7:15 a.m.-3:45 p.m.", text)
+        self.assertNotIn("Drive-up", text)                       # only the lobby was asked about
+        for q in ("Do lobby times differ among the branches?", "Are lobby times identical at every Canoeco branch?",
+                  "Do lobby hours change from branch to branch?"):
+            self.assertTrue(ks.answer(q).text.startswith("No, hours differ by branch."), q)
+        self.assertNotEqual(parse_query("Are the lobby hours the same every day?").compare, True)
+        same = self._ks([("news/larkspur", self.LARK), ("news/larkspur-2", self.LARK.replace("Larkspur", "Oakdale").replace("LARKSPUR", "OAKDALE"))])
+        self.assertTrue(same.answer("Do all branches keep the same lobby hours?").text.startswith("Yes."))
+
+    def test_a_branch_without_posted_hours_is_read_as_before_when_a_dated_statement_exists(self):
+        ks = self._branches()
+        self.assertIn("June 30, 2031", ks.answer("When is the last day the Elmwood branch will be open?").text)
+        self.assertIn("June 30, 2031", ks.answer("Is the Elmwood branch open until 4 p.m.?").text)
+        self.assertFalse(ks.answer("What are the lobby hours at the Elmwood branch?").confident)       # "hours": decline
+        self.assertIn("June 30, 2031", ks.answer("Is the Canoeco branch inside the grocery store still operating?").text)
+        # with no schedule anywhere, the hours cue reads the question as it was before
+        none = self._ks([("news/elmwood", self.CLOSE)])
+        self.assertIn("June 30, 2031", none.answer("When does the Elmwood branch close?").text)
+
+    def test_fee_cues(self):
+        fee = lambda q: parse_query(q).attribute == "fee"
+        for q in ("How much to get something notarized?", "How much to order a box of checks?", "How much would it be for a money order?",
+                  "Do I have to pay for a money order?", "Is it free to use a canoe ATM?", "Are money orders free for members?",
+                  "What would I pay for a money order?", "Is a notary available at no charge?"):
+            self.assertTrue(fee(q), q)
+        for q in ("Do I have to pay off my canoe loan early?", "Do I have to pay back the advance?", "Is a free checking account available?"):
+            self.assertFalse(fee(q), q)
+
+    def test_a_fee_is_the_thing_asked_not_who_it_is_for(self):
+        ks = self._ks([("fees", self.FEES), ("calculator", self.CALC)])
+        said = lambda q: ks.answer(q).text
+        self.assertIn("$8.00", said("Since I'm not a member yet, what would it cost me to cash a canoe check?"))
+        self.assertIn("$8.00", said("How much to have a canoe check cashed?"))
+        self.assertIn("$5.00", said("How much is a kayak money order for a non-member?"))
+        self.assertNotIn("$10.00", said("How much is a kayak money order for a non-member?"))     # the notary fee says "non-members"
+        self.assertIn("$10.00", said("How much to get something notarized?"))
+        self.assertIn("$10.00", said("How much is a canoe notary?"))
+        self.assertIn("1% of Amount", said("Is there a foreign transaction fee on my debit card?"))
+        self.assertNotIn("$50.00", said("Is there a foreign transaction fee on my debit card?"))
+        self.assertIn("$175.00", said("What would I pay for a locker drill?"))
+        self.assertFalse(ks.answer("How much does it cost to order a box of canoe checks?").confident)   # no check order is priced
+        self.assertNotIn("$99.00", said("What is the fee for a notary example?"))                # a calculator's figures are examples
+
+    def test_the_side_a_fee_question_is_about(self):
+        import retrieve
+        index = self._ks([("fees", self.FEES)])._indexes[-1]
+        side = lambda text: retrieve.fee_focus(index, parse_query(text))[2]
+        self.assertEqual(side("Is there a fee to use a Canoeco ATM?"), "own")
+        self.assertEqual(side("What does it cost to use a non-Canoeco ATM?"), "other")
+        self.assertEqual(side("Is there a fee at your own Canoeco ATM compared with another bank's?"), "both")
+        self.assertIsNone(side("What's the ATM fee?"))
+        ks = self._ks([("fees", self.FEES)])
+        self.assertIn("Free", ks.answer("Is there a fee to use a Canoeco ATM?").text)
+        self.assertIn("$0.50", ks.answer("What does it cost to use a non-Canoeco ATM?").text)
+        self.assertIn("$0.50", ks.answer("What's the ATM fee?").text)                 # no side: a priced line before a free one
+        self.assertIn("Free", ks.answer("Is it free to use a Canoeco ATM?").text)
+
+    def test_counts_by_year(self):
+        pages = {"a": "# Canoeco paddling\n\nIn 2028, 46 Canoeco employees used a new paid benefit called Paddle Time Off, allowing them to help out on the water.\n",
+                 "b": ("# More paddling\n\n58 Canoeco employees used a paid benefit in 2029 called Paddle Time Off (or PTO), allowing them to help out.\n\n"
+                       "Canoeco’s 120 employees paddled a total of 900 hours in 2029, with many using their PTO benefit.\n"),
+                 "c": "# Latest paddling\n\n71 Canoeco employees used a paid benefit in 2030 called Paddle Time Off (or PTO).\n"}
+        two = self._ks([(f"news/{k}", pages[k]) for k in "ab"])
+        text = two.answer("How many Canoeco employees used Paddle Time Off last year?").text      # 2030: the site counts 2029 and 2028
+        self.assertLess(text.index("58"), text.index("46"))                                        # newest first
+        self.assertNotIn("120", text)                                                              # that counts paddlers' hours
+        for q in ("How many staff took PTO last year?", "What number of employees used Paddle Time Off last year?",
+                  "How many team members used Paddle Time Off in the previous year?", "How many of your employees used PTO last year?"):
+            self.assertEqual(two.answer(q).text, text, q)
+        self.assertEqual(len(parse_query("How many staff took PTO last year?").count_said), 1)
+        self.assertIn("46", two.answer("How many employees used Paddle Time Off in 2028?").text)
+        self.assertNotIn("58", two.answer("How many employees used Paddle Time Off in 2028?").text)
+        self.assertFalse(two.answer("How many employees used Paddle Time Off in 2031?").confident)   # a year the site doesn't count
+        three = self._ks([(f"news/{k}", pages[k]) for k in "abc"])
+        self.assertEqual(three.answer("How many employees used PTO last year?").text.count("71"), 1)
+        self.assertNotIn("58", three.answer("How many employees used PTO last year?").text)
+
+    def test_list_wordings_and_a_value_asked_of_one_row(self):
+        import retrieve
+        retrieve.use_site_words({"canoeco"})
+        try:
+            for q in ("Which cards do you have?", "What kayak cards does Canoeco offer?", "What accounts are available?",
+                      "List the canoe cards", "Show me all kayak cards", "What kinds of canoe loans do you offer?"):
+                self.assertTrue(parse_query(q).list_intent, q)
+            for q in ("What APY does Canoeco offer on its 17-month special certificate?", "What rate do you have for a 60-month canoe loan?"):
+                self.assertFalse(parse_query(q).list_intent, q)
+        finally:
+            retrieve.use_site_words(set())
+
+    def test_own_contact_details_are_a_how_to(self):
+        for q in ("How do I change the address or phone number on my account?", "How do I update my phone number?",
+                  "How do I change the address on file?", "I have a new address. How do I update it?"):
+            parsed = parse_query(q)
+            self.assertIsNone(parsed.attribute, q)
+            self.assertTrue({_stem("contact"), _stem("information")} <= set(parsed.tokens), q)
+        self.assertEqual(parse_query("What is the address of the Elm Street branch?").attribute, "address")
+        self.assertNotIn(_stem("contact"), parse_query("Where is the Elm Street branch located?").tokens)
+
+    def test_link_wordings_and_the_fallback(self):
+        from solution import LINK_Q, LINK_WORDS
+        for q in ("Which web page should I visit to view the canoe certificate rates?", "What is the website for canoe rates?"):
+            self.assertIsNotNone(LINK_Q.search(q), q)
+        self.assertTrue({_stem(w) for w in ("view", "check", "look", "browse")} <= LINK_WORDS)
+        rates = "# Canoe Certificate Rates\n\n| Term | APY |\n|---|---|\n| 12 Month | 3.10% |\n| 24 Month | 3.20% |\n"
+        home = "# Canoeco\n\nSee the canoe certificate rates (canoeco.example.org/certificates) for current terms and APYs.\n"
+        ks = self._ks([("certificates", rates), ("home", home)])
+        for q in ("Which web page should I visit to view the canoe certificate rates?", "What link shows the canoe certificate rates?"):
+            self.assertIn("canoeco.example.org/certificates", ks.answer(q).text, q)
+
+    def test_a_status_passage_names_the_place_and_forms_are_not_answers(self):
+        forms = "# Contact us\n\nFirst Name*\n\nLast Name*\n\nWhat's your phone number?*\n"
+        ks = self._ks([("news/elmwood", self.CLOSE), ("contact", forms)])
+        self.assertIn("June 30, 2031", ks.answer("Is the Canoeco office inside the grocery store still operating today?").text)
+        self.assertNotIn("First Name", self._ks([("contact", forms), ("faq", "# Help\n\nTo update your phone number, sign in and open your profile settings page.\n")])
+                         .answer("How do I change the phone number on my account?").text)
 
 
 class Contract(unittest.TestCase):

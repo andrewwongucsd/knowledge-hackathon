@@ -160,6 +160,14 @@ def _respond(index: Index | None, synth: Synthesizer, question: str, search: str
         joins = _join_chunks(index) if joining else []
         link = (pick_link(near, view, q, carried, joins, vocab, named)
                 or pick_link(wide, view, q, carried, joins, vocab, named))
+        if not link and any(t in LINK_WORDS for t in q.tokens):
+            # "which page should I visit to view <X>": the frame words searched too; look again without them
+            q2 = parse_query(search or question)
+            q2.tokens = [t for t in q2.tokens if t not in LINK_WORDS] or q2.tokens
+            ev2 = select(index, q2)
+            link = pick_link(ev2.context or ev2.chunks, view, q, carried, joins, vocab, named)
+            if link:
+                near = (ev2.context or ev2.chunks) + near
         if link:
             vp = link_source(link, near + wide + joins, view)
             return Answer(text=f"You can find that at {link}.", confident=True,
@@ -569,9 +577,10 @@ def strip_temporal(question: str, same_view, stated=frozenset()) -> str:
     return re.sub(r"\s{2,}", " ", DATE_PHRASE.sub(drop, question)).strip(" ,")
 
 
-LINK_Q = re.compile(r"\b(link|url|web ?page|website address|web ?address)\b", re.I)
+LINK_Q = re.compile(r"\b(link|url|web ?page|website address|web ?address)\b|"
+                    r"\b(?:what|which)(?:['’]s|\s+is|\s+are)?\s+(?:the\s+|your\s+)?(?:web)?(?:site|page)\b", re.I)
 LINK_RE = re.compile(r"([^()\n]{0,80})\(([a-z0-9.-]+\.[a-z]{2,}(?:/[^)\s]*)?)\)")
-LINK_WORDS = set(tokenize("link url use see find page web webpage website address where visit"))
+LINK_WORDS = set(tokenize("link url use see find page web webpage website address where visit view check look browse"))
 MEDIUM_WORDS = set(tokenize("online"))      # how, not what: "join online" asks for the link to join
 # Joining the credit union, in general English. "membership" followed by another noun ("membership meeting",
 # "membership grant") is something else; a member of a kind ("a board member") is not joining either.

@@ -17,6 +17,14 @@ A rate question whose term, model year or amount picks out one row gets that row
 - a link worded for another line ("a business auto loan") gives way to the site's page titled with what was asked;
 - a question about joining ("apply for membership", "become / sign up as a member", opening someone's first account, or a bare "join") also reads the site's pages about joining and gets the application link they give, or the one for continuing an application. Joining something else ("the newsletter", "a board member") is not joining, and a second request in the same sentence keeps the usual pick. In a message of several sentences, the others are context when the request is plainly about joining ("My cousin just moved here. Can you send me the link so she can join?"), unless they name an event, a product line or one of the site's own pages, or the request also asks to apply for something. How the link is passed on ("email it to her") is never what it is for.
 
+**Hours** are answered from the schedule blocks (two or more weekday lines with clock times), each bound to its page's lead paragraph, which names the branch's town and street, so "the Quartz Road branch" or "the Millbrook drive-up" matches a schedule that names neither. A place is a capitalised run or street phrase the wording marks as one (a street word, "in / at / on / near" before it, "branch", "lobby", "hours" after it, each town of a list); a name in a greeting, a day or month, AM/PM, the site's own name and the region after a town ("Elmville, Ohio") are not, and a place the site has no schedule for declines. Hours asked without the word ("when does the lobby close?", "what time do you open?") are answered from a schedule too; when none can answer and a dated statement names the place ("the Elmwood branch will close on June 30, 2031"), the question is read as it was before, so the date answers. With no place named every wording gets the same schedule, the one whose times the most branches share, given as the lobby or drive-up block asked about, with no model call. "Do all branches keep the same hours?" lists each distinct schedule with its town, "No, hours differ by branch." or "Yes.".
+
+**Fees** are asked about the thing the question's words name that some fee line prices ("money order", "foreign transaction"), not who it is for ("non-member") or which product ("debit card"). Fee lines are ranked by the thing, then by the side asked ("a <Name> ATM" and "a non-<Name> ATM" are different lines; with no side stated a priced line comes before a free one), then by the word search; the item of a block that names the thing is quoted, and a row of a fee table that says "Free" is an item too. When the best item names fewer than half of two or more asked things ("a box of checks" is not the drill-box fee) the answer declines, and a calculator's example figures are never fees. "How much to get / order / use …", "is it free to …", "what would I pay for …" are fee questions.
+
+**Counts asked of a year** ("how many … last year", "… in 2023") read the site's dated sentences, one per year, by the clause that does the counting ("staff" is the site's "employees", an acronym matches its spelled-out words, "627 employees volunteered 6,000 hours, with many using the benefit" counts volunteers): the asked year's sentence; for a relative year the site doesn't count, the years it does, newest first, at most three; a calendar year it doesn't count declines. No model call, so every wording gives the same numbers.
+
+**Wordings** also read: "which … do you have", "what … does <Name> offer", "list the …", "show me all …" as a list, unless a value is asked of one row a term, model year or amount picks out; "change the address or phone number on my account" as the member's own contact information (searched as contact and personal information), not a request for an address; "which page should I visit to view …" as a link question, the frame words searched again without the link words only when no link was found. "Is the … still operating?" prefers the passage that states a closing, ending or opening with a full date and names the place asked about, and a form's field labels are never the answer to a general question.
+
 **`conflicts`** is deterministic, from the newest view, and names each winner and why: one product, term and tier priced differently on two pages; boilerplate counts that disagree; "Nth time" / "Nth year in a row" claims, including ones contradicting each other on one page.
 
 ## How "current" is decided
@@ -38,16 +46,19 @@ The evaluation sets were rebuilt from the pages by independent agents after the 
 | Run | Result |
 |---|---|
 | Kit selftest with `--conflicts-gold` | accuracy 1.0, conflicts F1 1.0 |
-| Public 40 | with key 0.946 in two runs (p95 1.7–2.3s, 0 stale values, 0 errors, about $0.01); no key 0.811 |
-| Battery: the 40 practice questions, 160 rewordings and 39 dated questions | with key 0.916, reworded groups consistent 0.85; no key 0.778; 0 stale values |
+| Public 40 | with key 0.969 in two runs (p95 2.1–2.2s, 0 stale values, 0 errors, about $0.01), the one miss an item with no required value; no key 0.850 (0.811 before this version) |
+| Battery: the 40 practice questions, 160 rewordings and 39 dated questions | with key 0.967, reworded groups consistent 0.99 (0.916 and 0.85 before this version); no key 0.834; 0 stale values |
 | 32 held-out dated questions | with key 0.987; no key 0.960; 0 stale values |
-| Fee probes at three dates | 48 of 50; with key 49 |
+| Fee probes at three dates | 49 of 50 with no key |
 | 82 questions with a date phrase, labelled with the snapshot that should answer | 79 read that snapshot |
-| 78 regression questions from five adversarial reviews | no key 75 |
+| 86 regression questions from six adversarial reviews | no key 83 |
 | 10 reworded question pairs that must give the same numbers | 10 agree (6 before this version) |
-| 36 reworded pairs written from the pages by an independent agent | same numbers: no key 33, with key 36 (13 and 18 before this version); answers right of 72: no key 68, with key 70 |
-| 66 fee, rate and wording cases from an adversarial review, judged against the pages | no key 65, with key 64 (no key 32 before this version) |
-| Crash sweep: every kit question plus branch, wire, date and down-payment templates (910) | 0 errors |
+| 36 reworded pairs written from the pages by an independent agent | same numbers: no key 36, with key 36 (33 and 36 before this version); answers right of 72: no key 72, with key 72 (68 and 70) |
+| 30 reworded pairs of branch-hours, contact, fee, status and decline questions written from the pages by a second agent | same numbers: no key 20, with key 26 (9 and 23 before this version); answers right of 60: no key 42, with key 51 (20 and 36); branch hours 14 of 14 both ways (2 and 4) |
+| 16 probes for the questions the previous version missed (branch hours by street or town, fee wordings, a status question, counts, a link) | no key 16 of 16 |
+| 66 fee, rate and wording cases from an adversarial review, judged against the pages | no key 66, with key 65 |
+| 75 wordings from this version's adversarial review of its own design (closing dates, "open" that is not hours, a greeting name, rate wordings, links) | 44 answers changed, none for the worse |
+| Crash sweep: every kit question plus branch, wire, date and down-payment templates (965) | 0 errors |
 | 216 link, joining, eligibility, intro-rate, HSA, aside, tier, date, wire, down-payment, branch, fee-wording and plain-product questions in 14 independent sets, each written against the previous version | no question worse than on the version it was written against beyond run-to-run variation; latest set (16): with key 8 → 15, no key 5.5 → 15 |
 | Conflicts vs a 20-entry key built independently | pillar 0.605 |
 | Earlier sets (history) | battery with key 0.937 / no key 0.780; held-out 0.984 / 0.859; 12 "how did it change" questions 0.90 / 0.875; conflicts vs a 21-entry key 0.716 |
@@ -62,8 +73,9 @@ The evaluation sets were rebuilt from the pages by independent agents after the 
 - Asked whether any savings tier pays another account's rate, the model sometimes still answers "yes, the money market does"; the plain account's top tier is always given too.
 - "Now" for relative dates is an assumption (a month after the newest crawl); a question written much later reads "two months ago" a crawl too early. "Last year" in a total ("how many … last year") is a period, not a moment.
 - A foreign place the geography list lacks gets the domestic wire fee with no key (the model, with the key, still knows it); a foreign-named US town without its state ("my cousin in Paris") reads as abroad.
-- Fee wording the rules don't cover still misses: "how much to get something notarized?" isn't read as a fee question, "a money order for a non-member" can get the non-member notary fee, "order a box of checks" can get another box fee, and with no key "a foreign transaction fee on my debit card" can quote the rush fee from the same block.
-- A fee asked inside a sentence about something else ("since I'm not a member yet, what would it cost me to cash a check?") can still miss the fee line.
+- Fee wording the rules don't cover still misses: a fee asked of two sides at once ("at your ATM compared with another bank's") with no key quotes one side, "coin counting machine" and "purchases made in another country" can decline, and "how much is a debit card?" quotes the rush fee.
 - A lost or stolen card's replacement fee declines: the site lists none, only a rush fee, which is a different service.
-- Branch hours named by a street or town rather than a branch name ("the Main Street branch in Harbor City") can decline or get another branch's hours.
+- Hours asked of several towns at once ("Elmville, Harbor City or Larkspur") decline, since no one schedule names them all; a branch the site names only in a later paragraph ("the Learning Lab") declines; the phone number or address of a branch asked for by town can miss with no key.
+- A status question about an ended offer or a finished renovation, with no key, can quote the page's lead instead of the sentence that says so.
+- "How many members does <Name> have?" can quote a count of something else with no key, and the personal credit cards, written as prose, are listed only by the model.
 - An aside in a sentence of its own after a request that isn't a question ("Tell me the 17-month special rate. This is my savings.") is read as part of the request.

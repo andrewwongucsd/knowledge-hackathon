@@ -19,8 +19,9 @@ from collections import Counter
 from types import SimpleNamespace
 
 from retrieve import (ASKS_THRESHOLD, KIND_NAME, SOFT_QUALIFIERS, SYNONYMS, WIRE, WIRE_FEE_LINE, Evidence, Query, _asked,
-                      asked_kinds, fee_items, kinds_in, names_line, on_other_line, other_kind, other_lines, product_name, qualify, supports,
-                      terms_in, tier_width, tokenize, wire_direction)
+                      asked_kinds, chunk_cover, count_sentence, fee_cover, fee_items, kinds_in, names_line, on_other_line, other_kind, other_lines,
+                      place_phrases, product_name, qualify, supports, terms_in, tier_width, tokenize, wire_direction,
+                      STATUS_DATE, STATUS_EV)
 
 REFUSAL = "That isn't listed on our website, so I can't confirm it. Please contact us and we can help."
 # The prompt calls the context "excerpts"; a sentence that talks about them instead of the site is dropped.
@@ -124,19 +125,110 @@ def _short_header(h: str) -> str:
 PARAGRAPH_CHARS = 500
 
 
+# A schedule is a block per facility ("Lobby", "Drive-up") of weekday lines ("Monday-Thursday: 6:45 a.m.-3:15 p.m."). Quoted
+# whole, or the facility and the weekdays asked about.
+_DAYS = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+_DAYNAME = r"(?:Mon|Tues|Wednes|Thurs|Fri|Satur|Sun)day"
+_DAYSPEC = re.compile(rf"^\s*({_DAYNAME})(?:\s*[-–—]\s*({_DAYNAME}))?\s*:", re.I)
+_CMP_DAYS = re.compile(r"\b(?:later|earlier|longer|shorter|than|vs\.?|versus|compared?|same|different|differ)\b", re.I)
+
+
+def _schedule_blocks(text: str) -> list:
+    """[(facility label or None, [weekday lines])]; the label may sit on its own line or lead the first weekday line."""
+    blocks, label, lines = [], None, []
+    for line in text.split("\n"):
+        m = re.match(rf"\s*([A-Za-z][A-Za-z -]{{1,20}}?)\s*(?=(?:{_DAYNAME})\b|$)", line)
+        head = m.group(1).strip() if m and not re.search(r"\d", m.group(1)) and len(m.group(1).split()) <= 2 else None
+        if head and not re.match(_DAYNAME, head, re.I):
+            if lines:
+                blocks.append((label, lines))
+            label, lines, line = head, [], line[m.end():].strip()
+        if _DAYSPEC.match(line):
+            lines.append(line.strip())
+    if lines:
+        blocks.append((label, lines))
+    return blocks
+
+
+def hours_part(text: str, question: str, by_day: bool = True) -> str:
+    """The lobby or the drive-up block when one is asked about; with a place named, only the weekdays asked about
+    ("weekdays", "weekends", one day); a comparison word ("later", "vs", "than") keeps the whole block."""
+    blocks = _schedule_blocks(text)
+    if not blocks:
+        return text.replace("\n", "; ")[:400]
+    low = question.lower()
+    lobby, drive = bool(re.search(r"\blobb(?:y|ies)\b", low)), bool(re.search(r"\bdrive[- ]?(?:up|thru|through)", low))
+    want = [b for b in blocks if b[0] and ((lobby and not drive and b[0].lower().startswith("lobby"))
+                                           or (drive and not lobby and "drive" in b[0].lower()))]
+    days = {i for i, d in enumerate(_DAYS) if re.search(rf"\b{d}s?\b", low)}
+    days |= set(range(5)) if re.search(r"\bweekdays?\b", low) else set()
+    days |= {5, 6} if re.search(r"\bweekends?\b", low) else set()
+    if not by_day or _CMP_DAYS.search(low):
+        days = set()
+    out = []
+    for lab, ls in want or blocks:
+        keep = ls
+        if days:
+            def covers(l):
+                m = _DAYSPEC.match(l)
+                a = _DAYS.index(m.group(1).lower()); b = _DAYS.index(m.group(2).lower()) if m.group(2) else a
+                return any(a <= d <= b for d in days)
+            keep = [l for l in ls if covers(l)] or ls
+        out.append(f"{lab + ' ' if lab else ''}{'; '.join(keep)}")
+    return "; ".join(out)[:600]
+
+
+def compare_hours(q: Query, lead: bool = True):
+    """Each distinct schedule among the q.schedules, with its branch's town (at most six), compared by clock times
+    ("dash and spacing styles don't matter"). With `lead`, "No, hours differ by branch." or "Yes."."""
+    seen, parts = {}, []
+    asked = q.raw if (not lead or re.search(r"lobb|drive", q.raw, re.I)) else ""
+    for c in q.schedules:
+        part = hours_part(c.text, asked)
+        sig = tuple(re.sub(r"\W", "", t.lower()) for t in re.findall(r"\d{1,2}(?::\d{2})?\s*[ap]\.?\s?m\b|noon|closed", part, re.I))
+        if sig and sig not in seen:
+            seen[sig] = c
+            parts.append((c.branch, part, c))
+    if not parts:
+        return None
+    if len(parts) == 1:
+        return (("Yes. " + parts[0][1] + ".") if lead else parts[0][1]), [parts[0][2]]
+    return ("No, hours differ by branch. " if lead else "") + " ".join(f"{name + ': ' if name else ''}{part}." for name, part, _ in parts[:6]), \
+        [c for _, _, c in parts[:6]]
+
+
+# "Is the <place> branch still open?", "has the offer ended?": the passage that says so with a date
+STATUS_Q = re.compile(r"\bstill\s+(?:open|operating|operational|in\s+operation|in\s+business|running|around|available|offered|"
+                      r"active|going|valid)\b|\b(?:has|have|did|is|are|was)\b[^?]*\b(?:close[sd]?|closing|shut\s+down|shutting\s+down|"
+                      r"ended|discontinued|expired)\b", re.I)
+FORM_LABELS = re.compile(r"[A-Za-z?]\*(?=\s|$)")
+
+
 def best_sentence(c: Chunk, q: Query) -> str:
-    if q.attribute == "hours":                          # schedules only make sense whole
-        return c.text.replace("\n", "; ")[:400]
+    if q.attribute == "hours":
+        return hours_part(c.text, q.raw, bool(q.places))
     if q.attribute is None:                             # how-to and "what is…": the steps or the description
         return c.text.replace("\n", " ")[:PARAGRAPH_CHARS]   # span the paragraph, not one sentence of it
+    if q.attribute == "count" and q.count_noun:         # the clause that counts the asked thing
+        sent = count_sentence(c, q)[0]
+        if sent:
+            return sent[:400]
     sents = [s.strip() for s in re.split(r"(?<=[.!?])\s+(?=[A-Z0-9*])|\n", c.text) if s.strip()]
     if q.attribute == "fee":
         # a sentence holding several fees is quoted as one of them; a sentence with an amount is preferred, a
         # threshold ("less than $5") only when the question asks one
         allow = bool(ASKS_THRESHOLD.search(q.raw))
         items = lambda s: [it for _, it, threshold in fee_items(s) if not threshold or allow]
-        sents = [p for s in sents for p in (items(s) if len(fee_items(s)) > 1 else [s])]
-        sents = [s for s in sents if items(s)] or sents
+        split = [(p, True) for s in sents if len(fee_items(s)) > 1 for p in items(s)]
+        whole = [(s, bool(items(s))) for s in sents if len(fee_items(s)) <= 1]
+        sents = [p for p, ok in split + whole if ok] or sents
+        if q.focus and q.focus[0] and sents:
+            # the item that names what was asked ("foreign transaction fee on my debit card" is not "Rush fee for
+            # debit card"); a free one only when no priced one names it as much
+            cov = lambda s: fee_cover(tokenize(s), q.focus, bool(re.search(r"[$%]", s)))
+            best = max(sents, key=cov)
+            if cov(best)[1]:
+                return best[:400]
     qt = set(q.tokens)
 
     def score(s):
@@ -170,6 +262,30 @@ def extractive(q: Query, ev: Evidence, view: View) -> tuple[str, list[Chunk]]:
         pool = [c for c in pool if c.kind != "promo"] or pool
     if not pool:
         return REFUSAL, []
+    if q.attribute == "fee" and q.focus and len(q.focus[0]) >= 2 and q.focus[2] != "both" and not WIRE.search(q.raw) \
+            and chunk_cover(pool[0], q, q.focus)[1] * 2 < len(q.focus[0]):
+        return REFUSAL, []           # the thing asked isn't priced: "a box of checks" is not the drill-box fee
+    if q.attribute == "count" and q.no_year:            # a year asked that the site counts nothing for
+        return REFUSAL, []
+    if q.attribute == "count" and q.series:             # one dated sentence per year (see select)
+        return " ".join(s if s.endswith((".", "!", "?")) else s + "." for _, s, _ in q.series), [c for _, _, c in q.series]
+    if q.attribute == "hours" and q.places and len(q.schedules) > 1:
+        several = compare_hours(q, lead=False)          # the place names more than one branch: each distinct schedule
+        if several:
+            return several
+    if q.attribute == "hours" and q.compare:
+        both = compare_hours(q)
+        if both:
+            return both
+    if q.attribute is None and STATUS_Q.search(q.raw):
+        # the passage that states a closing, ending or opening with a full date and names the place asked about
+        asked = place_phrases(q.raw)
+        dated = [c for c in pool if STATUS_DATE.search(c.text) and STATUS_EV.search(c.text)
+                 and (not asked or any(p & set(tokenize(c.index_text)) for p in asked))]
+        pool = dated + [c for c in pool if c not in dated]
+    if q.attribute is None:                             # a form's field labels answer nothing
+        forms = [c for c in pool if not c.is_row and len(FORM_LABELS.findall(c.text)) >= 2]
+        pool = [c for c in pool if c not in forms] + forms
     if q.attribute == "fee" and WIRE.search(q.raw) and wire_direction(q.raw) == "all":
         # several kinds of wire asked about ("domestic and international", "your wire fees"): one fee line of each
         # kind, from the page that lists the first one
@@ -423,7 +539,11 @@ def clear_cut(question: str, q: Query, ev: Evidence) -> bool:
     """A rate question whose pinned term, model year or amount picks out exactly the top evidence row:
     that row is the answer, so it is given verbatim with no model call (faster, cheaper, and the same
     text for every wording). Lists, comparisons, changes and rows of an unasked product line still go
-    to the model."""
+    to the model. A count stated per year is the dated sentence itself, for the same reason."""
+    if q.attribute == "count" and (q.series or q.no_year):
+        return True
+    if q.attribute == "hours" and (q.places or q.need_schedule or (q.compare and q.schedules)):
+        return any(supports(c, q) for c in ev.chunks)     # a schedule is given verbatim: the same for every wording
     if q.attribute != "rate" or not (q.terms or q.years or q.amounts) or q.list_intent or COMPARE_Q.search(question) \
             or SECOND_ASK.search(question) or len({w.rstrip("s") for w in _line_words(q)}) > 1:
         return False
