@@ -31,7 +31,7 @@ from datetime import date, timedelta   # noqa: E402
 
 from ingest import KIND_RANK, MONTH_RE, MONTHS, STATUS_RANK, Chunk, Store, _on_site, url_key   # noqa: E402
 import retrieve                        # noqa: E402
-from retrieve import (CHAT_FILLERS, FRAME_WORDS, GENERIC, GENERIC_HEADS, MEMBERSHIP_Q, STOP, Evidence, Index, _stem,  # noqa: E402
+from retrieve import (CHAT_FILLERS, asking_sentence, carried_in_context, FRAME_WORDS, GENERIC, GENERIC_HEADS, MEMBERSHIP_Q, STOP, Evidence, Index, _stem,  # noqa: E402
                       parse_query, proper_names, select, terms_in, tokenize, use_proper_names, use_site_words)
 from synth import REFUSAL, Synthesizer  # noqa: E402
 
@@ -154,6 +154,14 @@ def _respond(index: Index | None, synth: Synthesizer, question: str, search: str
         q.expansion = q.expansion + [_stem("join")]        # "sign up as a member": the link to join
         q.tokens = q.tokens + [_stem("join")]
     ev = select(index, q)
+    if q.attribute == "count" and not ev.supported and (lead := asking_sentence(q.raw)) != q.raw:
+        # a long lead-in before the question ("I'm writing a paper … Roughly how many …?"): its words may be what
+        # nothing answers; ask the sentence that asks, only when the whole question found nothing
+        q2 = parse_query(lead)
+        ev2 = select(index, q2)
+        if q2.attribute == "count" and q2.count_noun == q.count_noun and (
+                ev2.supported or (synth.enabled and carried_in_context(ev2, q2))):
+            q, ev = q2, ev2
     if linking:                                       # "what link should I use…": the site's own link
         carried = lambda u: sum(u in t for t in _page_texts(index).values())
         near, wide = ev.context or ev.chunks, [c for _, c in index.search(q.tokens, top=30)]
@@ -172,7 +180,7 @@ def _respond(index: Index | None, synth: Synthesizer, question: str, search: str
             vp = link_source(link, near + wide + joins, view)
             return Answer(text=f"You can find that at {link}.", confident=True,
                           sources=[Source(url=vp.page.url, snapshot_id=vp.snapshot_id)] if vp else [])
-    if not ev.chunks or (q.attribute and not ev.supported):
+    if not ev.chunks or (q.attribute and not ev.supported and not (synth.enabled and carried_in_context(ev, q))):
         return Answer(text=REFUSAL, confident=False)
     fact = match_fact(_facts(index), q, index)
     if fact:
@@ -1236,13 +1244,26 @@ def _path(ref: str) -> str:
     return "/" + ref.split("/", 1)[1].strip("/") if "/" in ref else "/"
 
 
+PAGES_BUDGET = 16000      # characters of the picked pages the model reads on a second look
+
+
 def _pages_evidence(index: Index, q, keys: list) -> Evidence | None:
-    """Evidence from the pages picked: each page's opening paragraphs, then its best matches."""
+    """Evidence from the pages picked: the paragraphs that best match the question, the rest of the sections they
+    sit in, each page's opening paragraphs, then whatever else the page says, in page order, to a size budget."""
     view, wanted = index.view, set(keys)
-    opening = [c for k in keys for c in view.pages[k].page.chunks[:8]]
-    best = [c for _, c in index.search(q.tokens, top=3000) if c.key in wanted][:8]
-    chunks = [c for c in {c.id: c for c in opening + best}.values()
-              if not (c.expired_on and c.expired_on < view.taken_on)][:16]
+    live = lambda c: not (c.expired_on and c.expired_on < view.taken_on)
+    best = [c for _, c in index.search(q.tokens, top=3000) if c.key in wanted and live(c)][:8]
+    pages = [[c for c in view.pages[k].page.chunks if live(c)] for k in keys]
+    sections = {(c.key, c.section) for c in best if c.section}
+    near = [c for page in pages for c in page if (c.key, c.section) in sections]
+    opening = [c for page in pages for c in page[:5]]
+    rest = [c for page in pages for c in page]
+    chunks, used = [], 0
+    for c in {c.id: c for c in best + near + opening + rest}.values():
+        if used + len(c.text) > PAGES_BUDGET or len(chunks) >= 60:
+            continue
+        chunks.append(c)
+        used += len(c.text)
     return Evidence(chunks, [], True, {}, chunks) if chunks else None
 
 

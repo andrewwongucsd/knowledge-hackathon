@@ -2092,6 +2092,160 @@ class Rev46(unittest.TestCase):
             self.assertTrue(all(isinstance(v, str) for v in c.values))
 
 
+class Rev47(unittest.TestCase):
+    """Fine print on a second look, long lead-ins before a count, hedges, limit sentences, digits as written, list
+    wording, and a product's rows beside another table with the same label shape (synthetic data only)."""
+
+    ABOUT = "# About Canoeco\n\nCanoeco runs 14 branch offices across the valley and has 320 employees.\n"
+
+    def _site(self, pages, replies=None, date="2031-06-15"):
+        import json as _json
+        from types import SimpleNamespace as NS
+        from contract import Page, Snapshot
+        calls = []
+
+        class Fake:
+            class messages:
+                @staticmethod
+                def create(**k):
+                    calls.append(k)
+                    reply = replies[min(len(calls), len(replies)) - 1]
+                    return NS(stop_reason="end_turn", content=[NS(type="text", text=_json.dumps(reply))])
+        ks = build()
+        ks.ingest(Snapshot("s1", date, [Page(f"https://canoeco.example.org/{p}", f"{p} | Canoeco", md, date + "T09:00:00Z")
+                                        for p, md in pages]))
+        if replies is not None:
+            ks._synth.enabled, ks._synth._client = True, Fake()
+        return ks, calls
+
+    def test_the_sentence_that_asks_a_count(self):
+        from retrieve import asking_sentence
+        lead = "I'm making a slideshow for my class and want facts. "
+        self.assertEqual(asking_sentence(lead + "Roughly how many branch offices does Canoeco have these days?"),
+                         "Roughly how many branch offices does Canoeco have these days?")
+        for q in ("How many branch offices does Canoeco have?",                                    # one sentence
+                  lead + "Which branch is the biggest?",                                           # not a count
+                  "How many branch offices are in Zeta? My sister is moving there.",              # a trailing aside
+                  lead + "How many branch offices are there?",                                     # refers back
+                  "I'm asking about the Paddle program. How many members used it?",                # a name in the lead-in
+                  "I'm opening 3 accounts. How many branch offices does Canoeco have?",           # a figure in the lead-in
+                  "My rate is 3.5%. How many branch offices does Canoeco have?"):                  # a decimal is no sentence end
+            self.assertEqual(asking_sentence(q), q, q)
+
+    def test_a_long_lead_in_before_a_count_is_read_when_the_whole_question_finds_nothing(self):
+        ks, _ = self._site([("about", self.ABOUT)])
+        lead = "I'm making a slideshow for my class and want facts. "
+        self.assertIn("14", ks.answer(lead + "Roughly how many branch offices does Canoeco have?").text)
+        self.assertIn("14", ks.answer("Roughly how many branch offices does Canoeco have?").text)
+        self.assertIn("14", ks.answer("Hi how many branch offices does Canoeco have?").text)
+        for q in (lead + "How many branch offices are there?",                                        # refers back: no retry
+                  "I'm making a slideshow about Zeta. How many branch offices does Canoeco have?",    # a name in the scene
+                  "How many branch offices does Canoeco have in Zeta? My sister is moving there.",
+                  "Zeta how many branch offices does Canoeco have?",                                  # not a hedge
+                  "How many branch offices does Canoeco have in Zeta?"):
+            a = ks.answer(q)
+            self.assertFalse(a.confident, q)
+            self.assertEqual(a.text, REFUSAL, q)
+
+    def test_a_count_the_search_could_not_support_is_left_to_the_model_unless_a_name_is_missing(self):
+        from retrieve import carried_in_context
+        from types import SimpleNamespace as NS
+        chunk = lambda key, *words: NS(key=key, tf={w: 1 for w in words}, index_text="")
+        raw = "How many Refer-a-Friend bonus payments can one member earn?"
+        q = NS(attribute="count", subject=[["refer"], ["friend"]], raw=raw)
+        one_page = NS(chunks=[chunk("a", "refer")], context=[chunk("a", "refer"), chunk("a", "friend", "limit")])
+        two_pages = NS(chunks=[chunk("a", "refer")], context=[chunk("a", "refer"), chunk("b", "friend")])
+        self.assertTrue(carried_in_context(one_page, q))                  # names, both on one page
+        self.assertFalse(carried_in_context(two_pages, q))                # names spread over pages are no topic
+        self.assertFalse(carried_in_context(one_page, NS(attribute="count", subject=[["refer"], ["zeta"]], raw=raw.replace("Friend", "Zeta"))))
+        # a place named in the question is proof only with its topic on one page: one name is not enough
+        place = NS(attribute="count", subject=[["zephyr"]], raw="How many employees work at the Zephyr branch?")
+        self.assertFalse(carried_in_context(one_page, place))
+        # no name among the rare words ("log" for the site's "logged"): the model reads what the search found
+        plain = NS(attribute="count", subject=[["log"]], raw="Roughly how many paddling hours did staff log in 2025?")
+        self.assertTrue(carried_in_context(NS(chunks=[chunk("a", "hour")], context=[chunk("a", "hour")]), plain))
+        for attribute in ("rate", "fee", "when", None):
+            self.assertFalse(carried_in_context(one_page, NS(attribute=attribute, subject=q.subject, raw=raw)), attribute)
+        self.assertFalse(carried_in_context(one_page, NS(attribute="count", subject=[], raw=raw)))
+
+    def test_a_filler_word_anywhere_is_never_what_is_counted(self):
+        ks, _ = self._site([("grants", "# Grants\n\nIn 2030, 50 people received a Canoeco grant.\n")])
+        for q in ("How many people actually received a grant in 2030?", "How many people really received a grant in 2030?"):
+            self.assertIn("50", ks.answer(q).text, q)
+        self.assertFalse(ks.answer("How many people received a grant from Zeta in 2030?").confident)     # a real word still is
+
+    def test_a_spelled_number_says_the_digits_the_site_gives(self):
+        from synth import _digits_as_written
+        from types import SimpleNamespace as NS
+        shown = [NS(text="Payments are limited to ten (10) per member, within twenty-five (25) days, and four (4) tries.")]
+        self.assertEqual(_digits_as_written("A member can earn up to ten referrals.", shown), "A member can earn up to 10 referrals.")
+        self.assertEqual(_digits_as_written("You have twenty-five days.", shown), "You have 25 days.")
+        self.assertEqual(_digits_as_written("Payments are limited to ten (10) per member.", shown), "Payments are limited to ten (10) per member.")
+        self.assertEqual(_digits_as_written("It takes twenty-four months.", shown), "It takes twenty-four months.")   # a different number
+        self.assertEqual(_digits_as_written("No pause is allowed.", shown), "No pause is allowed.")
+        one = [NS(text="One (1) per member, no one-time fees.")]
+        self.assertEqual(_digits_as_written("No one pays one-time fees.", one), "No one pays one-time fees.")        # never "one"
+        self.assertEqual(_digits_as_written("Ten referrals.", []), "Ten referrals.")
+
+    def test_a_page_read_on_a_second_look_keeps_its_best_match_and_its_budget(self):
+        import solution
+        paragraphs = [f"Filler paragraph number {i} talks about lakes and docks and weather." for i in range(120)]
+        paragraphs[90] = "## Paddling grants\n\nMembers are ineligible within 730 days of closing a paddling account."
+        ks, _ = self._site([("grants", "# Grants\n\n" + "\n\n".join(paragraphs) + "\n")])
+        index = ks._indexes[-1]
+        key = next(iter(index.view.pages))
+        evidence = solution._pages_evidence(index, parse_query("What is the waiting period after closing a paddling account?"), [key])
+        self.assertIn("730", evidence.chunks[0].text)                                                # best match first
+        self.assertLessEqual(len(evidence.chunks), 60)
+        self.assertLessEqual(sum(len(c.text) for c in evidence.chunks), solution.PAGES_BUDGET)
+        self.assertEqual(len({c.id for c in evidence.chunks}), len(evidence.chunks))
+
+    def test_the_second_look_is_for_open_and_date_questions_only(self):
+        pages = [("grants/paddling", "# Paddling grant\n\nThe application period for the next paddling grant opens January 5, 2031 and closes in March.\n"),
+                 ("about", self.ABOUT), ("rates", "# Rates\n\n| Term | APY |\n|---|---|\n| 12 Month | 2.41% |\n")]
+        declined = {"note": "", "answer": "", "answerable": False, "evidence_ids": []}
+        picked = {"paths": ["/grants/paddling"]}
+        answered = {"note": "", "answer": "Applications open January 5, 2031.", "answerable": True, "evidence_ids": [1]}
+        ks, calls = self._site(pages, [declined, picked, answered])
+        a = ks.answer("When do applications open for the next paddling grant?")
+        self.assertEqual(len(calls), 3)
+        self.assertIn("January 5, 2031", a.text)
+        # the decision itself: a rate, fee, hours, count or address question that found nothing is not looked at again
+        from types import SimpleNamespace as NS
+        for attribute, looked in (("rate", False), ("fee", False), ("hours", False), ("count", False), ("address", False),
+                                  ("when", True), (None, True)):
+            seen = []
+            ks._synth._second_look("Q?", NS(attribute=attribute, list_intent=False), None, None, lambda text: seen.append(text))
+            self.assertEqual(bool(seen), looked, attribute)
+
+    def test_the_list_hint_goes_with_list_questions_only(self):
+        cards = ("# Canoeco Cards\n\n| Card | APR |\n|---|---|\n| Personal Classic Card | 12.50% |\n| Business Classic Card | 14.50% |\n")
+        reply = {"note": "", "answer": "Personal Classic Card 12.50%, Business Classic Card 14.50%.", "answerable": True, "evidence_ids": [1, 2]}
+        ks, calls = self._site([("cards", cards)], [reply])
+        ks.answer("What cards do you offer and what are their rates?")
+        self.assertEqual(len(calls), 1)
+        self.assertIn("personal and business alike", calls[0]["messages"][0]["content"])
+        self.assertNotIn("personal and business alike", calls[0]["system"][0]["text"])
+        ks, calls = self._site([("cards", cards)], [reply])
+        ks.answer("Which is better, the personal classic card or the business classic card?")
+        self.assertEqual(len(calls), 1)
+        self.assertNotIn("personal and business alike", calls[0]["messages"][0]["content"])
+
+    TABLES = ("# Canoeco Loans\n\n## Auto Loans\n\n| Loan Program | Term | APR |\n|---|---|---|\n"
+              "| 2024-27 Model Year | 60 Months | 5.10% |\n| 2020-23 Model Year | 60 Months | 5.60% |\n\n"
+              "## Trail Vehicle Loans (Snowmobile and ATV)\n\n| Loan Type | Term | APR |\n|---|---|---|\n"
+              "| Model Year 2026-23 | 60 Months | 8.30% |\n| Model Year 2022-21 | 60 Months | 8.50% |\n| Model Year 2020-19 | 60 Months | 8.90% |\n")
+
+    def test_a_products_own_rows_are_not_hidden_by_another_table_with_the_same_label_shape(self):
+        ks, _ = self._site([("loans", self.TABLES)])
+        self.assertIn("8.90%", ks.answer("What APR would I get on a 60-month loan for a 2020 snowmobile?").text)
+        self.assertIn("8.50%", ks.answer("What APR would I get on a 60-month loan for a 2021 ATV?").text)
+        self.assertIn("8.90%", ks.answer("how much interest on a loan for a 2019 jet ski, 60 months").text)
+        self.assertIn("5.10%", ks.answer("What's the APR for a 60-month auto loan on a 2025 model-year vehicle?").text)
+        self.assertNotIn("8.", ks.answer("What's the APR for a 60-month auto loan on a 2025 model-year vehicle?").text)
+        self.assertEqual(parse_query("Got a 2020 snowmobile to finance over 60 months. What's the APR?").years, {2020})
+
+
 class Contract(unittest.TestCase):
     def test_exactly_the_three_contract_methods(self):
         own = {n for n, v in vars(type(build())).items() if callable(v) and not n.startswith("__")}

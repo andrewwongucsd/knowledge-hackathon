@@ -580,7 +580,7 @@ class Synthesizer:
             except Exception:           # no SDK (e.g. Python 3.9): _llm keeps its lazy path and falls back
                 self._client = None
 
-    def _llm(self, question: str, ev: Evidence, view: View, asked: date | None = None) -> dict | None:
+    def _llm(self, question: str, ev: Evidence, view: View, asked: date | None = None, listing: bool = False) -> dict | None:
         excerpts = "\n\n".join(f"[{i}] ({describe(c, view)})\n{c.text}" for i, c in enumerate(_llm_chunks(ev), 1))
         # A dated question is answered from the site as it stood that day, i.e. the newest crawl
         # on or before it; showing the crawl's own (earlier) day reads as "can't confirm".
@@ -591,6 +591,9 @@ class Synthesizer:
                     f"before it, or none).")
         else:
             head = f"Website snapshot date: {(asked if asked and asked > view.taken_on else view.taken_on).isoformat()}"
+        if listing:                            # asked what is offered: every line, not the member's own
+            head += ("\nThe member asks what is offered: list every product line the excerpts show for it, personal and "
+                     "business alike, each with its own rate.")
         return self._ask(f"{head}\n\nExcerpts:\n{excerpts}", question)
 
     def _ask(self, content: str, question: str, system: str = SYSTEM, schema: dict = SCHEMA,
@@ -669,9 +672,9 @@ class Synthesizer:
             return REFUSAL, [], False, note         # "an 84-month certificate" with only an 84-month loan row
         cooling = self._cooldown > 0
         self._cooldown = max(0, self._cooldown - 1)
-        if self.enabled and not cooling and not clear_cut(question, q, ev):
+        if self.enabled and not cooling and (not ev.supported or not clear_cut(question, q, ev)):
             ev = line_table_first(q, own_table_first(question, q, ev, view, lookup), view)
-            out = self._llm(question, ev, view, asked)
+            out = self._llm(question, ev, view, asked, q.list_intent)
             if out is not None:
                 if not out.get("answerable", False):
                     again = self._second_look(question, q, view, asked, second_look)
@@ -682,6 +685,8 @@ class Synthesizer:
                 if accepted is not None:
                     text, cited, llm_note = accepted
                     return text, cited, True, "; ".join(x for x in (llm_note, note) if x)
+        if not ev.supported:                    # only the model may answer what the search could not support
+            return REFUSAL, [], False, note
         text, cited = extractive(q, ev, view)
         if text != REFUSAL:                     # the no-key answer gets the same own row
             text, own = named_row_guard(question, q, ev, text, lookup, view)
@@ -691,8 +696,8 @@ class Synthesizer:
     def _accept(self, question: str, q: Query, ev: Evidence, view: View, out: dict, lookup=None,
                 asked: date | None = None):
         """The model's answer if it passes the guards: (text, cited chunks, note), else None."""
-        text = _drop_dead_links(_drop_banned(str(out.get("answer", ""))), view)
         shown = _llm_chunks(ev)                # the exact excerpts the model saw, same numbering
+        text = _digits_as_written(_drop_dead_links(_drop_banned(str(out.get("answer", ""))), view), shown)
         allowed = numbers(question) | numbers(" ".join(f"{c.text} {describe(c, view)}" for c in shown))
         if asked:                              # the day it was told it may write back, in any form
             allowed |= numbers(f"{asked.isoformat()} {asked.day} {asked.year} {asked.month}")
@@ -706,13 +711,13 @@ class Synthesizer:
     def _second_look(self, question: str, q: Query, view: View, asked, second_look):
         """The search results held no answer to an open question ("who qualifies for membership?"): the
         model picks the site's own pages by title, then answers once more from those pages. Never for a
-        rate, fee, hours, count, date or address question, where "not listed" is usually the truth."""
-        if second_look is None or q.attribute is not None:
+        rate, fee, hours, count or address question, where "not listed" is usually the truth."""
+        if second_look is None or q.attribute not in (None, "when"):
             return None
         ev = second_look(question)
         if ev is None or not ev.chunks:
             return None
-        out = self._llm(question, ev, view, asked)
+        out = self._llm(question, ev, view, asked, q.list_intent)
         if not out or not out.get("answerable", False):
             return None
         return self._accept(question, q, ev, view, out, asked=asked)
@@ -729,6 +734,26 @@ def _thinking_off(model: str) -> dict:
     """Haiku 5.5 thinks by default and accepts `disabled` at effort <= high; the speed score wants
     answers under 2s. Opus 5.5 rejects `disabled` (thinking is always on), so it gets nothing here."""
     return {"thinking": {"type": "disabled"}} if model.startswith("claude-haiku") else {}
+
+
+NUMBER_WORDS = set("""zero two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen
+seventeen eighteen nineteen twenty thirty forty fifty sixty seventy eighty ninety""".split())
+WORD_THEN_DIGITS = re.compile(r"(?<![\w-])([A-Za-z]+(?:-[A-Za-z]+)?)\s*\((\d[\d,]*)\)")
+
+
+def _digits_as_written(text: str, shown: list) -> str:
+    """The site writes "ten (10) per member": an answer that says "ten" says "10", the figure the site gives in digits.
+    Whole words only ("one-time", "twenty-four" stay), never the pronoun "one", and a quote of the site's own
+    "ten (10)" is left alone."""
+    given = {}
+    for c in shown:
+        for m in WORD_THEN_DIGITS.finditer(c.text):
+            if all(w in NUMBER_WORDS for w in m.group(1).lower().split("-")):
+                given[m.group(1).lower()] = m.group(2)
+    if not given:
+        return text
+    return re.sub(r"(?<![\w-])(" + "|".join(map(re.escape, given)) + r")(?![\w-])(?!\s*\()", lambda m: given[m.group(1).lower()],
+                  text, flags=re.I)
 
 
 def _llm_chunks(ev: Evidence) -> list[Chunk]:

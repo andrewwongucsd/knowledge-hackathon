@@ -115,7 +115,7 @@ DEPOSIT_NAMED = re.compile(r"\b(?:savings|checking|certificates?|cds?|money\s+ma
 FEE_WORD = re.compile(r"\b(?:fees?|costs?|charges?|charged|price)\b", re.I)
 # a rate question naming no product line but a vehicle is about a loan on it; never one about saving
 DEPOSIT_CUE = re.compile(r"\b(?:apy|dividends?|sav(?:e|es|ing|ings)|certificates?|cds?|deposits?|money\s+market|hsas?|iras?)\b", re.I)
-VEHICLE = re.compile(r"\b(cars?|vehicles?|trucks?|pickups?|suvs?|vans?|motorcycles?|boats?|snowmobiles?|atvs?|utvs?|watercraft)\b", re.I)
+VEHICLE = re.compile(r"\b(cars?|vehicles?|trucks?|pickups?|suvs?|vans?|motorcycles?|boats?|snowmobiles?|atvs?|utvs?|jet\s?skis?|watercraft)\b", re.I)
 RV = re.compile(r"\b(?:rvs?|recreational\s+vehicles?|campers?|motor\s*homes?)\b", re.I)
 # "does any savings tier pay 0.45%?" asks about a rate without the word (cash back and points are not rates)
 PLAIN_DESCRIPTORS = {"regular", "basic", "standard", "plain", "normal", "ordinary", "simple", "everyday", "share", "personal"}
@@ -420,7 +420,7 @@ def parse_query(question: str) -> Query:
     pinned = product_text == head and terms_in(head)          # a term in the question itself is never overridden
     q.terms = terms_in(head) if pinned else terms_in(head if context else low)
     q.native_terms = native_terms(head) if pinned else native_terms(head if context else low)
-    if re.search(r"model|vehicle|\bcar\b|truck|pickup|\bsuv|\bvan\b|motorcycle", low):   # model years only, never "as of March 2031"
+    if re.search(r"model|vehicle|\bcar\b|truck|pickup|\bsuv|\bvan\b|motorcycle|snowmobile|\batv|\butv|jet ?ski", low):   # model years only, never "as of March 2031"
         q.years = {int(m.group(1)) for m in re.finditer(r"\b((?:19|20)\d\d)\b", norm)
                    if not re.search(rf"(?:{MONTH_RE})\s*(?:\d{{1,2}}(?:st|nd|rd|th)?,?\s*)?$", norm[:m.start()])}
     if q.years and tail.strip():
@@ -529,7 +529,7 @@ def parse_query(question: str) -> Query:
                 q.category.add("loan")
                 q.descriptors = set(q.descriptors) | {"rv"}
             elif v := VEHICLE.search(head):
-                word = v.group(1).lower()
+                word = v.group(1).lower().split()[-1]
                 word = word[:-1] if word.endswith("s") else word
                 q.category.add("loan")
                 q.descriptors = set(q.descriptors) | {word} | ({"vehicle"} if word in ("car", "vehicle", "truck", "pickup", "suv", "van") else set())
@@ -553,7 +553,7 @@ def parse_query(question: str) -> Query:
 # table's question (it has no such row), not a boat or RV loan's.
 def _read_vehicle_year(q: Query, low: str) -> None:
     if q.attribute == "rate" and q.years and q.category == {"loan"} and not q.descriptors and (v := VEHICLE.search(low)):
-        word = v.group(1).lower()
+        word = v.group(1).lower().split()[-1]           # "jet ski": the table's own word is "ski"
         word = word[:-1] if word.endswith("s") else word
         q.descriptors = {word} | ({"vehicle"} if word in ("car", "vehicle", "truck", "pickup", "suv", "van") else set())
 
@@ -1077,6 +1077,10 @@ def _row_signature(c: Chunk, q: Query):
     label_wo_years = YEAR_RANGE_RE.sub(" ", label) if model_year_ranges(c.index_text) else label
     nums = tuple(sorted(_num_token(n) for n in re.findall(r"\d+(?:\.\d+)?", label_wo_years.replace(",", ""))))
     kinds = tuple(sorted(_value_kind(h, v) for h, v in c.values() if "%" in v))
+    if q.attribute == "rate" and q.descriptors:
+        text = c.index_text.lower()      # a row that names the asked product is not a stale copy of another product's tier
+        if any(d in text or any(x in text for x in SYNONYMS.get(d, ())) for d in q.descriptors):
+            words = words | {"(named)"}
     return words, nums, kinds
 
 
@@ -1683,6 +1687,47 @@ def asking_clause(text: str) -> str:
     return clause
 
 
+SENTENCE_END = re.compile(r"(?<=[.!?])\s+(?=[A-Z\"“(])")
+COUNT_ASKED = re.compile(r"\bhow many\b|\bnumber of\b", re.I)
+BACK_REFERENCE = re.compile(r"\b(?:it|its|there|here|them|they|that|this|those|one|ones|these(?!\s+(?:days|times|weeks)))\b", re.I)
+
+
+def asking_sentence(text: str) -> str:
+    """The last sentence of a count question, when it is the one that counts ("I'm writing a paper for my class.
+    Roughly how many ... ?"): it asks "how many", refers back to nothing ("it", "there", "that branch"), and the
+    sentences before it name nothing (no capitalised word, no figure) that the question might be about."""
+    parts = [p for p in SENTENCE_END.split(text.strip()) if p]
+    if len(parts) < 2 or not COUNT_ASKED.search(parts[-1]) or BACK_REFERENCE.search(parts[-1]):
+        return text
+    lead = " ".join(parts[:-1])
+    if re.search(r"\d", lead) or re.search(r"(?<![.!?]\s)(?<!^)\b[A-Z][a-z]", lead):
+        return text                      # a name or a figure in the scene may be what is asked about
+    return parts[-1]
+
+
+HEDGES = {_stem(w) for w in """roughly approximately about around exactly precisely currently presently nearly almost altogether
+overall now just also actually really honestly basically typically usually generally total estimated hi hey hello wow sorry
+please ok okay quick curious""".split()}
+
+
+def carried_in_context(ev: "Evidence", q: Query) -> bool:
+    """A count the search could not support, which the model may still read: two or more rare words of the question
+    all on one page of the evidence ("limited to N per member" under a program's heading, in a paragraph of its own),
+    or no rare word that is a name (a place or program is proof only when the evidence has it with the topic; a
+    common word the page words differently, "log" for "logged", is not). Everything else declines."""
+    if q.attribute != "count" or not q.subject:
+        return False
+    names = {_stem(w.lower()) for w in re.findall(r"(?<![.!?]\s)(?<!^)\b[A-Z][a-z]+", q.raw)}
+    if not any(w in names for alts in q.subject for w in alts):
+        return True
+    if len(q.subject) < 2:
+        return False
+    pages: dict = {}
+    for c in ev.context or ev.chunks:
+        pages.setdefault(c.key, set()).update(c.tf if c.tf else tokenize(c.index_text))
+    return any(all(any(w in have for w in alts) for alts in q.subject) for have in pages.values())
+
+
 def rare_subject(index: Index, q: Query) -> list[list[str]]:
     """The specific things a fee or count question is about ("Springfield", "cashier's check"), each with
     its synonyms. A fee line or count that names none of them answers a different question, so the
@@ -1706,6 +1751,7 @@ def rare_subject(index: Index, q: Query) -> list[list[str]]:
     skip = {t for m in re.finditer(r"\(([^)]*)\)", text) for t in tokenize(m.group(1))} | ({_stem(w) for w in (q.place, "branch", "location", "office")} if q.place else set())
     if clause_words is not None:                     # a lead-in word counts only if the site prices it
         skip |= {t for t in set(tokenize(full)) - clause_words if not priced(t) and t not in HAPPENED}
+    skip = skip | (set(tokenize(text)) & HEDGES)           # "Roughly how many", "people actually received": a hedge, not what is counted
     amounts = _fee_amounts(index)
     words = lambda s: set(tokenize(s or ""))
     # a word naming one specific fee: its fee items carry one or two amounts ("stop" -> $30)
