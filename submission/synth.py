@@ -544,6 +544,8 @@ def clear_cut(question: str, q: Query, ev: Evidence) -> bool:
         return True
     if q.attribute == "hours" and (q.places or q.need_schedule or (q.compare and q.schedules)):
         return any(supports(c, q) for c in ev.chunks)     # a schedule is given verbatim: the same for every wording
+    if q.year_guess:
+        return False                                          # which product line the vehicle belongs to is for the model
     if q.attribute != "rate" or not (q.terms or q.years or q.amounts) or q.list_intent or COMPARE_Q.search(question) \
             or SECOND_ASK.search(question) or len({w.rstrip("s") for w in _line_words(q)}) > 1:
         return False
@@ -684,6 +686,8 @@ class Synthesizer:
                 accepted = self._accept(question, q, ev, view, out, lookup, asked)
                 if accepted is not None:
                     text, cited, llm_note = accepted
+                    if q.attribute in ("count", "when") and _says_absent(text, question):
+                        return REFUSAL, [], False, note         # "the site only says …": that is not an answer
                     return text, cited, True, "; ".join(x for x in (llm_note, note) if x)
         if not ev.supported:                    # only the model may answer what the search could not support
             return REFUSAL, [], False, note
@@ -720,7 +724,8 @@ class Synthesizer:
         out = self._llm(question, ev, view, asked, q.list_intent)
         if not out or not out.get("answerable", False):
             return None
-        return self._accept(question, q, ev, view, out, asked=asked)
+        accepted = self._accept(question, q, ev, view, out, asked=asked)
+        return None if accepted is not None and _says_absent(accepted[0], question) else accepted
 
     def pick_pages(self, question: str, pages: str) -> list[str]:
         """Up to 3 page paths from the site's own page list ("path | title" lines) for a question."""
@@ -734,6 +739,17 @@ def _thinking_off(model: str) -> dict:
     """Haiku 5.5 thinks by default and accepts `disabled` at effort <= high; the speed score wants
     answers under 2s. Opus 5.5 rejects `disabled` (thinking is always on), so it gets nothing here."""
     return {"thinking": {"type": "disabled"}} if model.startswith("claude-haiku") else {}
+
+
+ABSENT = re.compile(r"\b(?:only (?:say|says|state|states|mention|mentions)|(?:does|do|did)(?:n['’]t| not) (?:say|state|list|mention|specify|"
+                    r"provide|give|show|publish|have)|no (?:information|mention|details?|record)|not (?:stated|listed|specified|mentioned|"
+                    r"published)|(?:isn['’]t|is not|aren['’]t|are not) (?:stated|listed|specified|mentioned|given|available))\b", re.I)
+
+
+def _says_absent(text: str, question: str) -> bool:
+    """An answer that says the site doesn't state it is a decline in other words ("they only say that in …"), unless it
+    also gives a figure the question didn't contain ("it doesn't give 2025; 317 used it in 2023")."""
+    return ABSENT.search(text) is not None and not numbers(text) - numbers(question)
 
 
 NUMBER_WORDS = set("""zero two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen

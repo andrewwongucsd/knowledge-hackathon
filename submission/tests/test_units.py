@@ -2118,20 +2118,6 @@ class Rev47(unittest.TestCase):
             ks._synth.enabled, ks._synth._client = True, Fake()
         return ks, calls
 
-    def test_the_sentence_that_asks_a_count(self):
-        from retrieve import asking_sentence
-        lead = "I'm making a slideshow for my class and want facts. "
-        self.assertEqual(asking_sentence(lead + "Roughly how many branch offices does Canoeco have these days?"),
-                         "Roughly how many branch offices does Canoeco have these days?")
-        for q in ("How many branch offices does Canoeco have?",                                    # one sentence
-                  lead + "Which branch is the biggest?",                                           # not a count
-                  "How many branch offices are in Zeta? My sister is moving there.",              # a trailing aside
-                  lead + "How many branch offices are there?",                                     # refers back
-                  "I'm asking about the Paddle program. How many members used it?",                # a name in the lead-in
-                  "I'm opening 3 accounts. How many branch offices does Canoeco have?",           # a figure in the lead-in
-                  "My rate is 3.5%. How many branch offices does Canoeco have?"):                  # a decimal is no sentence end
-            self.assertEqual(asking_sentence(q), q, q)
-
     def test_a_long_lead_in_before_a_count_is_read_when_the_whole_question_finds_nothing(self):
         ks, _ = self._site([("about", self.ABOUT)])
         lead = "I'm making a slideshow for my class and want facts. "
@@ -2139,7 +2125,6 @@ class Rev47(unittest.TestCase):
         self.assertIn("14", ks.answer("Roughly how many branch offices does Canoeco have?").text)
         self.assertIn("14", ks.answer("Hi how many branch offices does Canoeco have?").text)
         for q in (lead + "How many branch offices are there?",                                        # refers back: no retry
-                  "I'm making a slideshow about Zeta. How many branch offices does Canoeco have?",    # a name in the scene
                   "How many branch offices does Canoeco have in Zeta? My sister is moving there.",
                   "Zeta how many branch offices does Canoeco have?",                                  # not a hedge
                   "How many branch offices does Canoeco have in Zeta?"):
@@ -2244,6 +2229,157 @@ class Rev47(unittest.TestCase):
         self.assertIn("5.10%", ks.answer("What's the APR for a 60-month auto loan on a 2025 model-year vehicle?").text)
         self.assertNotIn("8.", ks.answer("What's the APR for a 60-month auto loan on a 2025 model-year vehicle?").text)
         self.assertEqual(parse_query("Got a 2020 snowmobile to finance over 60 months. What's the APR?").years, {2020})
+
+
+class Rev48(unittest.TestCase):
+    """Lists, a model year beside a make, a long lead-in that names or restricts something, rate words that ask no rate,
+    and an answer that says the site doesn't state it (synthetic data only)."""
+
+    ABOUT = Rev47.ABOUT
+    _site = Rev47._site
+
+    def test_the_clause_that_counts_and_what_the_lead_in_names(self):
+        from retrieve import count_clause, lead_names
+        clause, lead = count_clause("I'm making a slideshow for my class and want facts. Roughly how many branch offices does Canoeco have?")
+        self.assertEqual(clause, "how many branch offices does Canoeco have?")
+        self.assertIn("slideshow", lead)
+        clause, _ = count_clause("My boss asked me to find out how many branch offices Canoeco has.")      # inside one sentence
+        self.assertEqual(clause, "how many branch offices Canoeco has.")
+        from retrieve import ASKS_ELSE
+        self.assertTrue(ASKS_ELSE.search(count_clause("What APR does a $35,000 loan carry, and over how many months?")[1]))   # the lead asks too
+        self.assertIsNone(ASKS_ELSE.search(count_clause("My boss asked me to find out how many branch offices Canoeco has.")[1]))
+        for q in ("How many branch offices does Canoeco have?",                                            # no lead-in
+                  "Zeta how many branch offices does Canoeco have?",                                       # one word before it
+                  "I'm making a slideshow for my class today. Which branch is the biggest?"):               # no count
+            self.assertIsNone(count_clause(q), q)
+        names = lead_names("I help at Rivertown Pantry and gave $1,000 last year. Hello, we live near Cedar Rapids.")
+        self.assertTrue({_stem("rivertown"), _stem("pantry"), _stem("cedar"), "1,000"} <= names)
+        self.assertNotIn(_stem("hello"), names)                                                            # a sentence start is no name
+
+    def test_a_lead_in_that_names_something_is_read_one_that_places_or_restricts_it_is_not(self):
+        ks, _ = self._site([("about", self.ABOUT)])
+        for q in ("I'm making a slideshow about Zeta for my class. How many branch offices does Canoeco have?",     # a name in the scene
+                  "My boss at Rivertown Pantry asked me to find out how many branch offices Canoeco has."):
+            self.assertIn("14", ks.answer(q).text, q)
+        for q in ("I'm trying to decide before the end of the week. How many branch offices does Canoeco have?",     # innocent words
+                  "I only just heard about credit unions and my class project is due. How many branch offices does Canoeco have?",
+                  "During my lunch break I was reading for the class project. How many branch offices does Canoeco have?",
+                  "Honestly I'm a bit confused about the whole class project. How many branch offices does Canoeco have, if you know?"):
+            self.assertIn("14", ks.answer(q).text, q)
+        lead = "I'm making a slideshow for my class and want facts. "
+        for q in (lead + "How many branch offices are there?",                                    # "there": a place it doesn't name
+                  "I'm making a slideshow for my class. Over the last five years, how many branch offices does Canoeco have?",
+                  "I'm making a slideshow for my class. Counting the Zeta office too. How many branch offices does Canoeco have?",
+                  "I live in Zeta. How many branch offices are in my state?",
+                  "I live in Zeta. How many branch offices are close to me?",
+                  "I'm in Zeta on business this week. How many branch offices are in the area?",
+                  "I'm making a slideshow for my class. Excluding the Zeta office. How many branch offices does Canoeco have?",
+                  "I'm only counting the valley offices for my class project. How many branch offices does Canoeco have?",
+                  "I'm asking about the Paddle program for my class. How many members used it?"):    # refers back, and nothing carries the name
+            self.assertEqual(ks.answer(q).text, REFUSAL, q)
+
+    def test_wider_list_wordings_only_for_unpinned_product_and_rate_questions(self):
+        for q in ("What special certificates are you running right now?", "I'd like every regular certificate term you offer with its APY please",
+                  "What protection products can I add to my loan?", "What savings accounts can a business open with you?"):
+            self.assertTrue(parse_query(q).list_intent, q)
+        for q in ("What auto loan can I get for a 2024 vehicle at 84 months?", "What APY can I get on a 12-month certificate?",
+                  "What time can I get to the lobby on Saturday?", "What fee can I get waived on a checking account?",
+                  "What date can I pick up my new debit card?", "What can I do about a lost card?",
+                  "What rate can I get on a personal loan?", "What information can I get about a credit card?",
+                  "What credit limit can I get on a card?"):
+            self.assertFalse(parse_query(q).list_intent, q)
+
+    def test_a_list_question_reads_the_best_pages_not_only_the_best_paragraphs(self):
+        filler = "\n\n".join(f"Loan paragraph number {i} talks about protection products you can add to your loan." for i in range(3))
+        far = "\n\n".join(f"Coverage note number {i} describes the Gap Cover add-on and what it pays when a vehicle is lost." for i in range(30))
+        page = "# Loan protection\n\n" + filler + "\n\n## Gap\n\n" + far + "\n"
+        reply = {"note": "", "answer": "Gap Cover.", "answerable": True, "evidence_ids": [1]}
+        ks, calls = self._site([("loans/protection", page)], [reply])
+        ks.answer("What protection products can I add to my loan?")
+        self.assertEqual(len(calls), 1)
+        content = calls[0]["messages"][0]["content"]
+        self.assertIn("Gap Cover", content)
+        import solution
+        self.assertLessEqual(len(content), 6000 + solution.LIST_BUDGET + 4000)               # the listed pages stay under their budget
+
+    TABLES = ("# Canoeco Loans\n\n## Auto Loans\n\n| Model Year | Term | APR |\n|---|---|---|\n"
+              "| 2020-23 | 60 Months | 5.10% |\n| 2024-27 | 60 Months | 5.40% |\n\n"
+              "## Trail Loans (Snowmobile and Jet Ski)\n\n| Model Year | Term | APR |\n|---|---|---|\n"
+              "| 2022-21 | 60 Months | 8.50% |\n| 2020-19 | 60 Months | 8.90% |\n")
+
+    def test_a_year_beside_a_capitalised_make_is_a_model_year_only_in_an_unnamed_loan_question(self):
+        guess = lambda q: parse_query(q).year_guess
+        for q in ("What's the APR on a 60-month loan for a 2021 Honda Accord?", "Looking at a 2023 Tahoe, 60 month term. What APR would I get?"):
+            self.assertTrue(guess(q), q)
+        self.assertEqual(parse_query("APR for a 2021 Honda Accord, 60 months?").years, {2021})
+        self.assertEqual(parse_query("APR for a 2021 Honda Accord, 60 months?").descriptors, set())
+        for q in ("What's the APR on a 36-month personal loan for a 2026 wedding?", "What's the APR on a 2000 dollar personal loan?",
+                  "What's the rate on a 2025 home loan?", "36-month boat loan for a 2024 Sea Ray, what APR?",
+                  "What's the APR on a 60-month auto loan for a 2025 Honda Civic?", "APR for a 2021 honda accord, 60 months?",
+                  "What's the APR on a 2025 Auto Loan?", "What's the rate on the 2026 Summer Special?"):
+            self.assertFalse(guess(q), q)
+        # no key: a year that fits two product lines can't be placed without the vehicle; with a key the model sees both rows
+        reply = {"note": "", "answer": "5.10%.", "answerable": True, "evidence_ids": [1]}
+        ks, calls = self._site([("loans", self.TABLES)], [reply])
+        a = ks.answer("What's the APR on a 60-month loan for a 2021 Honda Accord?")
+        self.assertEqual(len(calls), 1)
+        content = calls[0]["messages"][0]["content"]
+        self.assertTrue("5.10%" in content and "8.50%" in content)
+        self.assertIn("5.10%", a.text)
+        off, _ = self._site([("loans", self.TABLES)])
+        self.assertFalse(off.answer("What's the APR on a 60-month loan for a 2021 Honda Accord?").confident)
+        self.assertIn("5.40%", off.answer("What's the APR on a 60-month loan for a 2025 Honda Accord?").text)    # one row fits: it is the answer
+        self.assertFalse(off.answer("What's the APR on a 60-month loan for a 2010 Honda Accord?").confident)    # none fits
+        self.assertIn("8.90%", off.answer("how much interest on a loan for a 2019 jet ski, 60 months").text)    # a vehicle word pins its table
+
+    def test_a_model_year_candidate_is_a_live_product_row_never_a_calculator_or_a_page_that_left_the_crawl(self):
+        import solution
+        from contract import Page, Snapshot
+        calc = "# Auto loan calculator\n\n| Model Year | Term | APR |\n|---|---|---|\n| 2020-23 | 60 Months | 4.35% |\n"
+        gone = "# Old auto rates\n\n| Model Year | Term | APR |\n|---|---|---|\n| 2020-23 | 60 Months | 3.00% |\n"
+        ks, _ = self._site([("loans", self.TABLES), ("calculators/auto-loan", calc), ("old-rates", gone)])
+        ks.ingest(Snapshot("s2", "2031-07-15", [Page("https://canoeco.example.org/loans", "loans | Canoeco", self.TABLES, "2031-07-15T09:00:00Z"),
+                                                 Page("https://canoeco.example.org/calculators/auto-loan", "calc | Canoeco", calc, "2031-07-15T09:00:00Z")]))
+        q = parse_query("What's the APR on a 60-month loan for a 2021 Honda Accord?")
+        text = " ".join(c.text for c in solution._model_year_rows(ks._indexes[-1], q))
+        self.assertTrue("5.10%" in text and "8.50%" in text)
+        self.assertTrue("4.35%" not in text and "3.00%" not in text)
+
+    def test_how_a_value_changed_between_two_moments_where_only_one_says_the_year(self):
+        from solution import change_span
+        ks = Rev46("test_one_past_moment_and_now_are_two_snapshots")._timeline()
+        span = lambda q: change_span(q, ks._store)
+        d = date
+        self.assertEqual(span("How did the 12-month certificate APY change between May 10 and June 12, 2030?"), (d(2030, 5, 10), d(2030, 6, 12)))
+        self.assertEqual(span("Between mid-May and late September 2030, how did the 12-month APY change?"), (d(2030, 5, 15), d(2030, 9, 30)))
+        self.assertEqual(span("How did the 12-month APY change between early June and late September 2030?"), (d(2030, 6, 12), d(2030, 9, 30)))
+        self.assertEqual(span("What happened to the 12-month APY between May 20 and September 2, 2030?"), (d(2030, 5, 20), d(2030, 9, 2)))
+        self.assertEqual(span("How did the 12-month APY change from the start of May to September 2030?"), (d(2030, 5, 10), d(2030, 9, 30)))
+        for q in ("What is the 12-month APY between 1% and 2%?", "Between 2 and 5 years, how did the term change?",
+                  "What was the 12-month APY as of June 12, 2030, between you and me?", "What is the APY from Monday to Friday?"):
+            self.assertIsNone(span(q), q)
+        text = ks.answer("How did the 12-month certificate APY change between May 20 and June 12, 2030?").text
+        self.assertTrue("1.25%" in text and "1.70%" in text, text)
+
+    def test_rate_words_that_ask_no_rate_are_open_questions(self):
+        for q in ("What credit score do I need to qualify for your lowest mortgage rate?", "How long are your quoted mortgage rates locked for?",
+                  "what credit score do the mortgage rates you advertise assume?"):
+            self.assertIsNone(parse_query(q).attribute, q)
+        for q in ("Can you tell me the interest rate for a 30-year mortgage if my credit score is 700?",                # cue after the rate word
+                  "Provide current checking interest rates if my credit score is 700?",
+                  "Rate for a 5-year certificate? Do I need to qualify?",
+                  "What rate would I qualify for on a 15-year mortgage?", "What are the rates and requirements for a personal loan?",
+                  "What's the interest rate on a 60-month auto loan, and how long will that rate last?",
+                  "What rate am I eligible for on a 60-month auto loan?", "What rate did the relief program offer qualified borrowers?",
+                  "My cousin locked in a 15 year fixed mortgage around May 11. What was the rate back then?"):
+            self.assertEqual(parse_query(q).attribute, "rate", q)
+
+    def test_an_answer_that_says_the_site_does_not_state_it_is_a_decline(self):
+        from synth import _says_absent
+        self.assertTrue(_says_absent("They only say that in 2008 the chief officer changed.", "When did it merge in 2008?"))
+        self.assertTrue(_says_absent("That isn't listed anywhere.", "When is it?"))
+        self.assertFalse(_says_absent("The site doesn't give a 2025 figure; 317 employees used it in 2023.", "How many used it in 2025?"))
+        self.assertFalse(_says_absent("Applications open January 5, 2031.", "When do applications open?"))
 
 
 class Contract(unittest.TestCase):

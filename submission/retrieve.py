@@ -96,6 +96,13 @@ def use_site_words(words) -> None:
 
 
 LIST_ASK = r"^\s*(?:please\s+)?(?:list|show me all)\b"     # "list your card rates"
+# more ways to ask for every line: "what specials are you running", "every term you offer", "what protection products can I add"
+LIST_WIDER = re.compile(r"\b(?:what|which) (?:\w+ ){0,4}(?:are|do) (?:you|y['’]all) (?:running|offering|selling|having|got)\b|"
+                        r"\bevery (?:\w+ ){0,3}(?:term|type|kind|product|option)s?\b|"
+                        r"\b(?:what|which) are (?:all|every) (?:of )?(?:your|the)\b", re.I)
+LIST_CAN = re.compile(r"\b(?:what|which) (?!(?:\w+ ){0,4}?(?:rate|apr|apy|limit|amount|information|info|time|bonus|date|fee|credit score)s?\b)"
+                      r"(?:\w+ ){1,5}(?:can|could) (?:i|we|a member|a business|one|someone) "
+                      r"(?:add|open|get|choose|pick|have|apply for|sign up for|select)\b", re.I)
 OPTIONS_Q = re.compile(r"\boptions\b", re.I)
 PRODUCT_HEADS = r"loans?|mortgages?|certificates?|cds?|accounts?|cards?|savings|checking|visa|mastercard|discover|amex|heloc|line"
 
@@ -151,6 +158,10 @@ WHEN_Q = re.compile(r"^\s*when\b|what date|\bby when\b", re.I)
 LIST_Q = re.compile(r"\b(?:what|which) (?:\w+ ){0,3}(?:do|does) (?:you) (?:offer|have|carry|provide)\b|"
                     r"\b(?:what|which) (?:\w+ ){0,3}(?:are|is) (?:available|offered)\b|\bwhat (?:kinds|types) of\b|"
                     r"\blist (?:the|your|all|every|out)\b|\bshow me all\b|" + LIST_ASK, re.I)
+NOT_A_RATE = re.compile(r"\bhow long\b|\bhow many (?:days|weeks|months|years)\b|\bcredit score\b|\brequirements?\b|\bqualify\b|\bqualifies\b|"
+                        r"\bqualification\b|\beligib\w*\b|\brate lock\b|\block(?:ed|s)? (?:for|until)\b|\block period\b", re.I)
+VALUE_REQUESTED = re.compile(r"\b(?:what|which)(?:['’]s| is| are| was| were)?\s+(?:\w+\s+){0,3}?(?:rates?|apr|apy|dividends?|yield|interest)\b|"
+                             r"\brates?\s+(?:and|&)\b|\bhow much (?:interest|will i earn|do i earn)\b", re.I)
 RATE_EV = re.compile(r"\d+(?:\.\d+)?\s*%\s*(?:APR|APY|annual percentage|fixed|variable|interest|dividend)|"
                      r"(?:APR|APY|rate of|rates? (?:as low as|start(?:ing)? at|from)|dividend rate)\s*(?:is|of|:)?\s*"
                      r"\d+(?:\.\d+)?\s*%", re.I)
@@ -356,6 +367,7 @@ class Query:
     place: str | None = None                         # a branch the site has, named in a rate or fee question
     descriptors: set = field(default_factory=set)    # words naming the product, e.g. {"tractor"}
     category: set = field(default_factory=set)       # the product-line word itself, e.g. {"savings"}
+    year_guess: bool = False                         # the year was read from "a <year> <word>", not from a vehicle word
     list_intent: bool = False                        # "what cards do you offer": show every product line
     subject: list = field(default_factory=list)      # rare question words a fee/count answer must contain
     native_terms: set = field(default_factory=set)   # terms in the question's own unit, {(5, 'year')}
@@ -459,7 +471,10 @@ def parse_query(question: str) -> Query:
         q.terms, q.native_terms = set(), set()
     # "what are my options": a list, unless a term or model year already pins one row
     q.list_intent = bool(LIST_Q.search(question)) or (OPTIONS_Q.search(question) is not None
-                                                      and not (q.terms or q.years))
+                                                      and not (q.terms or q.years)) \
+        or ((LIST_WIDER.search(question) is not None and q.attribute in (None, "rate")
+             or LIST_CAN.search(question) is not None and q.attribute is None)
+            and re.search(rf"\b(?:{PRODUCT_HEADS})\b", question, re.I) and not (q.terms or q.years or q.amounts))
     syn = {**_SYN, **_HOWTO_SYN} if q.attribute in (None, "when") else _SYN
     if q.attribute in ("rate", "fee"):
         syn = {**syn, _stem("hsa"): [_stem("health")]}     # a rate row names the line in full
@@ -538,6 +553,9 @@ def parse_query(question: str) -> Query:
             q.tokens += [x for x in FEE_SYN.get(t, []) if x not in q.tokens]
         q.descriptors = {d for d in q.descriptors if _stem(d.lower()) not in HAPPENED}   # "a lost card": no product
     raw_low = q.raw.lower()
+    if q.attribute == "rate" and (cue := NOT_A_RATE.search(raw_low)) and not VALUE_REQUESTED.search(raw_low) \
+            and (word := RATE_Q.search(raw_low)) and cue.start() < word.start():
+        q.attribute = None                              # "how long are the rates locked", "what credit score for the lowest rate": about a rate, not its value
     _read_hours(q, raw_low)
     _read_counts(q, raw_low)
     _read_vehicle_year(q, raw_low)
@@ -549,9 +567,21 @@ def parse_query(question: str) -> Query:
     return q
 
 
+# "a 2022 Honda Accord": a year, an article before it and a capitalised make or model after it
+YEAR_BEFORE_MAKE = re.compile(r"\b(?i:a|an|my|our|the|his|her|their)\s+((?:19|20)\d\d)\s+((?:[A-Z][\w-]*)(?:\s+[A-Z][\w-]*){0,2})")
+
+
 # A vehicle word names the loan when a model year is asked: "a 72-month loan on a 2016 or older vehicle" is the auto
 # table's question (it has no such row), not a boat or RV loan's.
 def _read_vehicle_year(q: Query, low: str) -> None:
+    if q.attribute == "rate" and not q.years and (q.category == {"loan"} or (not q.category and re.search(r"\bapr\b", low))) \
+            and (m := YEAR_BEFORE_MAKE.search(q.raw)) and not re.search(rf"\b(?:{PRODUCT_HEADS})\b", m.group(2), re.I):
+        # "a 2022 <Make> <Model>" in a loan rate question that names no product line: a model year, whatever the make is
+        # called; the make and model are no product words of the site. A product word that stays ("personal", "boat",
+        # "auto") names the line already: no guess.
+        made = {x for w in re.findall(r"[A-Za-z]+", m.group(2)) for x in (w.lower(), _stem(w.lower()))}
+        if not (set(q.descriptors) - made):
+            q.years, q.year_guess, q.descriptors = {int(m.group(1))}, True, set()
     if q.attribute == "rate" and q.years and q.category == {"loan"} and not q.descriptors and (v := VEHICLE.search(low)):
         word = v.group(1).lower().split()[-1]           # "jet ski": the table's own word is "ski"
         word = word[:-1] if word.endswith("s") else word
@@ -1689,20 +1719,40 @@ def asking_clause(text: str) -> str:
 
 SENTENCE_END = re.compile(r"(?<=[.!?])\s+(?=[A-Z\"“(])")
 COUNT_ASKED = re.compile(r"\bhow many\b|\bnumber of\b", re.I)
-BACK_REFERENCE = re.compile(r"\b(?:it|its|there|here|them|they|that|this|those|one|ones|these(?!\s+(?:days|times|weeks)))\b", re.I)
+BACK_REFERENCE = re.compile(r"\b(?:it|its|them|they|that|this|those|one|ones|these(?!\s+(?:days|times|weeks)))\b", re.I)
+PLACE_DEICTIC = re.compile(r"\b(?:there|here|nearby|near by|near me|near us|close to me|close to us|close by|by me|around me|around here|in my area|"
+                           r"in our area|in the area|my area|our area|my town|our town|my city|our city|my neighborhood|where i live|"
+                           r"nearest|closest|local|locally|within \d+ miles?|(?:my|our|this|your) (?:state|county|region|metro|zip|province))\b", re.I)
+# a lead-in that narrows what is counted ("not counting …", "stick to …", "for 2023") is part of the question
+RESTRICTION = re.compile(r"\b(?:not counting|not including|excluding|other than|apart from|aside from|leaving out|leave out|only count(?:ing)?|"
+                         r"just count(?:ing)?|counting|if i only|except for|except the|out of the picture|combined|stick to|specifically)\b|"
+                         r"\b(?:for|as of|in|during)\s+(?:19|20)\d\d\b|"
+                         r"\b(?:over|in|during|for|within)\s+the\s+(?:last|past|previous)\s+(?:\w+\s+){0,2}(?:years?|months?|weeks?|days?)\b", re.I)
 
 
-def asking_sentence(text: str) -> str:
-    """The last sentence of a count question, when it is the one that counts ("I'm writing a paper for my class.
-    Roughly how many ... ?"): it asks "how many", refers back to nothing ("it", "there", "that branch"), and the
-    sentences before it name nothing (no capitalised word, no figure) that the question might be about."""
+# a lead-in that asks something else ("What APR does a $35,000 loan carry, and over how many months?") is the question
+ASKS_ELSE = re.compile(r"\b(?:what|which|who|when|where|why|how (?:much|long|often|old|far))\b", re.I)
+
+
+def count_clause(text: str):
+    """(the clause that counts, the words before it) for a count question with a lead-in, else None. The clause runs from
+    the last "how many" / "number of" to the end of its sentence, so "My chair asked me to find out how many …" and
+    "I'm writing a paper. Roughly how many …?" both give the count alone."""
     parts = [p for p in SENTENCE_END.split(text.strip()) if p]
-    if len(parts) < 2 or not COUNT_ASKED.search(parts[-1]) or BACK_REFERENCE.search(parts[-1]):
-        return text
-    lead = " ".join(parts[:-1])
-    if re.search(r"\d", lead) or re.search(r"(?<![.!?]\s)(?<!^)\b[A-Z][a-z]", lead):
-        return text                      # a name or a figure in the scene may be what is asked about
-    return parts[-1]
+    for i in range(len(parts) - 1, -1, -1):
+        m = COUNT_ASKED.search(parts[i])
+        if m:
+            clause = parts[i][m.start():]
+            lead = " ".join(parts[:i] + [parts[i][:m.start()]]).strip()
+            return (clause, lead) if len(lead.split()) >= 4 else None      # one word before it is a name, not a lead-in
+    return None
+
+
+def lead_names(lead: str) -> set:
+    """Stems of what a lead-in names: capitalised words (not at a sentence start) and figures. They help the search
+    for a clause that refers back ("that grant"), and are never required words."""
+    caps = re.findall(r"(?<![.!?]\s)(?<!^)\b[A-Z][a-z]{2,}", lead)
+    return {_stem(w.lower()) for w in caps} | {x for x in re.findall(r"\d[\d,.]*", lead)}
 
 
 HEDGES = {_stem(w) for w in """roughly approximately about around exactly precisely currently presently nearly almost altogether
