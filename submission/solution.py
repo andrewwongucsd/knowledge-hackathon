@@ -31,10 +31,10 @@ from datetime import date, timedelta   # noqa: E402
 
 from ingest import KIND_RANK, MONTH_RE, MONTHS, STATUS_RANK, Chunk, Store, _on_site, url_key   # noqa: E402
 import retrieve                        # noqa: E402
-from retrieve import (ASKS_ELSE, BACK_REFERENCE, CHAT_FILLERS, FRAME_WORDS, GENERIC, GENERIC_HEADS, HEDGES, MEMBERSHIP_Q, PLACE_DEICTIC,  # noqa: E402
-                      QUIET, RESTRICTION, STOP, Evidence, Index, _stem, carried_in_context, count_clause, lead_names, parse_query,
-                      proper_names, qualify, select, terms_in, tokenize, use_proper_names, use_site_words)
-from synth import REFUSAL, Synthesizer  # noqa: E402
+from retrieve import (ASKS_ELSE, BACK_REFERENCE, CHAT_FILLERS, DIMENSIONS, FRAME_WORDS, GENERIC, GENERIC_HEADS, HEDGES, MEMBERSHIP_Q,  # noqa: E402
+                      PLACE_DEICTIC, QUIET, RESTRICTION, STOP, Evidence, Index, _stem, carried_in_context, count_clause, fee_clause,
+                      lead_names, parse_query, proper_names, qualify, select, terms_in, tokenize, use_proper_names, use_site_words)
+from synth import REFUSAL, Synthesizer, spelled_as_digits  # noqa: E402
 
 
 class KnowledgeSystem:
@@ -150,6 +150,7 @@ def _respond(index: Index | None, synth: Synthesizer, question: str, search: str
         return Answer(text=REFUSAL, confident=False)
     view = index.view
     q = parse_query(search or question)       # the model still sees the full question
+    q.spelled_counts = synth.enabled          # a count a page spells in words is for the model to read
     linking = LINK_Q.search(question) is not None
     vocab = _anchor_vocab(index) if linking else None
     named = _title_names(index) if linking else None
@@ -158,29 +159,11 @@ def _respond(index: Index | None, synth: Synthesizer, question: str, search: str
         q.expansion = q.expansion + [_stem("join")]        # "sign up as a member": the link to join
         q.tokens = q.tokens + [_stem("join")]
     ev = select(index, q)
-    if q.attribute == "count" and not ev.supported and (split := count_clause(q.raw)):
-        # a lead-in before the question ("I'm writing a paper … Roughly how many …?"): its words may be what nothing
-        # answers. Ask the clause that counts, only when the whole question found nothing, and only if the lead-in
-        # restricts, places or asks nothing else ("not counting …", "I live in …" with "close to me"), the clause refers to nothing
-        # ("there", "it") unless the lead-in names it and the page that answers carries every name, and what answers
-        # shares a word of the clause beyond the thing counted.
-        clause, lead = split
-        names = lead_names(lead)
-        back = BACK_REFERENCE.search(clause)
-        if not PLACE_DEICTIC.search(clause) and not RESTRICTION.search(lead) and not ASKS_ELSE.search(lead) \
-                and not (back and not names):
-            q2 = parse_query(clause)
-            if back:
-                q2.tokens = list(dict.fromkeys(q2.tokens + sorted(n for n in names if not n[0].isdigit())))
-            ev2 = select(index, q2)
-            words = {n for n in names if not n[0].isdigit()}
-            rest = set(q2.tokens) - {q2.count_noun} - QUIET - HEDGES - FILLERS
-            ok = lambda c: retrieve.supports(c, q2) and (not rest or rest & set(c.tf or {}))
-            carries = not back or (bool(words) and any(ok(c) and words <= set(tokenize(_page_texts(index).get(c.key, "")))
-                                                         for c in ev2.chunks))
-            if (q2.attribute == "count" and q2.count_noun == q.count_noun and carries
-                    and ((ev2.supported and any(ok(c) for c in ev2.chunks)) or (synth.enabled and carried_in_context(ev2, q2)))):
-                q, ev = q2, ev2
+    lead_split = count_clause(q.raw) if q.attribute == "count" else fee_clause(q.raw) if q.attribute == "fee" else None
+    antecedent = []
+    if lead_split and not ev.supported:
+        antecedent = _antecedent(*lead_split)
+        q, ev = _retry_clause(index, synth, q, ev, *lead_split, antecedent)
     if linking:                                       # "what link should I use…": the site's own link
         carried = lambda u: sum(u in t for t in _page_texts(index).values())
         near, wide = ev.context or ev.chunks, [c for _, c in index.search(q.tokens, top=30)]
@@ -201,19 +184,20 @@ def _respond(index: Index | None, synth: Synthesizer, question: str, search: str
                           sources=[Source(url=vp.page.url, snapshot_id=vp.snapshot_id)] if vp else [])
     if not ev.chunks or (q.attribute and not ev.supported and not (synth.enabled and carried_in_context(ev, q))):
         return Answer(text=REFUSAL, confident=False)
+    if q.attribute == "count" and synth.enabled and lead_split:
+        ev.context = _with_count_chunks(index, q, ev, list(q.tokens) + antecedent)
     if q.list_intent and synth.enabled:
         ev.context = _with_listed_pages(index, q, ev)
+    if q.year_kind and not _model_year_rows(index, q):
+        return Answer(text=REFUSAL, confident=False)       # the vehicle's year and term fit no row of its kind
     if q.year_guess:
         rows = _model_year_rows(index, q)
-        if not rows or (len(rows) > 1 and not synth.enabled):
-            # no model-year row fits the year and term, or several do and only the model can say which product line the
-            # vehicle belongs to
+        if not rows or not synth.enabled:
+            # no model-year row fits the year and term, or the word beside the year is not one the vehicle list knows and
+            # only the model can say what it is and which product line it is financed under
             return Answer(text=REFUSAL, confident=False)
-        if len(rows) == 1:                          # the one row the year and term fit is the answer
-            ev.chunks, ev.context, ev.supported = rows, rows, True
-        else:
-            have = {c.id for c in ev.context or ev.chunks}
-            ev.context = (ev.context or ev.chunks) + [c for c in rows if c.id not in have]
+        have = {c.id for c in ev.context or ev.chunks}
+        ev.context = (ev.context or ev.chunks) + [c for c in rows if c.id not in have]
     fact = match_fact(_facts(index), q, index)
     if fact:
         ev.context = apply_fact(ev.context or ev.chunks, fact, view)
@@ -231,6 +215,8 @@ def _respond(index: Index | None, synth: Synthesizer, question: str, search: str
                                                  second_look=second_look)
     if not confident or (before and any(_too_new(c, view, before, dated or {}) for c in cited)):
         return Answer(text=REFUSAL, confident=False)
+    if q.attribute == "count" and synth.enabled:
+        text = spelled_as_digits(text)                    # "Thirty-two" on the page: the member and the scorer read "32"
     if fact:
         text, stated = fact_guard(text, fact)
         if stated is not None:
@@ -561,7 +547,10 @@ SPAN_FROM = re.compile(r"\b(?:since|after|from)\s+(?:\S+\s+){0,2}$", re.I)
 # "What was it in May and what is it now?", "Has it changed since the middle of May?", "…when I first checked in May":
 # one past moment, and "now" (or "since" it), asks for the site at both. A moment is a date, a day without a year
 # ("May 12"), or a month alone; the newest crawl is "now".
-NOW_REF = re.compile(r"\b(?:now|currently|today|at present|these days|latest(?:\s+update)?|most\s+recent(?:ly)?|newest)\b", re.I)
+# "the most recent round" / "the latest cohort" names a thing, not the moment "now": the adjective counts only when no such noun follows
+NOW_REF = re.compile(r"\b(?:now|currently|today|at present|these days|most\s+recently|latest(?:\s+update)?|most\s+recent|newest)\b"
+                     r"(?!\s+(?:round|cohort|class|batch|group|recipients?|winners?|awardees?|edition|announcement|news|press|article|"
+                     r"story|post|issue|grant|award|program|list)\b)", re.I)
 FIRST_CHECKED = re.compile(r"\b(?:first\s+checked|when\s+i\s+first|at\s+first|originally)\b", re.I)
 AS_OF_PIN = re.compile(r"\bas\s+(?:of|at)\b", re.I)
 SINCE_RE = re.compile(r"\bsince\b", re.I)
@@ -671,6 +660,9 @@ def _then_now_span(question: str, original: str, store: Store) -> tuple | None:
     return (days[0], days[-1]) if len(days) >= 2 else (days[0], None)
 
 
+# "in May and in June 2026", "in May vs June", "in May compared to June"
+IN_AND_FRAME = re.compile(r"\b(?:in|on|during|for)\s+(?P<a>.+?)\s+(?:and|vs\.?|versus|compared\s+(?:to|with))\s+(?:in\s+|on\s+)?"
+                          r"(?P<b>(?:[^?,]|,(?=\s*\d))+)", re.I)
 BETWEEN_FRAME = re.compile(r"\b(?:between|from)\s+(?P<a>.+?)\s+(?:and|to|through|until|till)\s+(?P<b>(?:[^?,]|,(?=\s*\d))+)", re.I)
 
 
@@ -696,7 +688,7 @@ def _half_moment(text: str, year: int, store: Store) -> date | None:
 def _between_span(question: str, store: Store) -> tuple | None:
     """(earlier, later) for "between A and B" where each side is a date, a day or a month, and only one of them says the
     year ("between May 19 and June 9, 2026", "between mid-May and late September 2026")."""
-    if not (m := BETWEEN_FRAME.search(question)):
+    if not (m := BETWEEN_FRAME.search(question) or IN_AND_FRAME.search(question)):
         return None
     years = [d.year for x in DATE_PHRASE.finditer(question) if (d := _phrase_date(x.group(1)))]
     year = years[-1] if years else store.views[-1].taken_on.year
@@ -712,7 +704,8 @@ def change_span(question: str, store: Store) -> tuple | None:
     question = calendar_phrases(question, _now(store), _crawls(store))
     if len(store.views) < 2:
         return None
-    if CHANGE_ASK.search(question) or (COMPARE_ASK.search(question) and len(terms_in(question.lower())) <= 1):
+    asks_change = CHANGE_ASK.search(question) or (COMPARE_ASK.search(question) and len(terms_in(question.lower())) <= 1)
+    if asks_change:
         found = [(m.start(1), d) for m in DATE_PHRASE.finditer(question) if (d := _phrase_date(m.group(1)))]
         if len(found) < 2 and (mp := MONTH_PAIR.search(question)) and (d := _phrase_date(f"{mp.group(1)} {mp.group(2)}")):
             found.append((mp.start(1), d))
@@ -721,7 +714,7 @@ def change_span(question: str, store: Store) -> tuple | None:
             return days[0], days[-1]
         if len(days) == 1 and SPAN_FROM.search(question[:found[0][0]]):
             return days[0], None
-    if CHANGE_ASK.search(question) and not AS_OF_PIN.search(question) and (span := _between_span(question, store)):
+    if asks_change and not AS_OF_PIN.search(question) and (span := _between_span(question, store)):
         return span
     return _then_now_span(question, original, store)
 
@@ -1334,6 +1327,95 @@ def _pages_evidence(index: Index, q, keys: list, budget: int | None = None) -> E
     return Evidence(chunks, [], True, {}, chunks) if chunks else None
 
 
+SENTENCE_END_RE = re.compile(r"(?<=[.!?])\s+")
+
+
+SIZE_COMPARED = re.compile(r"\b(?:too\s+(?:big|small|large|little|tight)|bigger|larger|smaller|(?:next|another|different|other)\s+size|"
+                          r"instead|rather\s+than|upgrade|downsize)\b", re.I)
+
+
+def _resolve_size(clause: str, lead: str) -> str:
+    """"What does that size cost?" after "a 5 by 10 safe deposit box": the size, and the thing it is the size of. Only when
+    the lead-in gives one size and does not compare it ("too big", "the next size up"), and says what the thing is (a
+    box); with none or two, a comparison or no box named, the clause is left as it is."""
+    m = re.search(r"\b(?:that|this|the same)\s+(?:size|one)\b", clause, re.I)
+    sizes = [(d.group(1).strip(), d.group(2).strip()) for d in DIMENSIONS.finditer(lead)]
+    if not m or len({tuple(re.findall(r"\d+", x)) for x, _ in sizes}) != 1 or SIZE_COMPARED.search(lead):
+        return clause
+    size, noun = sizes[-1]
+    noun = noun or ("box" if re.search(r"\bbox", lead, re.I) else "")
+    return clause[:m.start()] + f"a {size} {noun}".strip() + clause[m.end():] if noun else clause
+
+
+def _antecedent(clause: str, lead: str) -> list:
+    """What "that grant" or "this program" in a clause refers to: the content words of the lead-in's sentence that names the
+    same thing, to search with (never to require)."""
+    out = []
+    for m in re.finditer(r"\b(?:that|this|those|these|the same)\s+([a-z]+)", clause, re.I):
+        noun = _stem(m.group(1).lower())
+        for sentence in SENTENCE_END_RE.split(lead):
+            toks = tokenize(sentence)
+            if noun in toks:
+                out += [t for t in toks if t not in STOP and t not in GENERIC and not t[0].isdigit()][:8]
+    return list(dict.fromkeys(out))
+
+
+def _retry_clause(index: Index, synth: Synthesizer, q, ev: Evidence, clause: str, lead: str, antecedent: list) -> tuple:
+    """A lead-in before the question ("I'm writing a paper … Roughly how many …?"): its words may be what nothing answers.
+    Returns (q, ev) of the clause asked alone when it answers, else the ones given. Used only when the whole question found
+    nothing, and only if the lead-in restricts, places or asks nothing else ("not counting …", "I live in …" with "close to
+    me"); a clause that refers back ("that grant", "it") needs a lead-in that names what it refers to and an answer on a
+    page that carries the names; and what answers must share a word of the clause beyond the thing counted. A fee question
+    reads its lead-in only to say what "that size" is the size of."""
+    if q.attribute == "fee":
+        resolved = _resolve_size(clause, lead)
+        if resolved == clause:
+            return q, ev
+        clause = resolved
+    names = lead_names(lead)
+    back = BACK_REFERENCE.search(clause)
+    if PLACE_DEICTIC.search(clause) or RESTRICTION.search(lead) or ASKS_ELSE.search(lead) or (back and not names):
+        return q, ev
+    q2 = parse_query(clause)
+    q2.spelled_counts = synth.enabled
+    if back:
+        q2.tokens = list(dict.fromkeys(q2.tokens + sorted(n for n in names if not n[0].isdigit()) + antecedent))
+    ev2 = select(index, q2)
+    words = {n for n in names if not n[0].isdigit()}
+    rest = set(q2.tokens) - {q2.count_noun} - QUIET - HEDGES - FILLERS if q2.attribute == "count" else set()
+    ok = lambda c: retrieve.supports(c, q2) and (not rest or rest & set(c.tf or {}))
+    carries = not back or (bool(words) and any(ok(c) and words <= set(tokenize(_page_texts(index).get(c.key, "")))
+                                                 for c in ev2.chunks))
+    if (q2.attribute == q.attribute and (q.attribute != "count" or q2.count_noun == q.count_noun) and carries
+            and ((ev2.supported and any(ok(c) for c in ev2.chunks)) or (synth.enabled and carried_in_context(ev2, q2)))):
+        return q2, ev2
+    return q, ev
+
+
+def _with_count_chunks(index: Index, q, ev: Evidence, tokens: list) -> list:
+    """With a key, a count question that has a lead-in also shows the model the paragraphs that state a count of the thing
+    asked about (a number in digits or in words), the five that share most with the question first."""
+    pat = retrieve.count_re(q.count_noun, spelled=True)
+    have = ev.context or ev.chunks
+    seen = {c.id for c in have}
+    wanted = set(tokens)
+    found = []
+    for pos, _ in index.postings.get(q.count_noun, []):
+        c = index.chunks[pos]
+        if c.id in seen or c.kind == "calculator" or (c.expired_on and c.expired_on < index.view.taken_on):
+            continue
+        if pat.search(c.text.lower()):
+            found.append((-len(wanted & set(c.tf)), c.id, c))
+    out, starts = [], set()
+    for _, _, c in sorted(found, key=lambda x: x[:2]):
+        if c.text[:80] not in starts:                  # the same paragraph on several pages once
+            starts.add(c.text[:80])
+            out.append(c)
+        if len(out) == 5:
+            break
+    return have + out
+
+
 def _model_year_rows(index: Index, q) -> list:
     """A year written beside a make or model ("a 2022 <make> <model>") can be the model year of any line that prices by
     model year. Every such row of a live product page that the year and the asked term fit, the most authoritative of
@@ -1361,19 +1443,49 @@ LIST_PAGES, LIST_BUDGET = 2, 8000
 
 def _with_listed_pages(index: Index, q, ev: Evidence) -> list:
     """A list question ("what protection products can I add?") is answered from every line the best pages give, not
-    the few paragraphs that ranked highest: the two pages whose paragraphs match the question most (never a blog post
-    or a calculator) are read to a budget, after the evidence already chosen."""
+    the few paragraphs that ranked highest: the two pages whose paragraphs match the question most (a business page
+    first when the question says business; never a blog post or a calculator) are read to a budget, after the evidence
+    already chosen; then the titles of the pages under the best page's section ("business/loans/…": the kinds of
+    financing), the rest of the table the best row sits in when a rate is asked at every term, and every rate row of the
+    kind of product asked about."""
     view = index.view
+    business = re.search(r"\bbusiness(?:es)?\b", q.raw, re.I) is not None
     mass: dict = {}
     for score, c in index.search(q.tokens, top=400):
         vp = view.pages[c.key]
         if vp.page.kind == "product" and vp.status == "fresh":
-            mass[c.key] = mass.get(c.key, 0.0) + score
+            mass[c.key] = mass.get(c.key, 0.0) + score * (3 if business and "business" in c.key else 1)
     keys = sorted(mass, key=lambda k: -mass[k])[:LIST_PAGES]
     more = _pages_evidence(index, q, keys, LIST_BUDGET) if keys else None
     have = ev.context or ev.chunks
     seen = {c.id for c in have}
-    return have + [c for c in (more.chunks if more else []) if c.id not in seen]
+    out = have + [c for c in (more.chunks if more else []) if c.id not in seen]
+    if keys:
+        titles = [view.pages[k].page.title.split("|")[0].strip() for k in sorted(view.pages)
+                  if k.startswith(keys[0] + "/") and view.pages[k].page.kind == "product" and view.pages[k].status == "fresh"
+                  and view.pages[k].page.title][:14]
+        if titles:
+            text = "Pages under this one: " + "; ".join(dict.fromkeys(titles))
+            out.append(Chunk(-1, keys[0], "product", text, text))
+    top = next((c for c in ev.chunks if c.is_row and retrieve.supports(c, q)), None)
+    if top is not None and retrieve.LIST_EACH.search(q.raw):
+        # "what APR at each term?": every row of the table the best row sits in that the question's other words fit
+        ids = {c.id for c in out}
+        out += [c for c in view.pages[top.key].page.chunks if c.is_row and c.table_span == top.table_span and c.id not in ids
+                and qualify(c, q)[0] != "mismatch"][:24]
+    if q.attribute == "rate" and q.category:
+        ids = {c.id for c in out}
+        kind = {_stem(w.lower()) for w in q.category if w not in GENERIC_HEADS}
+        rows, keyed = [], set()
+        for c in index.chunks:
+            if (c.is_row and c.id not in ids and retrieve._pct_values(c) and kind and kind <= set(c.tf)
+                    and view.pages[c.key].page.kind == "product" and view.pages[c.key].status == "fresh"
+                    and not (c.expired_on and c.expired_on < view.taken_on) and qualify(c, q)[0] != "mismatch"):
+                if (rk := retrieve._row_key(c)) not in keyed:
+                    keyed.add(rk)
+                    rows.append(c)
+        out += rows[:24]
+    return out
 
 
 def _page_texts(index: Index) -> dict:

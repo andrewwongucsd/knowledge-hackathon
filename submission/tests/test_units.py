@@ -2307,28 +2307,29 @@ class Rev48(unittest.TestCase):
               "## Trail Loans (Snowmobile and Jet Ski)\n\n| Model Year | Term | APR |\n|---|---|---|\n"
               "| 2022-21 | 60 Months | 8.50% |\n| 2020-19 | 60 Months | 8.90% |\n")
 
-    def test_a_year_beside_a_capitalised_make_is_a_model_year_only_in_an_unnamed_loan_question(self):
+    def test_a_year_beside_a_word_no_list_knows_is_a_guess_only_in_an_unnamed_loan_question(self):
         guess = lambda q: parse_query(q).year_guess
-        for q in ("What's the APR on a 60-month loan for a 2021 Honda Accord?", "Looking at a 2023 Tahoe, 60 month term. What APR would I get?"):
+        for q in ("What's the APR on a 60-month loan for a 2021 Zephyrix?", "Looking at a 2023 Kestrel, 60 month term. What APR would I get?"):
             self.assertTrue(guess(q), q)
-        self.assertEqual(parse_query("APR for a 2021 Honda Accord, 60 months?").years, {2021})
-        self.assertEqual(parse_query("APR for a 2021 Honda Accord, 60 months?").descriptors, set())
         for q in ("What's the APR on a 36-month personal loan for a 2026 wedding?", "What's the APR on a 2000 dollar personal loan?",
                   "What's the rate on a 2025 home loan?", "36-month boat loan for a 2024 Sea Ray, what APR?",
                   "What's the APR on a 60-month auto loan for a 2025 Honda Civic?", "APR for a 2021 honda accord, 60 months?",
-                  "What's the APR on a 2025 Auto Loan?", "What's the rate on the 2026 Summer Special?"):
+                  "What's the APR on a 2025 Auto Loan?", "What's the rate on the 2026 Summer Special?",
+                  "What's the APR on a 60-month loan for a 2021 Honda Accord?", "Looking at a 2023 Tahoe, 60 month term. What APR would I get?"):
             self.assertFalse(guess(q), q)
-        # no key: a year that fits two product lines can't be placed without the vehicle; with a key the model sees both rows
+        # no key: a word the vehicle list doesn't know can't be placed; with a key the model sees both rows
         reply = {"note": "", "answer": "5.10%.", "answerable": True, "evidence_ids": [1]}
         ks, calls = self._site([("loans", self.TABLES)], [reply])
-        a = ks.answer("What's the APR on a 60-month loan for a 2021 Honda Accord?")
+        a = ks.answer("What's the APR on a 60-month loan for a 2021 Zephyrix?")
         self.assertEqual(len(calls), 1)
         content = calls[0]["messages"][0]["content"]
         self.assertTrue("5.10%" in content and "8.50%" in content)
+        self.assertIn("vehicle's make or model", content)
         self.assertIn("5.10%", a.text)
         off, _ = self._site([("loans", self.TABLES)])
-        self.assertFalse(off.answer("What's the APR on a 60-month loan for a 2021 Honda Accord?").confident)
-        self.assertIn("5.40%", off.answer("What's the APR on a 60-month loan for a 2025 Honda Accord?").text)    # one row fits: it is the answer
+        self.assertFalse(off.answer("What's the APR on a 60-month loan for a 2021 Zephyrix?").confident)
+        self.assertFalse(off.answer("What's the APR on a 60-month loan for a 2025 Zephyrix?").confident)      # even where one row fits
+        self.assertIn("5.40%", off.answer("What's the APR on a 60-month loan for a 2025 Honda Accord?").text)    # a car: the auto table's row
         self.assertFalse(off.answer("What's the APR on a 60-month loan for a 2010 Honda Accord?").confident)    # none fits
         self.assertIn("8.90%", off.answer("how much interest on a loan for a 2019 jet ski, 60 months").text)    # a vehicle word pins its table
 
@@ -2407,6 +2408,262 @@ class Contract(unittest.TestCase):
         self.assertIsInstance(a, Answer)                    # the harness's own class (repeat check)
         self.assertFalse(a.confident)
         self.assertEqual(build().conflicts(), [])
+
+
+class Rev49(unittest.TestCase):
+    """The vehicle list (a year beside a make or model), list evidence, long lead-ins before a count or a fee, numbers a page
+    spells, and a comparison of two months (synthetic data only)."""
+
+    _site = Rev47._site
+    VEHICLES = ("# Canoeco Loans\n\n"
+                "## Auto Loans (Car, Truck and Van)\n\n| Model Year | Term | APR |\n|---|---|---|\n| 2020-23 | 60 Months | 5.10% |\n| 2024-27 | 60 Months | 5.40% |\n\n"
+                "## Motorcycle Loans\n\n| Model Year | Term | APR |\n|---|---|---|\n| 2020-23 | 60 Months | 6.20% |\n| 2024-27 | 60 Months | 6.50% |\n\n"
+                "## ATV and Jet Ski Loans\n\n| Model Year | Term | APR |\n|---|---|---|\n| 2022-21 | 60 Months | 8.50% |\n| 2020-19 | 60 Months | 8.90% |\n\n"
+                "## Boat Loans\n\n| Amount | Term | APR |\n|---|---|---|\n| $10,000 - $29,999 | 120 Months | 9.30% |\n| $30,000+ | 120 Months | 9.60% |\n")
+
+    # --- the vehicle list -------------------------------------------------------------------------------------------------
+    def test_a_known_make_or_model_is_read_as_its_kind_of_vehicle_in_any_case(self):
+        for q, kind, year in (("What's the APR on a 60-month loan for a 2021 Honda Accord?", {"car", "vehicle"}, 2021),
+                              ("APR for a 2021 honda accord, 60 months?", {"car", "vehicle"}, 2021),
+                              ("APR for a 2019 harley, 60 months?", {"motorcycle"}, 2019),
+                              ("What APR on a 2024 Polaris RZR, 60 months?", {"atv"}, 2024),
+                              ("What APR on a 2023 Sea-Doo, 60 months?", {"atv"}, 2023),
+                              ("What's the APR on a 2022 Ford F-150 loan, 60 months?", {"car", "vehicle"}, 2022),
+                              ("What's the APR for a 2022 sedan loan, 60 months?", {"car", "vehicle"}, 2022)):
+            p = parse_query(q)
+            self.assertEqual((p.descriptors, p.years, p.year_guess), (kind, {year}, False), q)
+
+    def test_a_boat_or_rv_is_priced_by_amount_so_the_year_beside_it_is_no_model_year(self):
+        p = parse_query("What's the APR on a 120-month loan for a 2020 Bayliner, $35,000?")
+        self.assertEqual((p.descriptors, p.years, p.year_guess), ({"boat"}, set(), False))
+        self.assertNotIn("2020", p.tokens)
+
+    def test_the_make_phrase_ends_at_a_product_or_vehicle_class_word(self):
+        guess = lambda q: parse_query(q).year_guess
+        self.assertEqual(parse_query("What's the APR on a 60-month auto loan for a 2022 Honda Civic?").years, {2022})   # "auto" stays a product word
+        self.assertEqual(parse_query("What's the APR on a 2022 Subaru Outback loan, 60 months?").years, {2022})
+        for q in ("What's the APR on a 2025 Auto Loan, 60 months?", "What's the rate on a 2024 boat loan, 120 months, $40,000?"):
+            self.assertEqual((guess(q), parse_query(q).years), (False, set()), q)
+        for q in ("What APR do you charge on a 60 month 2022 truck loan?", "What's the APR on a 2025 pickup, 60 months?"):
+            self.assertFalse(guess(q), q)                                   # a vehicle word, not a make
+
+    def test_a_product_word_other_than_the_kind_names_the_line_and_the_year_is_left_alone(self):
+        p = parse_query("I want a personal loan to buy a 2021 Honda Accord, 60 months. What's the APR?")
+        self.assertEqual((p.years, p.year_guess), (set(), False))
+
+    def test_two_years_or_a_refinance_leave_the_year_to_the_model_even_beside_a_known_make(self):
+        for q, years in (("What's the APR on a 60-month loan for a 2022 Honda Accord and a 2025 Honda Accord?", {2022, 2025}),
+                         ("What's the 60-month APR to refinance my 2024 Toyota Camry?", {2024}),
+                         ("I want to refi my 2021 Ford Mustang over 60 months. What APR?", {2021}),
+                         ("What is the lowest APR for a 2022 Honda Accord?", {2022})):
+            p = parse_query(q)
+            self.assertEqual((p.years, p.year_guess, p.year_kind), (years, True, False), q)
+        p = parse_query("What's the APR on a 60-month loan, not a refinance, for a 2024 Toyota Camry?")
+        self.assertEqual((p.years, p.year_guess, p.year_kind), ({2024}, False, True))
+
+    def test_a_year_is_read_beside_a_known_make_without_an_article_and_on_either_side(self):
+        for q in ("2022 Honda Accord 60 month auto loan APR", "What's the APR on a used 2022 Accord, 60 months?",
+                  "APR on a Honda Accord 2022, 60 month loan", "Honda Accord (2022), 60 months APR?",
+                  "What's the APR for 2022 Honda Accord, 60 months?"):
+            p = parse_query(q)
+            self.assertEqual((p.years, p.descriptors, p.year_guess), ({2022}, {"car", "vehicle"}, False), q)
+        for q in ("What's the 60-month APR in 2022 for Ford Credit offers?", "What are the 2025 summer Honda dealer promotions, APR?"):
+            self.assertEqual(parse_query(q).descriptors & {"car", "vehicle"}, set(), q)      # a year after a make is read only when a vehicle is named
+
+    def test_a_vehicle_class_word_after_the_make_says_what_the_vehicle_is(self):
+        p = parse_query("What's the APR on a 2022 Forest River Cherokee RV, $30,000, 60 months?")
+        self.assertEqual((p.descriptors, p.years), ({"rv"}, set()))
+        p = parse_query("APR for a 2022 Kestrel boat, $30,000, 120 months?")
+        self.assertEqual((p.descriptors, p.years, p.year_guess), ({"boat"}, set(), False))
+
+    def test_a_product_named_beside_a_year_is_no_make(self):
+        from retrieve import NOT_A_MAKE
+        self.assertTrue({"auto", "home", "equity", "improvement", "debt", "consolidation", "credit", "builder", "construction"} <= NOT_A_MAKE)
+        for q in ("What's the APR on a 2025 Credit Builder Loan, 24 months?", "What's the APR on a 2024 Construction Loan, 12 months?",
+                  "What's the APR on a 2025 Auto Loan, 60 months?"):
+            self.assertEqual((parse_query(q).year_guess, parse_query(q).years), (False, set()), q)
+
+    def test_a_known_makes_year_that_fits_no_row_of_its_kind_declines(self):
+        off, _ = self._site([("loans", self.VEHICLES)])
+        for q in ("What's the APR on a 60-month loan for a 2015 Honda Civic?", "What's the APR on a 60-month loan for a 2028 Ford Mustang?",
+                  "What's the APR on a 24-month loan for a 2021 Harley?", "What's the APR on a 2022 Honda Accord and a 2025 Honda Accord?"):
+            self.assertFalse(off.answer(q).confident, q)
+        self.assertIn("5.10%", off.answer("2021 Honda Accord 60 month auto loan APR").text)
+        self.assertIn("5.40%", off.answer("What's the APR on a 60-month loan for a 2025 Honda Accord?").text)
+
+    def test_a_word_the_list_does_not_know_is_a_guess_and_a_non_vehicle_noun_is_none(self):
+        guess = lambda q: parse_query(q).year_guess
+        for q in ("What's the APR on a 60-month loan for a 2022 Zephyrix?", "APR for a 2023 Kestrel 60 months?",
+                  "What's the 60-month APR on the 2026 January Special?"):
+            self.assertTrue(guess(q), q)
+        self.assertFalse(guess("APR on a 2022 zephyrix?"))                  # lower case, no loan word, no term: nothing to go on
+        for q in ("What's the APR on a 36-month personal loan for a 2026 wedding?", "What's the rate on a 2025 home loan?",
+                  "What's the APR on a 2025 Auto Loan?", "What's the rate on the 2026 Summer Special?",
+                  "What's the APR for a 2025 model-year vehicle, 60 months?", "What's the rate for a 60-month loan in May 2026?",
+                  "What's the APR on a 2026 60-month loan?", "What's the APR for the 2025 fiscal year, 60 months?",
+                  "What's the 60-month APR on the 2026 january special?"):
+            self.assertFalse(guess(q), q)
+
+    def test_with_a_key_the_model_decides_what_the_word_is_and_with_none_the_question_declines(self):
+        reply = {"note": "", "answer": "5.10%.", "answerable": True, "evidence_ids": [1]}
+        ks, calls = self._site([("loans", self.VEHICLES)], [reply])
+        a = ks.answer("What's the APR on a 60-month loan for a 2021 Zephyrix?")
+        content = calls[0]["messages"][0]["content"]
+        self.assertTrue("5.10%" in content and "8.50%" in content and "6.20%" in content)
+        self.assertIn("vehicle's make or model", content)
+        self.assertIn("5.10%", a.text)
+        off, _ = self._site([("loans", self.VEHICLES)])
+        self.assertFalse(off.answer("What's the APR on a 60-month loan for a 2021 Zephyrix?").confident)
+        for q, rate in (("What's the APR on a 60-month loan for a 2021 Honda Accord?", "5.10%"),
+                        ("APR for a 2025 harley, 60 months?", "6.50%"), ("APR for a 2021 Polaris RZR, 60 months?", "8.50%"),
+                        ("What's the APR on a 60-month auto loan for a 2025 Honda Civic?", "5.40%"),
+                        ("What's the APR on a 120-month loan for a 2020 Bayliner boat, $35,000?", "9.60%")):
+            self.assertIn(rate, off.answer(q).text, q)                      # a known word needs no key
+
+    def test_the_vehicle_list_leaves_out_makes_sold_as_several_kinds_and_plain_english_words(self):
+        from retrieve import VEHICLE_KIND
+        for w in ("honda", "yamaha", "suzuki", "kawasaki", "bmw", "explorer", "rogue", "sierra", "odyssey", "bronco", "malibu"):
+            self.assertNotIn(w, VEHICLE_KIND)
+        self.assertEqual({VEHICLE_KIND[w] for w in ("harley", "accord", "polaris", "bayliner", "winnebago")},
+                         {"motorcycle", "car", "atv", "boat", "rv"})
+
+    # --- lists ------------------------------------------------------------------------------------------------------------
+    def test_a_rate_asked_at_every_term_or_tier_and_what_a_business_can_open_are_lists(self):
+        for q in ("What APR do you charge at each term on a boat loan?", "What APR at each term for a $30,000 boat loan?",
+                  "What are the rates for each tier of savings?", "What accounts can a business open that pay the highest rate?"):
+            self.assertTrue(parse_query(q).list_intent, q)
+        for q in ("What rate can I get on a personal loan?", "What time can I get to the lobby?", "What information can I get about my loan?",
+                  "What is the APR on a 60-month auto loan for a 2025 model-year vehicle?",
+                  "What is the rate on the 12 month certificate at each branch?"):
+            self.assertFalse(parse_query(q).list_intent, q)
+
+    LISTING = {"note": "", "answer": "Boat Loans.", "answerable": True, "evidence_ids": [1]}
+
+    def test_a_list_reads_the_business_page_first_the_titles_beneath_it_and_every_row_of_the_kind(self):
+        biz = "# Business loans\n\nBusiness loans help firms grow.\n"
+        pages = [("business/loans", biz), ("business/loans/equipment", "# Equipment Financing\n\nFinance machines.\n"),
+                 ("business/loans/lines-of-credit", "# Business Lines of Credit\n\nBorrow as needed.\n"),
+                 ("personal/loans", "# Personal loans\n\nLoans for people: loans, loans, loans for loan seekers.\n"),
+                 ("rates", self.VEHICLES)]
+        ks, calls = self._site(pages, [self.LISTING])
+        ks.answer("What kinds of loans can a business get?")
+        content = calls[0]["messages"][0]["content"]
+        self.assertIn("Pages under this one:", content)
+        self.assertIn("Pages under this one: business/loans/equipment; business/loans/lines-of-credit", content)   # the page titles here are paths
+        ks, calls = self._site(pages, [self.LISTING])
+        ks.answer("What APR do you charge at each term on a boat loan?")
+        content = calls[0]["messages"][0]["content"]
+        self.assertTrue("9.30%" in content and "9.60%" in content)             # both rows of the table, not only the best one
+        import solution
+        self.assertLessEqual(len(content), 6000 + solution.LIST_BUDGET + 4000)
+
+    # --- long lead-ins ------------------------------------------------------------------------------------------------------
+    def test_there_stays_unresolved_when_a_lead_in_names_a_place(self):
+        about = "# About Canoeco\n\nCanoeco runs 14 branch offices across the valley and has 320 employees.\n"
+        maple = "# Maple Grove lab branch\n\nAt the Maple Grove lab branch, 19 full-time employees work with members.\n"
+        ks, _ = self._site([("about", about), ("maple-grove", maple)])
+        lead = "My cousin just got a job at the Maple Grove lab branch and she's really excited about it. "
+        for q in ("How many employees work there full-time?", "How many employees are there?"):
+            a = ks.answer(lead + q)
+            self.assertNotIn("320", a.text)                                   # never the company-wide count for one branch
+
+    def test_a_fee_lead_in_is_read_only_to_say_what_that_size_is_the_size_of(self):
+        import solution
+        self.assertEqual(solution._resolve_size("What does that size cost?", "Her friend said a 5 by 10 safe deposit box is right."),
+                         "What does a 5 by 10 safe deposit box cost?")
+        for lead in ("Her friend said a 5 by 10 or a 3 by 5 box is right.", "Her friend said a box is right.",
+                     "My neighbor rents a 10 by 10 box and says it is too big.", "I have a 3 by 5 box but want the next size up."):
+            self.assertEqual(solution._resolve_size("What does that size cost?", lead), "What does that size cost?")
+        self.assertEqual(solution._resolve_size("What does a box cost?", "a 5 by 10 box"), "What does a box cost?")
+        # only the size and the box words are carried over, never what else follows the size; no box named: no change
+        self.assertEqual(solution._resolve_size("What does that size cost?", "I asked about a safe deposit box. The clerk said a 5 by 10 plus a key is fine."),
+                         "What does a 5 by 10 box cost?")
+        for lead in ("I think a 5 by 10 would be plenty.", "A 3x5 would do for the family."):
+            self.assertEqual(solution._resolve_size("What does that size cost?", lead), "What does that size cost?")
+        boxes = ("# Safe deposit boxes\n\nSafe deposit boxes protect valuables.\n\n| Box size | Annual rent |\n|---|---|\n"
+                 "| 3 by 5 | $20.00 |\n| 5 by 10 | $60.00 |\n| 10 by 10 | $95.00 |\n")
+        ks, _ = self._site([("boxes", boxes)])
+        lead = ("My grandmother is moving into assisted living next month and wants somewhere safe for her jewelry and some old papers. "
+                "Her friend said a 5 by 10 safe deposit box is about right. ")
+        self.assertIn("$60.00", ks.answer(lead + "What does that size cost at Canoeco?").text)
+        self.assertFalse(ks.answer("My neighbor rents a 10 by 10 safe deposit box and says it is too big for the papers in it. "
+                                   "What does that size cost?").confident)
+        self.assertFalse(ks.answer("We just bought a house and want somewhere safe for our papers and jewelry. How much is that?").confident)
+        self.assertFalse(ks.answer(lead.replace("a 5 by 10 safe", "a 5 by 10 or a 3 by 5 safe") + "What does that size cost?").confident)
+
+    def test_what_a_clause_refers_to_is_searched_for_never_required(self):
+        import solution
+        from retrieve import tokenize
+        found = solution._antecedent("How many people received that grant in 2025?",
+                                     "My sister is shopping for a house. I saw the Hardship Relief grant helps first-time buyers.")
+        self.assertIn(tokenize("hardship")[0], found)
+        self.assertNotIn(tokenize("sister")[0], found)
+        self.assertEqual(solution._antecedent("How many people work there?", "My cousin has a new job."), [])
+
+    # --- spelled numbers --------------------------------------------------------------------------------------------------
+    def test_numbers_a_page_spells_from_eleven_up(self):
+        from retrieve import count_re, spelled_numbers, _count_figure
+        self.assertEqual(spelled_numbers("Thirty-two groups, twenty‑one, twelve, twenty one, ten and no one"),
+                         {"Thirty-two": 32, "twenty‑one": 21, "twelve": 12, "twenty one": 21})
+        self.assertIsNone(count_re("organizations").search("thirty-two organizations"))                     # the default reads digits only
+        self.assertTrue(count_re("organizations", spelled=True).search("thirty-two organizations"))
+        self.assertEqual((_count_figure("thirty-two organizations"), _count_figure("12,000 members")), ("32", "12000"))
+
+    def test_a_count_a_page_spells_is_answered_in_digits_and_the_guard_allows_the_figure(self):
+        from synth import spelled_as_digits
+        self.assertEqual(spelled_as_digits("Thirty-two organizations got it, not twenty."), "32 organizations got it, not 20.")
+        self.assertEqual(spelled_as_digits("Thirty-two organizations got it, not twenty.", {"Thirty-two": 32}),
+                         "32 organizations got it, not twenty.")
+        news = ("# Community Grants\n\nThe Community Grants round announced in August 2031 funded Thirty-two organizations across the valley.\n")
+        reply = {"note": "", "answer": "Thirty-two organizations were funded.", "answerable": True, "evidence_ids": [1]}
+        ks, calls = self._site([("about", Rev47.ABOUT), ("news", news)], [reply])
+        a = ks.answer("I'm writing a report on local giving. The most recent round was announced in August 2031. "
+                      "How many organizations did it fund?")
+        self.assertEqual(len(calls), 1)
+        self.assertIn("32", a.text)
+        self.assertNotIn("Thirty-two", a.text)
+        off, _ = self._site([("about", Rev47.ABOUT), ("news", news)])
+        self.assertNotIn("Thirty-two", off.answer("How many organizations did the Community Grants round fund?").text)   # no key: digits only, as before
+        q = parse_query("How many organizations did the Community Grants round fund?")
+        self.assertFalse(q.spelled_counts)
+
+    def test_the_paragraphs_that_state_a_count_reach_the_model(self):
+        import solution
+        from retrieve import select
+        rounds = [(f"grants/round-{n}", f"# Round {n}\n\nRound {n} of the Community Grants funded {10 + n} organizations in the valley.\n")
+                  for n in range(1, 9)]
+        ks, _ = self._site(rounds, [{"note": "", "answer": "x", "answerable": False}])
+        index = ks._indexes[-1]
+        q = parse_query("I'm writing a report. How many organizations did the Community Grants fund?")
+        ev = select(index, q)
+        more = solution._with_count_chunks(index, q, ev, list(q.tokens))
+        have = ev.context or ev.chunks
+        self.assertEqual(len({c.id for c in more}), len(more))                                           # each paragraph once
+        self.assertEqual(more[:len(have)], have)                                                          # nothing already chosen is lost
+        added = more[len(have):]
+        self.assertTrue(0 < len(added) <= 5)                                                              # up to five more
+        self.assertTrue(all("organizations" in c.text for c in added))                                    # each one states a count
+
+    def test_the_most_recent_round_names_a_thing_and_the_latest_update_names_the_moment(self):
+        from solution import NOW_REF
+        for text in ("the most recent round", "the latest cohort", "the newest winners announced", "the most recent grant"):
+            self.assertIsNone(NOW_REF.search(text), text)
+        for text in ("what is it now", "the latest update", "the latest rate", "most recently", "currently"):
+            self.assertTrue(NOW_REF.search(text), text)
+
+    # --- two months ---------------------------------------------------------------------------------------------------------
+    def test_a_comparison_names_two_moments_with_in_and_or_versus(self):
+        from types import SimpleNamespace as NS
+        from solution import change_span
+        st = NS(views=[NS(taken_on=date(2030, 1, 10)), NS(taken_on=date(2030, 3, 1)), NS(taken_on=date(2030, 6, 15))])
+        want = (date(2030, 2, 28), date(2030, 4, 30))
+        for q in ("Compare the kayak APY in February and in April 2030.", "Was the kayak APY the same in February and in April?",
+                  "Did the kayak APY change between February and April 2030?"):
+            self.assertEqual(change_span(q, st), want, q)
+        self.assertEqual(change_span("How does the kayak APY in January 2030 compare to June 2030?", st),
+                         (date(2030, 1, 31), date(2030, 6, 30)))
+        self.assertIsNone(change_span("What is the kayak APY in February and April?", st))                # no comparison asked
+        self.assertIsNone(change_span("Compare the 6-month and 12-month kayak APY in February and in April 2030.", st))   # terms, not moments
 
 
 class Selftest(unittest.TestCase):

@@ -18,9 +18,9 @@ from ingest import Chunk, View, url_key
 from collections import Counter
 from types import SimpleNamespace
 
-from retrieve import (ASKS_THRESHOLD, KIND_NAME, SOFT_QUALIFIERS, SYNONYMS, WIRE, WIRE_FEE_LINE, Evidence, Query, _asked,
+from retrieve import (ASKS_THRESHOLD, KIND_NAME, SOFT_QUALIFIERS, SPELLED, SYNONYMS, WIRE, WIRE_FEE_LINE, Evidence, Query, _asked,
                       asked_kinds, chunk_cover, count_sentence, fee_cover, fee_items, kinds_in, names_line, on_other_line, other_kind, other_lines,
-                      place_phrases, product_name, qualify, supports, terms_in, tier_width, tokenize, wire_direction,
+                      place_phrases, product_name, qualify, spelled_numbers, supports, terms_in, tier_width, tokenize, wire_direction,
                       STATUS_DATE, STATUS_EV)
 
 REFUSAL = "That isn't listed on our website, so I can't confirm it. Please contact us and we can help."
@@ -582,7 +582,8 @@ class Synthesizer:
             except Exception:           # no SDK (e.g. Python 3.9): _llm keeps its lazy path and falls back
                 self._client = None
 
-    def _llm(self, question: str, ev: Evidence, view: View, asked: date | None = None, listing: bool = False) -> dict | None:
+    def _llm(self, question: str, ev: Evidence, view: View, asked: date | None = None, listing: bool = False,
+             guess: bool = False) -> dict | None:
         excerpts = "\n\n".join(f"[{i}] ({describe(c, view)})\n{c.text}" for i, c in enumerate(_llm_chunks(ev), 1))
         # A dated question is answered from the site as it stood that day, i.e. the newest crawl
         # on or before it; showing the crawl's own (earlier) day reads as "can't confirm".
@@ -593,6 +594,9 @@ class Synthesizer:
                     f"before it, or none).")
         else:
             head = f"Website snapshot date: {(asked if asked and asked > view.taken_on else view.taken_on).isoformat()}"
+        if guess:                              # a year beside a word that may be a vehicle's make or model
+            head += ("\nThe member gives a year beside a name that may be a vehicle's make or model. If it is a vehicle, answer with "
+                     "the row of the product line that vehicle is financed under; if it is not a vehicle, set answerable=false.")
         if listing:                            # asked what is offered: every line, not the member's own
             head += ("\nThe member asks what is offered: list every product line the excerpts show for it, personal and "
                      "business alike, each with its own rate.")
@@ -676,7 +680,7 @@ class Synthesizer:
         self._cooldown = max(0, self._cooldown - 1)
         if self.enabled and not cooling and (not ev.supported or not clear_cut(question, q, ev)):
             ev = line_table_first(q, own_table_first(question, q, ev, view, lookup), view)
-            out = self._llm(question, ev, view, asked, q.list_intent)
+            out = self._llm(question, ev, view, asked, q.list_intent, q.year_guess)
             if out is not None:
                 if not out.get("answerable", False):
                     again = self._second_look(question, q, view, asked, second_look)
@@ -702,7 +706,11 @@ class Synthesizer:
         """The model's answer if it passes the guards: (text, cited chunks, note), else None."""
         shown = _llm_chunks(ev)                # the exact excerpts the model saw, same numbering
         text = _digits_as_written(_drop_dead_links(_drop_banned(str(out.get("answer", ""))), view), shown)
-        allowed = numbers(question) | numbers(" ".join(f"{c.text} {describe(c, view)}" for c in shown))
+        said = spelled_numbers(" ".join(c.text for c in shown))          # numbers the excerpts write in words
+        if q.attribute == "count":
+            text = spelled_as_digits(text, said)                       # "Thirty-two" on the page, asked how many: the figure
+        allowed = (numbers(question) | numbers(" ".join(f"{c.text} {describe(c, view)}" for c in shown))
+                   | {float(v) for v in said.values()})
         if asked:                              # the day it was told it may write back, in any form
             allowed |= numbers(f"{asked.isoformat()} {asked.day} {asked.year} {asked.month}")
         if not text or not numbers(text) <= allowed:
@@ -721,7 +729,7 @@ class Synthesizer:
         ev = second_look(question)
         if ev is None or not ev.chunks:
             return None
-        out = self._llm(question, ev, view, asked, q.list_intent)
+        out = self._llm(question, ev, view, asked, q.list_intent, q.year_guess)
         if not out or not out.get("answerable", False):
             return None
         accepted = self._accept(question, q, ev, view, out, asked=asked)
@@ -770,6 +778,13 @@ def _digits_as_written(text: str, shown: list) -> str:
         return text
     return re.sub(r"(?<![\w-])(" + "|".join(map(re.escape, given)) + r")(?![\w-])(?!\s*\()", lambda m: given[m.group(1).lower()],
                   text, flags=re.I)
+
+
+def spelled_as_digits(text: str, said: dict | None = None) -> str:
+    """An answer to a count says the digits for a number spelled in words ("Thirty-two" -> "32"), by default for every
+    number the text spells, or for those of `said` (what the excerpts spell)."""
+    by_word = {k.lower(): v for k, v in (spelled_numbers(text) if said is None else said).items()}
+    return SPELLED.sub(lambda m: str(by_word.get(m.group(0).lower(), m.group(0))), text)
 
 
 def _llm_chunks(ev: Evidence) -> list[Chunk]:

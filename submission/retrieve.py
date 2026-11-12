@@ -17,7 +17,7 @@ from collections import Counter
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 
-from ingest import KIND_RANK, MONTH_RE, STATUS_RANK, Chunk, View
+from ingest import KIND_RANK, MONTH_RE, MONTHS, STATUS_RANK, Chunk, View
 from places import CITY_COMMA, CURRENCY, FOREIGN_SET, GIVEN_NAMES, NATIONAL_BANK, PLACE_RE, PROVINCE_SET
 
 NUM_WORDS = {
@@ -100,6 +100,11 @@ LIST_ASK = r"^\s*(?:please\s+)?(?:list|show me all)\b"     # "list your card rat
 LIST_WIDER = re.compile(r"\b(?:what|which) (?:\w+ ){0,4}(?:are|do) (?:you|y['’]all) (?:running|offering|selling|having|got)\b|"
                         r"\bevery (?:\w+ ){0,3}(?:term|type|kind|product|option)s?\b|"
                         r"\b(?:what|which) are (?:all|every) (?:of )?(?:your|the)\b", re.I)
+# "what APR at each term", "the rate for every tier": a rate asked of every row of a table
+LIST_EACH = re.compile(r"\b(?:at|for|in|per|by)\s+(?:each|every|all)\s+(?:\w+\s+){0,2}(?:term|tier|level|length|bracket)s?\b|"
+                       r"\b(?:each|every)\s+(?:term|tier|level|bracket)\b", re.I)
+PLURAL_PRODUCT = re.compile(r"\b(?:accounts|cards|loans|certificates|cds|products|options|types|kinds|services|coverages|"
+                            r"protections|programs)\b", re.I)
 LIST_CAN = re.compile(r"\b(?:what|which) (?!(?:\w+ ){0,4}?(?:rate|apr|apy|limit|amount|information|info|time|bonus|date|fee|credit score)s?\b)"
                       r"(?:\w+ ){1,5}(?:can|could) (?:i|we|a member|a business|one|someone) "
                       r"(?:add|open|get|choose|pick|have|apply for|sign up for|select)\b", re.I)
@@ -368,6 +373,8 @@ class Query:
     descriptors: set = field(default_factory=set)    # words naming the product, e.g. {"tractor"}
     category: set = field(default_factory=set)       # the product-line word itself, e.g. {"savings"}
     year_guess: bool = False                         # the year was read from "a <year> <word>", not from a vehicle word
+    year_kind: bool = False                          # the year was read from a make or model the vehicle list knows
+    spelled_counts: bool = False                     # a count the page spells in words counts (only when a model writes the answer)
     list_intent: bool = False                        # "what cards do you offer": show every product line
     subject: list = field(default_factory=list)      # rare question words a fee/count answer must contain
     native_terms: set = field(default_factory=set)   # terms in the question's own unit, {(5, 'year')}
@@ -473,8 +480,10 @@ def parse_query(question: str) -> Query:
     q.list_intent = bool(LIST_Q.search(question)) or (OPTIONS_Q.search(question) is not None
                                                       and not (q.terms or q.years)) \
         or ((LIST_WIDER.search(question) is not None and q.attribute in (None, "rate")
-             or LIST_CAN.search(question) is not None and q.attribute is None)
-            and re.search(rf"\b(?:{PRODUCT_HEADS})\b", question, re.I) and not (q.terms or q.years or q.amounts))
+             or LIST_CAN.search(question) is not None
+             and (q.attribute is None or q.attribute == "rate" and PLURAL_PRODUCT.search(question)))
+            and re.search(rf"\b(?:{PRODUCT_HEADS})\b", question, re.I) and not (q.terms or q.years or q.amounts)) \
+        or (LIST_EACH.search(question) is not None and q.attribute == "rate" and not q.terms)
     syn = {**_SYN, **_HOWTO_SYN} if q.attribute in (None, "when") else _SYN
     if q.attribute in ("rate", "fee"):
         syn = {**syn, _stem("hsa"): [_stem("health")]}     # a rate row names the line in full
@@ -561,27 +570,124 @@ def parse_query(question: str) -> Query:
     _read_vehicle_year(q, raw_low)
     _read_refinance(q, raw_low)
     if q.list_intent and q.attribute == "rate" and (q.terms or q.years or q.amounts) and VALUE_ASKED.search(raw_low) \
-            and not re.match(LIST_ASK, q.raw, re.I):
+            and not re.match(LIST_ASK, q.raw, re.I) and not LIST_EACH.search(q.raw):
         q.list_intent = False                           # a value asked of one pinned row is not a list
     _read_contact(q, raw_low)
     return q
 
 
-# "a 2022 Honda Accord": a year, an article before it and a capitalised make or model after it
-YEAR_BEFORE_MAKE = re.compile(r"\b(?i:a|an|my|our|the|his|her|their)\s+((?:19|20)\d\d)\s+((?:[A-Z][\w-]*)(?:\s+[A-Z][\w-]*){0,2})")
+# General knowledge, not the site's: what common makes and models are, so "a 2019 Harley" is a motorcycle and "a 2022 Honda
+# Accord" a car. Makes sold in more than one kind ("yamaha", "kawasaki", "suzuki", "bmw", "honda") and words that are also plain
+# English ("explorer", "rogue", "sierra") are left out: the model beside them says ("accord" is a car, "ninja" a motorcycle),
+# and a word the list doesn't know is left to the model (see _read_vehicle_year).
+_KINDS = {
+    "car": """acura audi bentley buick cadillac chevrolet chevy chrysler dodge ferrari fiat ford genesis gmc hummer hyundai
+        infiniti jaguar jeep kia lamborghini lexus lincoln maserati mazda mercedes mercedes-benz mini mitsubishi nissan
+        pontiac porsche ram rivian saab saturn scion subaru tesla toyota volkswagen vw volvo
+        accord civic camry corolla prius rav4 highlander tacoma tundra 4runner cr-v crv hr-v f-150 f150 f-250 f250
+        mustang silverado tahoe suburban equinox camaro corvette impala traverse wrangler cherokee
+        altima sentra maxima elantra sonata tucson telluride sorento outback forester impreza crosstrek mazda3 cx-5 jetta
+        passat cybertruck charger challenger durango camper-van sedan suv pickup minivan""".split(),
+    "motorcycle": """harley harley-davidson davidson ducati triumph vespa ktm ninja sportster hayabusa goldwing scooter moped
+        chopper""".split(),
+    "atv": """polaris can-am ski-doo skidoo arctic-cat sea-doo seadoo waverunner rzr four-wheeler quad atv utv snowmobile
+        jetski""".split(),
+    "boat": """bayliner boston-whaler sea-ray pontoon yacht sailboat catamaran""".split(),
+    "rv": """winnebago airstream jayco fleetwood coachmen tiffin newmar motorhome camper trailer""".split(),
+}
+VEHICLE_KIND = {w: kind for kind, words in _KINDS.items() for w in words}
+# the descriptor the rate tables use for each kind of vehicle
+KIND_DESCRIPTORS = {"car": {"car", "vehicle"}, "motorcycle": {"motorcycle"}, "atv": {"atv"}, "boat": {"boat"}, "rv": {"rv"}}
+# "a 2022 Honda Accord", "a 2019 harley": an article, a year and up to three words after it, in any case
+YEAR_BEFORE_WORD = re.compile(r"\b(?i:a|an|my|our|the|his|her|their)\s+((?:19|20)\d\d)\s+"
+                              r"([A-Za-z0-9][\w-]*(?:\s+[A-Za-z0-9][\w-]*){0,2})")
 
 
+# words that name the product or the kind of vehicle, never a make ("a 2025 auto loan")
+NOT_A_MAKE = {"auto", "autos", "used", "personal", "student", "business", "secured", "unsecured", "signature", "home", "equity",
+              "heloc", "credit", "construction", "refinance", "refi", "commercial", "improvement", "debt", "consolidation", "builder",
+              "fiscal", "tax", "calendar", "season", "quarter"}
+# a vehicle-class word that ends the phrase says what the vehicle is ("a 2022 Forest River Cherokee RV" is no car)
+CLASS_KIND = {"boat": "boat", "boats": "boat", "watercraft": "boat", "rv": "rv", "rvs": "rv", "camper": "rv", "campers": "rv",
+              "motorhome": "rv", "motorcycle": "motorcycle", "motorcycles": "motorcycle", "atv": "atv", "atvs": "atv", "utv": "atv",
+              "utvs": "atv", "snowmobile": "atv", "snowmobiles": "atv"}
+SUPERLATIVE = re.compile(r"\b(?:lowest|cheapest|best|highest|smallest|largest|minimum|maximum)\b", re.I)
+# a year with no article before it, beside a make the list knows: "2022 Honda Accord 60 month auto loan", "a used 2022 Accord"
+YEAR_THEN_MAKE = re.compile(r"(?:^|\b(?:for|on|with|used|new|certified|pre-owned|preowned|leased|hybrid|electric)\s+)((?:19|20)\d\d)\s+"
+                            r"([A-Za-z0-9][\w-]*(?:\s+[A-Za-z0-9][\w-]*){0,2})", re.I)
+# a make or model, then its year: "Honda Accord 2022, 60 months", "Honda Accord (2022)"
+MAKE_THEN_YEAR = re.compile(r"\b([A-Za-z][\w-]*(?:\s+[A-Za-z0-9][\w-]*){0,2})\s*[(,]?\s*((?:19|20)\d\d)\b\)?")
+
+
+def _vehicle_words(phrase: str, trailing: bool = False) -> tuple:
+    """(the make and model words beside a year, the class word that ended them or None). After a year they end at the
+    first product or function word ("a 2022 Ford F-150 loan"); before one ("a Honda Accord 2022") they are read backwards
+    from it."""
+    words, ender = [], None
+    for w in (reversed if trailing else iter)(re.findall(r"[a-z0-9][\w-]*", phrase.lower())):
+        if (w in STOP or w in GENERIC or w in NOT_A_MAKE or re.fullmatch(rf"(?:{PRODUCT_HEADS})", w)
+                or VEHICLE.fullmatch(w) or RV.fullmatch(w)):
+            ender = CLASS_KIND.get(w)
+            break
+        words.append(w)
+    return (words[::-1] if trailing else words), ender
+
+
+def _kinds_of(words: list, ender: str | None) -> list:
+    """The kinds of vehicle a phrase names: the class word that ended it ("RV"), else the list's kinds of its words."""
+    if ender:
+        return [ender]
+    return [VEHICLE_KIND[w] for w in words if w in VEHICLE_KIND] \
+        or [VEHICLE_KIND[f"{a}-{b}"] for a, b in zip(words, words[1:]) if f"{a}-{b}" in VEHICLE_KIND]   # "sea doo"
+
+
+def _read_make_year(q: Query, low: str) -> None:
+    """A year beside a make or model in a rate question that names no other product line ("a 2022 Honda Accord", "a 2019
+    harley") is a vehicle's model year. A word the list knows is read as its kind of vehicle (boats and RVs are priced by
+    amount, so they keep no year); a word it doesn't know leaves the year guessed (q.year_guess) when the question is about a
+    loan (an APR or a loan word) and the word is capitalised or a term is asked: the model decides what it is and which
+    line it is financed under, and with no key the question declines. Two different years, a refinance (whose rows the site
+    keeps on pages of other products) and a superlative ("the lowest APR") are guessed too: a year the list is sure of, and
+    asked plainly, is not guessed."""
+    if not (q.attribute == "rate" and not q.years and q.category <= {"loan"}):
+        return
+    years = sorted({int(y) for y in re.findall(r"\b(?:19|20)\d\d\b", q.raw)})
+    found = [(m, m.group(2)) for m in (YEAR_BEFORE_WORD.search(q.raw), YEAR_THEN_MAKE.search(q.raw)) if m]
+    found += [(m, m.group(1)) for m in MAKE_THEN_YEAR.finditer(q.raw)]
+    for m, phrase in found:
+        words, ender = _vehicle_words(phrase, trailing=m.re is MAKE_THEN_YEAR)
+        if not words or words[0].startswith("model") or words[0] == "year" or re.fullmatch(r"\d+(?:-?(?:months?|mos?|years?|yrs?))?", words[0]):
+            continue                                        # "a 2025 model-year vehicle", "a 2026 60-month loan": no make
+        kinds = _kinds_of(words, ender)
+        if m.re is MAKE_THEN_YEAR and not kinds:
+            continue                                        # a year after a word is a vehicle's only when the list knows the word
+        year = int(m.group(1) if m.re is not MAKE_THEN_YEAR else m.group(2))
+        loan = q.category == {"loan"} or re.search(r"\bapr\b", low)
+        if not kinds and (not loan or (words[0] in MONTHS and not phrase[:1].isupper()) or not (phrase[:1].isupper() or q.terms)):
+            continue                                        # an unknown word needs a loan word, and a capital or a term
+        made = {x for w in words for x in (w, _stem(w), *w.split("-"), *tokenize(w))}
+        left = set(q.descriptors) - made                    # a product word that stays ("personal") names the line already
+        if kinds and not left <= {"auto"} | KIND_DESCRIPTORS[kinds[-1]]:
+            return
+        if kinds and kinds[-1] in ("boat", "rv"):
+            q.descriptors = set(KIND_DESCRIPTORS[kinds[-1]])
+            q.tokens = [t for t in q.tokens if not (t.isdigit() and len(t) == 4)]
+            return
+        if not kinds and left:
+            return
+        if len(years) > 1:
+            q.years, q.year_guess, q.descriptors = set(years), True, set()
+        elif not kinds or (REFINANCE_WORD.search(low) and not REFINANCE_NEGATED.search(low)) or SUPERLATIVE.search(low):
+            q.years, q.year_guess, q.descriptors = {year}, True, set()
+        else:
+            if not q.category and not DEPOSIT_CUE.search(low):
+                q.category.add("loan")                      # "the rate on a 2026 Honda Accord": a loan on it
+            q.descriptors, q.years, q.year_kind = set(KIND_DESCRIPTORS[kinds[-1]]), {year}, True
+        return
 # A vehicle word names the loan when a model year is asked: "a 72-month loan on a 2016 or older vehicle" is the auto
 # table's question (it has no such row), not a boat or RV loan's.
 def _read_vehicle_year(q: Query, low: str) -> None:
-    if q.attribute == "rate" and not q.years and (q.category == {"loan"} or (not q.category and re.search(r"\bapr\b", low))) \
-            and (m := YEAR_BEFORE_MAKE.search(q.raw)) and not re.search(rf"\b(?:{PRODUCT_HEADS})\b", m.group(2), re.I):
-        # "a 2022 <Make> <Model>" in a loan rate question that names no product line: a model year, whatever the make is
-        # called; the make and model are no product words of the site. A product word that stays ("personal", "boat",
-        # "auto") names the line already: no guess.
-        made = {x for w in re.findall(r"[A-Za-z]+", m.group(2)) for x in (w.lower(), _stem(w.lower()))}
-        if not (set(q.descriptors) - made):
-            q.years, q.year_guess, q.descriptors = {int(m.group(1))}, True, set()
+    _read_make_year(q, low)
     if q.attribute == "rate" and q.years and q.category == {"loan"} and not q.descriptors and (v := VEHICLE.search(low)):
         word = v.group(1).lower().split()[-1]           # "jet ski": the table's own word is "ski"
         word = word[:-1] if word.endswith("s") else word
@@ -838,9 +944,36 @@ def written_amounts(question: str) -> str:
     return BARE_AMT.sub(_bare_amount, RANGE_Q.sub(_range, text))
 
 
-def count_re(noun: str):
-    """'12 offices', '350 members' — a count, never a year like 'In 2025,'."""
-    return re.compile(rf"(?<![\d,.$])(?!(?:19|20)\d\d\b)\d[\d,]*\+?\s+(?:[a-z’'-]+\s+){{0,2}}{noun}")
+# Numbers a page writes in words: "twelve", "Thirty-two", "twenty one" (eleven and up; a small number in words is rarely a count)
+_UNITS = {w: i for i, w in enumerate("zero one two three four five six seven eight nine ten eleven twelve thirteen fourteen "
+                                     "fifteen sixteen seventeen eighteen nineteen".split())}
+_TENS = {w: 10 * i for i, w in enumerate("x x twenty thirty forty fifty sixty seventy eighty ninety".split()) if w != "x"}
+_DASH = r"[-\u2010-\u2015\s]"                      # a hyphen, a non-breaking hyphen or a dash, or a space
+SPELLED_ALT = ("(?:" + "|".join(_TENS) + ")(?:" + _DASH + "(?:" + "|".join(w for w, v in _UNITS.items() if 0 < v < 10) + "))?|"
+               + "|".join(w for w, v in _UNITS.items() if v >= 11))
+SPELLED = re.compile(rf"\b(?:{SPELLED_ALT})\b", re.I)
+
+
+def spelled_numbers(text: str) -> dict:
+    """The numbers a text writes in words, {as written: value}: "Thirty-two" -> 32."""
+    out = {}
+    for m in SPELLED.finditer(text or ""):
+        out[m.group(0)] = sum(_TENS.get(w, _UNITS.get(w, 0)) for w in re.split(_DASH, m.group(0).lower()))
+    return out
+
+
+def _count_figure(matched: str) -> str:
+    """The figure a count match starts with, as digits ("12,000 members" -> "12000", "thirty-two members" -> "32")."""
+    if (m := re.match(r"[\d,]+", matched)):
+        return m.group(0).replace(",", "")
+    return str(next(iter(spelled_numbers(matched).values()), 0))
+
+
+def count_re(noun: str, spelled: bool = False):
+    """'12 offices', '350 members' — a count, never a year like 'In 2025,'. With `spelled`, a number the page writes in
+    words counts too ("thirty-two organizations"); the counts a site states per year are read from digits only."""
+    figure = rf"\d[\d,]*\+?|{SPELLED_ALT}" if spelled else r"\d[\d,]*\+?"
+    return re.compile(rf"(?<![\d,.$])(?!(?:19|20)\d\d\b)(?:{figure})\s+(?:[a-z’'-]+\s+){{0,2}}{noun}")
 
 
 # A count asked of a year ("how many … last year", "… in 2023"): the site states such counts as dated sentences, one per
@@ -1045,7 +1178,7 @@ def supports(c: Chunk, q: Query) -> bool:
         # an intro offer is often worded its own way ("1.99% intro APR", "2.90%1 APR")
         return c.kind != "article" and bool(RATE_EV.search(c.text) or (q.rate_kind and KIND_RATE_EV.search(c.text)))
     if q.attribute == "count":
-        return bool(count_re(q.count_noun).search(c.text.lower()))
+        return bool(count_re(q.count_noun, spelled=q.period is None and q.spelled_counts).search(c.text.lower()))
     if q.attribute == "address":
         return bool(ADDRESS_EV.search(c.text))
     if q.attribute == "when":
@@ -1273,7 +1406,7 @@ def select(index: Index, q: Query, k: int = 8) -> Evidence:
     if q.attribute == "count" and q.count_noun:
         # BM25 ranks long boilerplate ("... N members and M offices") low for a
         # one-word query, so scan every chunk containing the counted noun for an actual count.
-        pat, have = count_re(q.count_noun), {c.id for _, c in hits}
+        pat, have = count_re(q.count_noun, spelled=q.period is None and q.spelled_counts), {c.id for _, c in hits}
         hits += [(_bm25_floor(hits), index.chunks[pos]) for pos, _ in index.postings.get(q.count_noun, [])
                  if index.chunks[pos].id not in have and pat.search(index.chunks[pos].text.lower())]
     if q.attribute == "rate" and q.category:
@@ -1375,7 +1508,7 @@ def select(index: Index, q: Query, k: int = 8) -> Evidence:
             # states a single count, so a multi-figure recap can't evict real data.
             pat = count_re(q.count_noun)
             def counts(c):
-                return {re.match(r"[\d,]+", m.group(0)).group(0).replace(",", "") for m in pat.finditer(c.text.lower())}
+                return {_count_figure(m.group(0)) for m in pat.finditer(c.text.lower())}
             win = counts(sup[0][1])
             if len(win) == 1:
                 stale = [sc for sc in kept if counts(sc[1]) and not counts(sc[1]) & win]
@@ -1746,6 +1879,19 @@ def count_clause(text: str):
             lead = " ".join(parts[:i] + [parts[i][:m.start()]]).strip()
             return (clause, lead) if len(lead.split()) >= 4 else None      # one word before it is a name, not a lead-in
     return None
+
+
+def fee_clause(text: str):
+    """(the last sentence, the sentences before it) for a fee question with a lead-in of four words or more, else None."""
+    parts = [p for p in SENTENCE_END.split(text.strip()) if p]
+    if len(parts) > 1 and re.search(rf"\b{QUESTION_START}", parts[-1], re.I):
+        lead = " ".join(parts[:-1])
+        return (parts[-1], lead) if len(lead.split()) >= 4 else None
+    return None
+
+
+# a size in the lead-in, with the box words that follow it: "a 5 by 10 safe deposit box", "a 3x5 box"
+DIMENSIONS = re.compile(r"\b(\d+\s*(?:by|x)\s*\d+(?:\s*(?:by|x)\s*\d+)?)((?:\s+(?:safe|safety|deposit|box|boxes))*)", re.I)
 
 
 def lead_names(lead: str) -> set:
