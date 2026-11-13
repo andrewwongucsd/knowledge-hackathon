@@ -103,6 +103,10 @@ PLAIN_WORDS = {"rate", "account", "loan", "card", "line", "home", "interest", "f
                "percentage", "the", "and", "of", "for", "your", "our", "my"}
 
 
+# a heading that is a person's name: two or three capitalised words, an initial allowed ("Todd Link", "Mary A. Jones")
+ROLE_WORD = re.compile(r"\b(?:chief|officer|president|director|manager|chair|chairman|vice|vp|ceo|cfo|coo|executive|treasurer|"
+                       r"secretary|supervisor|specialist|analyst|lead|head|advisor|adviser|counsel|trustee|member)\b", re.I)
+NAME_HEADING = re.compile(r"[A-Z][a-z'’-]+(?:\s+[A-Z]\.?)?\s+[A-Z][a-z'’-]+(?:\s+[A-Z][a-z'’-]+)?")
 # words that say what kind of product a heading is about; a heading with none ("Harbor Choice") needs its tab
 KIND_WORD = re.compile(r"\b(?:accounts?|savings|checking|certificates?|cds?|loans?|mortgages?|cards?|visa|money\s+market|"
                        r"iras?|hsa|heloc|lines?|specials?|promos?|rates?|share|deposits?)\b", re.I)
@@ -239,12 +243,14 @@ class Parser:
         lines = html.unescape(html.unescape(md)).splitlines()
         chunks: list[Chunk] = []
         section, caption, tabbed, under = "", "", "", ""      # under: the in-page tab naming a product we are in
+        psec = ""                  # a prose chunk's section: the heading, or a name heading joined to the title heading under it
+        last_heading = None        # (text, level) of a heading with nothing under it yet
         i, short_buf = 0, []
 
         def flush_short():
             if short_buf:
                 text = "\n".join(short_buf)
-                chunks.append(self._chunk(key, title, section, text, expired_on=_offer_end(text)))
+                chunks.append(self._chunk(key, title, psec or section, text, expired_on=_offer_end(text)))
                 short_buf.clear()
 
         while i < len(lines):
@@ -255,6 +261,7 @@ class Parser:
                 while j < len(lines) and lines[j].strip().startswith("|"):
                     j += 1
                 chunks.extend(self._table(key, title, section, caption, lines, i, j))
+                last_heading = None
                 caption, tabbed = "", ""
                 i = j
                 continue
@@ -272,12 +279,19 @@ class Parser:
                 under = ""
                 flush_short()
                 section = clean_inline(block[0].lstrip("#"), self.domains)
+                level = len(block[0]) - len(block[0].lstrip("#"))
+                # "#### Todd Link" then "###### Chief Member Services Officer": the person and the title are one fact
+                psec = (f"{last_heading[0]} · {section}" if last_heading and level > last_heading[1]
+                        and NAME_HEADING.fullmatch(last_heading[0])
+                        and (ROLE_WORD.search(section) or not NAME_HEADING.fullmatch(section)) else "")
+                last_heading = (section, level)
                 if re.search(r"\d", section):           # headings like "...with N% APY" carry facts
                     chunks.append(self._chunk(key, title, section, section))
                 block = block[1:]
                 if not block:
                     continue
             text = clean_inline(" ".join(block), self.domains)
+            last_heading = None
             # an in-page tab ("- [Health Kayak Rates](<this page>#)") names what follows it (see _tab_caption)
             tab = TAB_LINK.fullmatch(block[0]) if len(block) == 1 else None
             above, tabbed = tabbed, (clean_inline(tab.group(1), self.domains) if tab and url_key(tab.group(2)) == key else "")
@@ -298,7 +312,7 @@ class Parser:
                 for b in block:
                     b = clean_inline(b, self.domains)
                     if len(b) > 3:
-                        chunks.append(self._chunk(key, title, section, b, expired_on=_offer_end(b)))
+                        chunks.append(self._chunk(key, title, psec or section, b, expired_on=_offer_end(b)))
                 continue
             if len(text) < 90:                          # hours lists etc.: keep short lines together
                 short_buf.append(text)
@@ -307,7 +321,7 @@ class Parser:
                 continue
             flush_short()
             for piece in _split_long(text):
-                chunks.append(self._chunk(key, title, section, piece, expired_on=_offer_end(piece)))
+                chunks.append(self._chunk(key, title, psec or section, piece, expired_on=_offer_end(piece)))
         flush_short()
         _attach_effective_dates(lines, chunks)
         return ParsedPage(key, url, title, kind, _publish_date(kind, lines), chunks)

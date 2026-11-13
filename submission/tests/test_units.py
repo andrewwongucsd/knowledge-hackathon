@@ -16,7 +16,7 @@ import run_eval  # noqa: E402
 import scoring  # noqa: E402
 from contract import Answer, Conflict  # noqa: E402
 from ingest import Parser, View, strip_footnotes, url_key  # noqa: E402
-from retrieve import _stem, amount_ranges, model_year_ranges, parse_query, tokenize  # noqa: E402
+from retrieve import _stem, amount_ranges, model_year_ranges, parse_query, select, tokenize  # noqa: E402
 from solution import build  # noqa: E402
 from synth import REFUSAL, _drop_banned, _drop_dead_links, _sentences, numbers, render_row  # noqa: E402
 
@@ -2195,9 +2195,9 @@ class Rev47(unittest.TestCase):
         a = ks.answer("When do applications open for the next paddling grant?")
         self.assertEqual(len(calls), 3)
         self.assertIn("January 5, 2031", a.text)
-        # the decision itself: a rate, fee, hours, count or address question that found nothing is not looked at again
+        # the decision itself: a rate, hours or address question that found nothing is not looked at again
         from types import SimpleNamespace as NS
-        for attribute, looked in (("rate", False), ("fee", False), ("hours", False), ("count", False), ("address", False),
+        for attribute, looked in (("rate", False), ("fee", True), ("hours", False), ("count", True), ("address", False),
                                   ("when", True), (None, True)):
             seen = []
             ks._synth._second_look("Q?", NS(attribute=attribute, list_intent=False), None, None, lambda text: seen.append(text))
@@ -2451,15 +2451,14 @@ class Rev49(unittest.TestCase):
         p = parse_query("I want a personal loan to buy a 2021 Honda Accord, 60 months. What's the APR?")
         self.assertEqual((p.years, p.year_guess), (set(), False))
 
-    def test_two_years_or_a_refinance_leave_the_year_to_the_model_even_beside_a_known_make(self):
+    def test_two_years_or_a_superlative_leave_the_year_to_the_model_even_beside_a_known_make(self):
         for q, years in (("What's the APR on a 60-month loan for a 2022 Honda Accord and a 2025 Honda Accord?", {2022, 2025}),
-                         ("What's the 60-month APR to refinance my 2024 Toyota Camry?", {2024}),
-                         ("I want to refi my 2021 Ford Mustang over 60 months. What APR?", {2021}),
                          ("What is the lowest APR for a 2022 Honda Accord?", {2022})):
             p = parse_query(q)
             self.assertEqual((p.years, p.year_guess, p.year_kind), (years, True, False), q)
-        p = parse_query("What's the APR on a 60-month loan, not a refinance, for a 2024 Toyota Camry?")
-        self.assertEqual((p.years, p.year_guess, p.year_kind), ({2024}, False, True))
+        for q in ("What's the 60-month APR to refinance my 2024 Toyota Camry?", "What's the APR on a 60-month loan, not a refinance, for a 2024 Toyota Camry?"):
+            p = parse_query(q)
+            self.assertEqual((p.years, p.year_guess, p.year_kind), ({2024}, False, True), q)       # a refinance reads like a purchase
 
     def test_a_year_is_read_beside_a_known_make_without_an_article_and_on_either_side(self):
         for q in ("2022 Honda Accord 60 month auto loan APR", "What's the APR on a used 2022 Accord, 60 months?",
@@ -2664,6 +2663,284 @@ class Rev49(unittest.TestCase):
                          (date(2030, 1, 31), date(2030, 6, 30)))
         self.assertIsNone(change_span("What is the kayak APY in February and April?", st))                # no comparison asked
         self.assertIsNone(change_span("Compare the 6-month and 12-month kayak APY in February and in April 2030.", st))   # terms, not moments
+
+
+class Rev50(unittest.TestCase):
+    """Refinance reads like a purchase where the site has no refinance rows, people who work are employees, a branch asked of a
+    town no page writes, recovery of a rules-declined question, boilerplate figures, "what changed", staff titles, loan purposes,
+    a program priced as another line plus an amount, pages about a place (synthetic data only)."""
+
+    _site = Rev47._site
+    AUTO = ("# Canoeco Loans\n\n## Auto Loans\n\n| Model Year | Term | APR |\n|---|---|---|\n| 2020-23 | 60 Months | 5.10% |\n"
+            "| 2024-27 | 60 Months | 5.40% |\n| 2024-27 | 72 Months | 5.50% |\n\nAuto Loan Rates: Zephyr Loans: Add 1% to conventional rates.\n")
+    PROMO = ("# Refinance Your Loan and Earn Cash Back\n\nMove a loan here for a limited time.\n\n## Auto Loans\n\n| Model Year | Term | APR |\n"
+             "|---|---|---|\n| 2022-25 | 60 Months | 5.25% |\n| 2022-25 | 72 Months | 5.35% |\n")
+    MORTGAGE = ("# Home Rates\n\n## Home Loans - Purchase\n\n| Loan | Term | Rate |\n|---|---|---|\n| Fixed | 30 Years | 6.50% |\n\n"
+                "## Home Loans - Refinance\n\n| Loan | Term | Rate |\n|---|---|---|\n| Fixed | 30 Years | 6.80% |\n")
+
+    # --- refinance --------------------------------------------------------------------------------------------------------
+    def test_refinancing_a_loan_the_site_has_no_refinance_rows_for_reads_like_a_purchase(self):
+        ks, _ = self._site([("loans", self.AUTO), ("switch", self.PROMO), ("home", self.MORTGAGE)])
+        for q in ("What's the 60-month APR to refinance my 2025 vehicle?", "What's the APR for a 60-month auto loan refinance on a 2025 model-year vehicle?",
+                  "What's the 60-month APR to refinance my 2025 Honda Accord?"):
+            text = ks.answer(q).text
+            self.assertIn("5.40%", text, q)
+            self.assertNotIn("5.25%", text, q)                        # the promo page's old copy of the table
+        q = parse_query("What's the rate for refinancing my auto loan?")
+        select(ks._indexes[-1], q)
+        self.assertTrue(q.refinance_dropped)
+        self.assertFalse({_stem("refinance"), "refi"} & set(q.tokens))                 # the word no row says is not one to find
+        self.assertIn("6.80%", ks.answer("What's the 30-year fixed mortgage refinance rate?").text)    # a refinance table of its own
+        self.assertIn("6.50%", ks.answer("What's the 30-year fixed mortgage purchase rate?").text)
+
+    # --- people who work --------------------------------------------------------------------------------------------------
+    def test_how_many_people_work_at_the_institution_is_the_employee_count_in_every_wording(self):
+        about = "# About\n\nCanoeco has more than 340 employees and 17 branch office locations across the valley.\n"
+        press = "# A program\n\nThe Hearth program has partnered with 44 local employers since 2017.\n"
+        ks, _ = self._site([("about", about), ("hearth", press)])
+        for q in ("How many people work at Canoeco?", "how many ppl work at canoeco in total?", "How many people does Canoeco employ?",
+                  "How many employees does Canoeco have?", "How many employees work at Canoeco?"):
+            self.assertIn("340", ks.answer(q).text, q)
+        self.assertNotIn("340", ks.answer("How many Canoeco employees work remotely?").text)       # something after the verb but the institution
+        self.assertNotIn("44", ks.answer("How many people are currently employed through the Hearth program?").text)    # no institution named
+
+    # --- branches and towns no page writes --------------------------------------------------------------------------------
+    BRANCH = ("# Canoeco opens a branch\n\nLARKSPUR, Ohio–Canoeco opened its new branch in Larkspur this week, with members touring the lobby.\n\n"
+              "The Larkspur branch is located at 410 Quartz Road. Branch hours are:\n\n**Lobby**\n\nMonday-Friday: 9 a.m.-4 p.m.\n\n"
+              "Saturday: 10 a.m.-noon\n\nSunday: Closed\n")
+    CONTACT = "# Contact\n\nCall us at 800-555-0100 or visit a branch.\n"
+
+    def test_a_town_written_next_to_a_facility_is_found_in_any_case_and_only_there(self):
+        from retrieve import facility_places
+        self.assertEqual(facility_places("is there a canoeco branch in davenport? if so what time does it open"), [("davenport", False)])
+        self.assertEqual(facility_places("Is there a Canoeco branch in Davenport?"), [("davenport", True)])
+        self.assertEqual(facility_places("Does Canoeco have an ATM near Davenport?"), [("davenport", True)])
+        self.assertEqual(facility_places("What are the hours of the Davenport branch?"), [("davenport", True)])
+        for q in ("Do all Canoeco branches keep the same lobby hours?", "My boss at Rivertown Pantry asked how many branch offices Canoeco has.",
+                  "Roughly how many branch offices does Canoeco have?", "Is there a branch in my area?", "What are your lobby hours?"):
+            self.assertEqual(facility_places(q), [], q)
+
+    def test_a_branch_asked_of_a_town_no_page_writes_declines_before_any_model_call(self):
+        ks, calls = self._site([("news/larkspur", self.BRANCH), ("contact", self.CONTACT)],
+                               [{"note": "", "answer": "Call 800-555-0100.", "answerable": True, "evidence_ids": [1]}])
+        for q in ("Is there a Canoeco branch in Davenport, and what time does it open?", "is there a canoeco branch in davenport? if so what time does it open on saturday",
+                  "Does Canoeco have an ATM in Davenport, and what is its withdrawal limit?"):
+            a = ks.answer(q)
+            self.assertFalse(a.confident, q)
+            self.assertFalse(numbers(a.text), q)
+        self.assertEqual(len(calls), 0)                                              # never asked the model
+        self.assertIn("9 a.m.", ks.answer("What are the lobby hours at the Larkspur branch?").text)
+
+    def test_an_answer_that_says_the_branch_is_not_listed_and_adds_a_figure_declines_unless_the_town_is_a_branch(self):
+        news = "# News\n\nA member from Minneapolis told us about the new lobby, which opened last year.\n"
+        reply = {"note": "", "answer": "Canoeco does not list a branch in Minneapolis; call 800-555-0100.", "answerable": True, "evidence_ids": [1]}
+        ks, _ = self._site([("news/larkspur", self.BRANCH), ("contact", self.CONTACT), ("news/story", news)], [reply])
+        self.assertFalse(ks.answer("Is there a Canoeco branch in Minneapolis, and what is its address?").confident)
+
+    # --- recovery ---------------------------------------------------------------------------------------------------------
+    def test_a_question_the_rules_decline_before_any_model_call_gets_one_recovery_for_a_fee_but_not_for_a_rate(self):
+        fees = "# Fees\n\nForeign currency exchange fee: $35.00 for a Canadian check.\n"
+        route = {"paths": ["/fees"]}
+        answer = {"note": "", "answer": "Canoeco charges a $35.00 foreign currency exchange fee for a Canadian check.", "answerable": True, "evidence_ids": [1]}
+        ks, calls = self._site([("fees", fees), ("about", Rev47.ABOUT)], [route, answer])
+        a = ks.answer("A friend paid me with a Canadian check last week and I'm not sure what it costs me. What would Canoeco charge?")
+        self.assertIn("$35.00", a.text)
+        self.assertEqual(len(calls), 2)                                              # the page pick and the answer
+        ks, calls = self._site([("fees", fees), ("about", Rev47.ABOUT)], [route, answer])
+        self.assertFalse(ks.answer("What is the 7-year certificate APY?").confident)
+        self.assertEqual(len(calls), 0)                                              # a rate that is not listed is not asked again
+        denied = {"note": "", "answer": "Canoeco does not charge a fee for that.", "answerable": True, "evidence_ids": [1]}
+        ks, _ = self._site([("fees", fees), ("about", Rev47.ABOUT)], [route, denied])
+        self.assertFalse(ks.answer("A friend paid me with a Canadian check last week and I'm not sure what it costs me. What would Canoeco charge?").confident)
+
+    def test_a_recovered_fee_must_come_from_a_line_that_names_what_was_asked_not_a_near_miss(self):
+        fees = ("# Fees\n\n| Service | Fee |\n|---|---|\n| Rush fee for a debit card | $45.00 |\n| Stop payment on a lost check | $30.00 |\n"
+                "| Foreign currency exchange fee for a Canadian check | $35.00 |\n")
+        route = {"paths": ["/fees"]}
+        near = {"note": "", "answer": "Canoeco's rush fee for a debit card is $45.00.", "answerable": True, "evidence_ids": [1]}
+        ks, _ = self._site([("fees", fees), ("about", Rev47.ABOUT)], [route, near])
+        a = ks.answer("my debit card got lost last week, how much do you charge to replace it?")
+        self.assertFalse(a.confident)                                                # the rush line says nothing about a lost card
+        self.assertNotIn("$45", a.text)
+
+    # --- what changed -----------------------------------------------------------------------------------------------------
+    def test_what_changed_between_two_dates_asks_for_the_site_at_both(self):
+        from types import SimpleNamespace as NS
+        from solution import change_span
+        st = NS(views=[NS(taken_on=date(2030, 1, 10)), NS(taken_on=date(2030, 3, 1)), NS(taken_on=date(2030, 6, 15))])
+        want = (date(2030, 2, 28), date(2030, 4, 30))
+        for q in ("What changed in the kayak rate table between February and April 2030?", "What changed about the kayak grant between February and April 2030?",
+                  "What's different in the kayak rates between February and April 2030?", "What are the differences between February and April 2030 for the kayak APY?"):
+            self.assertEqual(change_span(q, st), want, q)
+        self.assertIsNone(change_span("What changed my kayak APY?", st))
+
+    # --- boilerplate figures ----------------------------------------------------------------------------------------------
+    def test_the_assets_and_membership_a_repeated_paragraph_states_differently_are_conflicts_but_other_figures_are_not(self):
+        from contract import Page, Snapshot
+        ks = build()
+        pages = []
+        for n in range(1, 7):                                          # six press releases, the paragraph growing over time
+            body = (f"May 0{n}, 2030\n\n# Release {n}\n\nCanoeco news item number {n} talks about a regatta.\n\n"
+                    f"Founded in 1935, membership has grown to more than {100 + 10 * n},000 with assets exceeding ${2 + n / 10:.1f} billion. "
+                    f"It has more than {300 + 10 * n} employees and {20 + n} branch office locations. Last year members got a $12 million bonus.\n")
+            pages.append(Page(f"https://canoeco.example.org/newsroom/release-{n}", f"Release {n} | Canoeco", body, f"2030-05-0{n}T09:00:00Z"))
+        ks.ingest(Snapshot("s1", "2030-06-15", pages))
+        topics = {c.topic: c for c in ks.conflicts()}
+        assets = next(c for t, c in topics.items() if t.startswith("Boilerplate figure (asset)"))
+        member = next(c for t, c in topics.items() if t.startswith("Boilerplate figure (membership)"))
+        self.assertEqual((assets.resolution, member.resolution), ("$2.6 billion", "160,000"))
+        self.assertFalse([t for t in topics if t.startswith("Boilerplate figure") and "asset" not in t and "membership" not in t])
+
+    # --- staff titles -----------------------------------------------------------------------------------------------------
+    def test_a_name_heading_and_the_title_heading_under_it_are_one_section_for_prose_only(self):
+        from ingest import Parser
+        md = ("# Leadership\n\n#### Pat Quill\n\n###### Chief Boat Officer\n\nPat joined in 2014 and leads the fleet.\n\n"
+              "## Share Rates\n\n### Overview\n\n| Term | APY |\n|---|---|\n| 6 Month | 1.91% |\n")
+        page = Parser().parse("example.org/about", "https://example.org/about", "About", md)
+        prose = next(c for c in page.chunks if "joined" in c.text)
+        self.assertEqual(prose.section, "Pat Quill · Chief Boat Officer")
+        row = next(c for c in page.chunks if c.is_row)
+        self.assertEqual(row.section, "Overview")                                    # a table keeps its own heading
+
+    # --- parse: purposes and terms ----------------------------------------------------------------------------------------
+    def test_a_home_project_names_the_loan_and_how_many_months_beside_a_rate_is_a_term(self):
+        for q in ("need to redo my roof, probably around $35k. whats the apr and how many months can i take?",
+                  "I want to remodel my kitchen, about $20,000. What rate would I get?"):
+            p = parse_query(q)
+            self.assertEqual((p.attribute, p.category, p.descriptors), ("rate", {"loan"}, {"home", "improvement"}), q)
+        self.assertEqual(parse_query("How many months until my certificate matures?").attribute, "count")
+        for q in ("How many days is the rate lock for a mortgage?", "How many months does the promo APR last?",
+                  "How many days of interest is the early withdrawal penalty?"):
+            self.assertEqual(parse_query(q).attribute, "count", q)                    # a rate word that describes the time asks no rate
+        for q in ("What's the interest rate and how many years is the term?", "How many months and what rate on the kayak special?"):
+            self.assertEqual(parse_query(q).attribute, "rate", q)
+        self.assertEqual(parse_query("I saved for a roof, what rate does savings pay?").descriptors, set())
+
+    # --- a program priced as another line plus an amount ------------------------------------------------------------------
+    def test_a_program_priced_as_a_line_plus_an_amount_gets_that_lines_row_raised_and_the_rule_when_asked_how_much_more(self):
+        ks, _ = self._site([("loans", self.AUTO)])
+        self.assertIn("6.40%", ks.answer("What's the 60-month APR on a Zephyr loan for a 2025 model-year vehicle?").text)
+        self.assertNotIn("5.40%", ks.answer("What's the 60-month APR on a Zephyr loan for a 2025 model-year vehicle?").text)
+        self.assertEqual(ks.answer("How much higher is the rate on a Zephyr auto loan than on a regular auto loan?").text,
+                         "Zephyr loans add 1% to conventional rates.")
+        self.assertIn("5.40%", ks.answer("What's the 60-month APR on an auto loan for a 2025 model-year vehicle?").text)     # no program named
+
+    def test_the_programs_amount_is_added_only_to_a_row_of_the_line_it_sits_under_and_not_when_the_question_sets_it_aside(self):
+        ks, _ = self._site([("loans", self.AUTO), ("home", self.MORTGAGE)])
+        rule = "Zephyr loans add 1% to conventional rates."
+        self.assertEqual(ks.answer("What is the Zephyr loan rate for a 30-year fixed mortgage?").text, rule)   # another line's row is never raised
+        for q in ("What's the 60-month APR for a 2025 model-year vehicle? Not Zephyr.", "Conventional vs Zephyr, 60 months, 2025 model-year: what APR?"):
+            text = ks.answer(q).text
+            self.assertIn("5.40%", text, q)
+            self.assertNotIn("6.40%", text, q)                                        # the plain line was asked for
+        hook = self.AUTO.replace("Zephyr Loans", "Sky-Hook Loans")
+        ks, _ = self._site([("loans", hook)])
+        for name in ("Sky-Hook", "Sky Hook", "skyhook", "SkyHook"):
+            self.assertIn("6.40%", ks.answer(f"What's the 60-month APR on a {name} loan for a 2025 model-year vehicle?").text, name)
+
+    def test_a_jeep_trim_is_no_atv_and_a_part_of_the_institution_or_a_kind_of_worker_is_no_employee_count(self):
+        from retrieve import VEHICLE_KIND
+        self.assertNotIn("rubicon", VEHICLE_KIND)
+        ks, _ = self._site([("loans", self.AUTO)])
+        self.assertIn("5.40%", ks.answer("What's the APR for a 2025 Jeep Wrangler Rubicon for 60 months?").text)
+        about = "# About\n\nCanoeco has more than 340 employees and 17 branch office locations across the valley.\n"
+        ks, _ = self._site([("about", about)])
+        self.assertIn("340", ks.answer("How many people work at Canoeco?").text)
+        for q in ("How many people work in the lending department at Canoeco?", "How many people does Canoeco employ part-time?",
+                  "How many people work at your headquarters?", "How many people work for the Canoeco board?"):
+            self.assertNotIn("340", ks.answer(q).text, q)
+
+    def test_a_named_person_asked_the_title_gets_the_title_the_heading_over_the_biography_gives(self):
+        from types import SimpleNamespace as NS
+        from solution import _with_heading_title
+        bio = NS(section="Pat Quill · Chief Boat Officer")
+        text = "Pat joined in 2014 after years of paddling."
+        self.assertEqual(_with_heading_title([bio], "What is Pat Quill's title?", text), "Pat Quill is Chief Boat Officer.")
+        self.assertEqual(_with_heading_title([bio], "Who is Pat Quill?", text), f"Pat Quill is Chief Boat Officer. {text}")
+        self.assertEqual(_with_heading_title([bio], "What is Sam Reed's title?", text), text)                     # another person
+        self.assertEqual(_with_heading_title([bio], "What is Pat Quill's title?", "Pat Quill · Chief Boat Officer — joined."), "Pat Quill · Chief Boat Officer — joined.")
+        self.assertEqual(_with_heading_title([NS(section="Overview · Auto Rates")], "What is Overview's title?", text), text)   # a table caption
+        md = ("# Leadership\n\n#### Pat Quill\n\n###### Chief Boat Officer\n\nPat joined in 2014 after years of paddling.\n\n"
+              "#### Sam Reed\n\n###### Senior Dock Consultant\n\nSam joined in 2019 and helps members with their dock plans.\n")
+        ks, _ = self._site([("about", md)])
+        self.assertIn("Chief Boat Officer", ks.answer("What is Pat Quill's title?").text)
+        self.assertIn("Senior Dock Consultant", ks.answer("What is Sam Reed's job title at Canoeco?").text)
+
+    def test_a_date_the_site_writes_short_is_said_short_and_a_staff_title_beats_an_old_quote(self):
+        from types import SimpleNamespace as NS
+        from synth import _dates_as_written
+        shown = [NS(text="Application period: Oct. 1-Nov. 12, 2030.")]
+        self.assertEqual(_dates_as_written("It runs October 1 to November 12, 2030; May 5 stays.", shown), "It runs Oct. 1 to Nov. 12, 2030; May 5 stays.")
+        self.assertEqual(_dates_as_written("It runs October 1.", [NS(text="no dates here")]), "It runs October 1.")
+        md = "# Leadership\n\n#### Pat Quill\n\n###### Chief Boat Officer\n\nPat joined in 2014 after years of paddling.\n"
+        blog = "# Blog\n\nThe fleet is growing, said Pat Quill, Canoeco's chief paddle officer.\n"
+        ks, _ = self._site([("about", md), ("learn/blog/post", blog)])
+        self.assertEqual(ks.answer("What is Pat Quill's title at Canoeco?").text, "Pat Quill is Chief Boat Officer.")
+
+    def test_a_list_question_gets_the_landing_pages_tiles_and_more_wordings_ask_for_a_list(self):
+        tiles = ("# Canoeco Boat Loans\n\n## Kayak Loan\n\nFor paddlers.\n\nExplore kayak loans (canoeco.example.org/boats/kayak)\n\n"
+                 "## Canoe Loan\n\nFor canoes.\n\nExplore canoe loans (canoeco.example.org/boats/canoe)\n\n"
+                 "## Raft Loan\n\nFor rafts.\n\nExplore raft loans (canoeco.example.org/boats/raft)\n\n"
+                 "## Handpicked Reading\n\nHow do I apply? Online.\n")
+        ks, _ = self._site([("boats", tiles), ("about", Rev47.ABOUT)])
+        q = parse_query("what boat loans do u guys offer?")
+        self.assertTrue(q.list_intent)
+        self.assertTrue(parse_query("What grant programs does Canoeco run?").list_intent)
+        self.assertFalse(parse_query("How much does Canoeco charge to run a wire?").list_intent)
+        from solution import _outline_chunks
+        text = " ".join(c.text for c in _outline_chunks(ks._indexes[-1], q))
+        for name in ("Kayak Loan", "Canoe Loan", "Raft Loan"):
+            self.assertIn(name, text)
+        self.assertNotIn("Handpicked", text)
+
+    # --- vehicle list ----------------------------------------------------------------------------------------------------
+    def test_more_model_words_each_name_one_kind_and_the_plain_english_ones_stay_out(self):
+        from retrieve import VEHICLE_KIND
+        for w, kind in (("x5", "car"), ("gold-wing", "motorcycle"), ("grizzly", "atv"), ("sundancer", "boat"), ("forest-river", "rv")):
+            self.assertEqual(VEHICLE_KIND[w], kind)
+        for w in ("scout", "shadow", "wildcat", "heartland", "explorer", "rogue", "honda", "yamaha"):
+            self.assertNotIn(w, VEHICLE_KIND)
+
+    # --- numbers in words -------------------------------------------------------------------------------------------------
+    def test_a_count_answer_says_digits_for_the_small_numbers_it_spells_too(self):
+        from retrieve import spelled_numbers
+        from synth import spelled_as_digits
+        self.assertEqual(spelled_numbers("six employees and one branch, Thirty-two groups"), {"Thirty-two": 32})
+        self.assertEqual(spelled_numbers("six employees and one branch", small=True), {"six": 6})
+        self.assertEqual(spelled_as_digits("Eight staff and one lead", small=True), "8 staff and one lead")
+
+    # --- pages about one place --------------------------------------------------------------------------------------------
+    LAB_A = ("# Canoeco opens the Maple Grove learning lab\n\nMAPLE GROVE, Ohio-Canoeco opened a branch today.\n\n"
+             "The phone number for the learning lab is (555) 123-4567. Hours follow.\n\nThere are 19 employees who work there full-time.\n")
+    LAB_B = ("# Canoeco opens the Oak Hill learning lab\n\nOAK HILL, Ohio-Canoeco opened a branch today.\n\n"
+             "The phone number for the learning lab is (555) 987-6543. Hours follow.\n\nThere are six employees who work there full-time.\n")
+
+    def test_the_pages_about_a_place_are_the_ones_whose_title_or_opening_name_it(self):
+        import solution
+        from retrieve import select
+        ks, _ = self._site([("newsroom/maple", self.LAB_A), ("newsroom/oak", self.LAB_B), ("about", Rev47.ABOUT)])
+        index = ks._indexes[-1]
+        q = parse_query("What is the phone number for the Maple Grove learning lab?")
+        places = [{t for t in solution.tokenize("Maple Grove")}]
+        keys = solution._pages_about(index, q, places)
+        self.assertEqual([k.split("/")[-1] for k in keys], ["maple"])
+        self.assertTrue(solution._place_has_page(index, places))
+        self.assertFalse(solution._place_has_page(index, [{"davenport"}]))
+        ev = select(index, q)
+        shown = " ".join(c.text for c in solution._with_place_chunks(index, q, ev, places))
+        self.assertIn("(555) 123-4567", shown)
+
+    def test_a_count_at_one_named_place_is_recovered_from_the_pages_about_it_and_other_places_do_not_answer_for_it(self):
+        import solution
+        route = {"paths": ["/about"]}
+        answer = {"note": "", "answer": "There are 19 employees who work there full-time.", "answerable": True, "evidence_ids": [1, 2, 3, 4]}
+        ks, calls = self._site([("newsroom/maple", self.LAB_A), ("newsroom/oak", self.LAB_B), ("about", Rev47.ABOUT)], [route, answer])
+        q = "My cousin just got a job at the Maple Grove learning lab and she loves it. How many people work there full-time?"
+        a = solution._recover(ks._indexes[-1], ks._synth, q, None, None)
+        self.assertIn("19", a.text)
+        self.assertEqual(len(calls), 2)                                              # the page pick, then the answer
+        self.assertTrue(all("oak" not in x.url for x in a.sources))
+        self.assertIsNone(solution._recover(ks._indexes[-1], ks._synth, "What APR do you charge on a 9-month Maple Grove loan?", None, None))
 
 
 class Selftest(unittest.TestCase):

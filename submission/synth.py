@@ -18,7 +18,7 @@ from ingest import Chunk, View, url_key
 from collections import Counter
 from types import SimpleNamespace
 
-from retrieve import (ASKS_THRESHOLD, KIND_NAME, SOFT_QUALIFIERS, SPELLED, SYNONYMS, WIRE, WIRE_FEE_LINE, Evidence, Query, _asked,
+from retrieve import (ASKS_THRESHOLD, KIND_NAME, SOFT_QUALIFIERS, SPELLED, SPELLED_SMALL, SYNONYMS, WIRE, WIRE_FEE_LINE, Evidence, Query, _asked,
                       asked_kinds, chunk_cover, count_sentence, fee_cover, fee_items, kinds_in, names_line, on_other_line, other_kind, other_lines,
                       place_phrases, product_name, qualify, spelled_numbers, supports, terms_in, tier_width, tokenize, wire_direction,
                       STATUS_DATE, STATUS_EV)
@@ -573,6 +573,7 @@ class Synthesizer:
     def __init__(self):
         self._client = None
         self._cooldown = 0
+        self.calls = 0                  # model requests made so far (a recovery is only tried when a question made none)
         self._probe = False             # the last call failed in transport: the next one is a probe
         self.enabled = bool(os.getenv("ANTHROPIC_API_KEY") or os.getenv("ANTHROPIC_AUTH_TOKEN")) \
             and not os.getenv("KH_NO_LLM")
@@ -599,11 +600,13 @@ class Synthesizer:
                      "the row of the product line that vehicle is financed under; if it is not a vehicle, set answerable=false.")
         if listing:                            # asked what is offered: every line, not the member's own
             head += ("\nThe member asks what is offered: list every product line the excerpts show for it, personal and "
-                     "business alike, each with its own rate.")
+                     "business alike, each with its own rate. An excerpt that says \"<page> lists: A; B; C\" names the page's "
+                     "own product lines: name each of them that fits the question.")
         return self._ask(f"{head}\n\nExcerpts:\n{excerpts}", question)
 
     def _ask(self, content: str, question: str, system: str = SYSTEM, schema: dict = SCHEMA,
              max_tokens: int = 1024) -> dict | None:
+        self.calls += 1
         try:
             if self._client is None:                   # lazy: a missing package must not break build()
                 self._client = _new_client()
@@ -682,7 +685,8 @@ class Synthesizer:
             ev = line_table_first(q, own_table_first(question, q, ev, view, lookup), view)
             out = self._llm(question, ev, view, asked, q.list_intent, q.year_guess)
             if out is not None:
-                if not out.get("answerable", False):
+                said_absent = bool(out.get("answerable", False)) and _says_absent(str(out.get("answer", "")), question)
+                if not out.get("answerable", False) or said_absent:
                     again = self._second_look(question, q, view, asked, second_look)
                     if again is not None:
                         return again[0], again[1], True, "; ".join(x for x in (again[2], note) if x)
@@ -705,10 +709,11 @@ class Synthesizer:
                 asked: date | None = None):
         """The model's answer if it passes the guards: (text, cited chunks, note), else None."""
         shown = _llm_chunks(ev)                # the exact excerpts the model saw, same numbering
-        text = _digits_as_written(_drop_dead_links(_drop_banned(str(out.get("answer", ""))), view), shown)
-        said = spelled_numbers(" ".join(c.text for c in shown))          # numbers the excerpts write in words
-        if q.attribute == "count":
-            text = spelled_as_digits(text, said)                       # "Thirty-two" on the page, asked how many: the figure
+        text = _dates_as_written(_digits_as_written(_drop_dead_links(_drop_banned(str(out.get("answer", ""))), view), shown), shown)
+        small = q.attribute == "count"
+        said = spelled_numbers(" ".join(c.text for c in shown), small)   # numbers the excerpts write in words
+        if small:
+            text = spelled_as_digits(text, said, small=True)           # "Thirty-two" on the page, asked how many: the figure
         allowed = (numbers(question) | numbers(" ".join(f"{c.text} {describe(c, view)}" for c in shown))
                    | {float(v) for v in said.values()})
         if asked:                              # the day it was told it may write back, in any form
@@ -723,8 +728,8 @@ class Synthesizer:
     def _second_look(self, question: str, q: Query, view: View, asked, second_look):
         """The search results held no answer to an open question ("who qualifies for membership?"): the
         model picks the site's own pages by title, then answers once more from those pages. Never for a
-        rate, fee, hours, count or address question, where "not listed" is usually the truth."""
-        if second_look is None or q.attribute not in (None, "when"):
+        rate, hours or address question, where "not listed" is usually the truth."""
+        if second_look is None or not (q.attribute in (None, "when") or (q.attribute in ("count", "fee") and asked is None)):
             return None
         ev = second_look(question)
         if ev is None or not ev.chunks:
@@ -780,11 +785,29 @@ def _digits_as_written(text: str, shown: list) -> str:
                   text, flags=re.I)
 
 
-def spelled_as_digits(text: str, said: dict | None = None) -> str:
-    """An answer to a count says the digits for a number spelled in words ("Thirty-two" -> "32"), by default for every
-    number the text spells, or for those of `said` (what the excerpts spell)."""
-    by_word = {k.lower(): v for k, v in (spelled_numbers(text) if said is None else said).items()}
-    return SPELLED.sub(lambda m: str(by_word.get(m.group(0).lower(), m.group(0))), text)
+AP_MONTHS = {"jan": "January", "feb": "February", "aug": "August", "sept": "September", "oct": "October", "nov": "November", "dec": "December"}
+AP_DATE = re.compile(r"\b(Jan|Feb|Aug|Sept|Oct|Nov|Dec)\.\s*(\d{1,2})\b")
+FULL_DATE = re.compile(r"\b(" + "|".join(AP_MONTHS.values()) + r")\s+(\d{1,2})\b")
+
+
+def _dates_as_written(text: str, shown: list) -> str:
+    """The site writes "Oct. 1" and "Nov. 12, 2026": an answer that says "October 1" says it as the site does, since the
+    member (and anything that checks the answer against the site) reads the site's own words. Only dates the excerpts
+    write in that short form, and only the same month and day."""
+    given = {}
+    for c in shown:
+        for m in AP_DATE.finditer(c.text):
+            given[(AP_MONTHS[m.group(1).lower()], int(m.group(2)))] = f"{m.group(1)}. {int(m.group(2))}"
+    if not given:
+        return text
+    return FULL_DATE.sub(lambda m: given.get((m.group(1), int(m.group(2))), m.group(0)), text)
+
+
+def spelled_as_digits(text: str, said: dict | None = None, small: bool = False) -> str:
+    """An answer to a count says the digits for a number spelled in words ("Thirty-two" -> "32"; with `small`, "six" -> "6"),
+    by default for every number the text spells, or for those of `said` (what the excerpts spell)."""
+    by_word = {k.lower(): v for k, v in (spelled_numbers(text, small) if said is None else said).items()}
+    return (SPELLED_SMALL if small else SPELLED).sub(lambda m: str(by_word.get(m.group(0).lower(), m.group(0))), text)
 
 
 def _llm_chunks(ev: Evidence) -> list[Chunk]:

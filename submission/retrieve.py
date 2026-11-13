@@ -11,6 +11,7 @@ Order of operations for a question:
 """
 from __future__ import annotations
 
+import copy
 import math
 import re
 from collections import Counter
@@ -92,10 +93,17 @@ def use_site_words(words) -> None:
     who = f"you|{alt}" if alt else "you"
     LIST_Q = re.compile(rf"\b(?:what|which) (?:\w+ ){{0,3}}(?:do|does) (?:{who}) (?:offer|have|carry|provide)\b|"
                         rf"\b(?:what|which) (?:\w+ ){{0,3}}(?:are|is) (?:available|offered)\b|\bwhat (?:kinds|types) of\b|"
-                        rf"\blist (?:the|your|all|every|out)\b|\bshow me all\b|{LIST_ASK}", re.I)
+                        rf"\blist (?:the|your|all|every|out)\b|\bshow me all\b|{LIST_ASK}|{LIST_MORE}", re.I)
 
 
 LIST_ASK = r"^\s*(?:please\s+)?(?:list|show me all)\b"     # "list your card rates"
+# more ways to ask what is offered: "what grant programs does <Name> run", "what business loans do u guys offer", "what are the
+# types of certificates", "which checking accounts are there", "name the scholarships"
+LIST_MORE = (r"\b(?:what|which) (?:\w+ ){0,3}(?:do|does) (?:you|u|y['’]all|the credit union|the foundation|they) ?(?:guys )?"
+             r"(?:run|sponsor|give out|sell|support|accept|write|make|have|offer|carry|provide)\b|"
+             r"\b(?:what|which) (?:\w+ ){0,3}(?:do|does) \w+ (?:run|sponsor|give out|sell|support)\b|"
+             r"\bwhat (?:are|r) (?:the|all the) (?:different |various |main )?(?:\w+ ){0,2}(?:kinds|types|sorts|ways)\b|"
+             r"\bwhich (?:\w+ ){1,3}are there\b|\bname (?:the|all|every|some)\b")
 # more ways to ask for every line: "what specials are you running", "every term you offer", "what protection products can I add"
 LIST_WIDER = re.compile(r"\b(?:what|which) (?:\w+ ){0,4}(?:are|do) (?:you|y['’]all) (?:running|offering|selling|having|got)\b|"
                         r"\bevery (?:\w+ ){0,3}(?:term|type|kind|product|option)s?\b|"
@@ -162,7 +170,14 @@ COUNT_CUE = re.compile(r"(?:^|\bthe\s+|\btotal\s+)number of\s+([a-z-]+)", re.I)
 WHEN_Q = re.compile(r"^\s*when\b|what date|\bby when\b", re.I)
 LIST_Q = re.compile(r"\b(?:what|which) (?:\w+ ){0,3}(?:do|does) (?:you) (?:offer|have|carry|provide)\b|"
                     r"\b(?:what|which) (?:\w+ ){0,3}(?:are|is) (?:available|offered)\b|\bwhat (?:kinds|types) of\b|"
-                    r"\blist (?:the|your|all|every|out)\b|\bshow me all\b|" + LIST_ASK, re.I)
+                    r"\blist (?:the|your|all|every|out)\b|\bshow me all\b|" + LIST_ASK + "|" + LIST_MORE, re.I)
+TIME_UNITS = {"day", "days", "week", "weeks", "month", "months", "year", "years"}
+# a rate asked for in its own clause ("what's the APR and how many months", "how many months and what rate"): the months are its
+# term. A rate word that only describes what the months are of ("how many days of interest", "how long is the promo APR") asks no rate.
+RATE_ASKED = re.compile(r"\bwhat(?:['’]?s|\s+is|\s+are|\s+would|\s+will)?\b[^?]{0,30}?\b(?:rates?|apr|apy)\b", re.I)
+# a home project named instead of the product: "need to redo my roof, $35k" asks the rate of the loan for work on a home
+PURPOSE_HOME = re.compile(r"\b(?:roof(?:ing)?|re-?roof\w*|remodel\w*|renovat\w*|kitchen|bathroom|siding|flooring|new\s+windows|"
+                          r"(?:house|home)\s+(?:repairs?|projects?)|repair(?:s|ing)?\s+(?:my|our|the)\s+(?:house|home))\b", re.I)
 NOT_A_RATE = re.compile(r"\bhow long\b|\bhow many (?:days|weeks|months|years)\b|\bcredit score\b|\brequirements?\b|\bqualify\b|\bqualifies\b|"
                         r"\bqualification\b|\beligib\w*\b|\brate lock\b|\block(?:ed|s)? (?:for|until)\b|\block period\b", re.I)
 VALUE_REQUESTED = re.compile(r"\b(?:what|which)(?:['’]s| is| are| was| were)?\s+(?:\w+\s+){0,3}?(?:rates?|apr|apy|dividends?|yield|interest)\b|"
@@ -374,6 +389,7 @@ class Query:
     category: set = field(default_factory=set)       # the product-line word itself, e.g. {"savings"}
     year_guess: bool = False                         # the year was read from "a <year> <word>", not from a vehicle word
     year_kind: bool = False                          # the year was read from a make or model the vehicle list knows
+    refinance_dropped: bool = False                  # "refinance" asked of a product that has no refinance rows of its own
     spelled_counts: bool = False                     # a count the page spells in words counts (only when a model writes the answer)
     list_intent: bool = False                        # "what cards do you offer": show every product line
     subject: list = field(default_factory=list)      # rare question words a fee/count answer must contain
@@ -458,8 +474,8 @@ def parse_query(question: str) -> Query:
     q.amounts = [a - 0.01 if a in below else a + 0.01 if a in above else a for a in q.amounts]
     q.qualifiers = {w for w in SOFT_QUALIFIERS if re.search(rf"\b{w}\b", head if context else low)}
     q.excluded -= q.qualifiers          # a line named elsewhere without a negation is still asked about
-    if m := COUNT_Q.search(low):
-        q.attribute, q.count_noun = "count", _stem(m.group(1))
+    if (m := COUNT_Q.search(low)) and not (m.group(1) in TIME_UNITS and RATE_ASKED.search(low)):
+        q.attribute, q.count_noun = "count", _stem(m.group(1))         # "what's the APR and how many months": a term, not a count
     elif RATE_Q.search(low) or PCT_PAID.search(low) or (DEPOSIT_PAYS.search(low) and not FEE_Q.search(low)) \
             or ((DEPOSIT_PAYS.search(head) or (VALUE_BACKREF.search(head) and DEPOSIT_NAMED.search(head)))
                 and not FEE_WORD.search(head)):         # what a deposit pays or earns, even "how much does … pay"
@@ -568,6 +584,7 @@ def parse_query(question: str) -> Query:
     _read_hours(q, raw_low)
     _read_counts(q, raw_low)
     _read_vehicle_year(q, raw_low)
+    _read_purpose(q, raw_low)
     _read_refinance(q, raw_low)
     if q.list_intent and q.attribute == "rate" and (q.terms or q.years or q.amounts) and VALUE_ASKED.search(raw_low) \
             and not re.match(LIST_ASK, q.raw, re.I) and not LIST_EACH.search(q.raw):
@@ -587,13 +604,17 @@ _KINDS = {
         accord civic camry corolla prius rav4 highlander tacoma tundra 4runner cr-v crv hr-v f-150 f150 f-250 f250
         mustang silverado tahoe suburban equinox camaro corvette impala traverse wrangler cherokee
         altima sentra maxima elantra sonata tucson telluride sorento outback forester impreza crosstrek mazda3 cx-5 jetta
-        passat cybertruck charger challenger durango camper-van sedan suv pickup minivan""".split(),
+        passat cybertruck charger challenger durango camper-van sedan suv pickup minivan ridgeline x3 x5 x7 m3 m5""".split(),
     "motorcycle": """harley harley-davidson davidson ducati triumph vespa ktm ninja sportster hayabusa goldwing scooter moped
-        chopper""".split(),
+        chopper gold-wing rebel cbr fat-boy street-glide road-king road-glide bonneville royal-enfield enfield
+        z900 r1 mt-07 mt-09 versys vulcan v-strom vstrom africa-twin""".split(),
     "atv": """polaris can-am ski-doo skidoo arctic-cat sea-doo seadoo waverunner rzr four-wheeler quad atv utv snowmobile
-        jetski""".split(),
-    "boat": """bayliner boston-whaler sea-ray pontoon yacht sailboat catamaran""".split(),
-    "rv": """winnebago airstream jayco fleetwood coachmen tiffin newmar motorhome camper trailer""".split(),
+        jetski grizzly kodiak wolverine viking mule teryx brute-force pioneer talon rancher foreman sportsman
+        scrambler mxz""".split(),
+    "boat": """bayliner boston-whaler sea-ray pontoon yacht sailboat catamaran sundancer bowrider wakeboat mastercraft lund
+        crestliner chaparral glastron""".split(),
+    "rv": """winnebago airstream jayco fleetwood coachmen tiffin newmar motorhome camper trailer keystone grand-design
+        forest-river thor dutchmen fifth-wheel travel-trailer toy-hauler""".split(),
 }
 VEHICLE_KIND = {w: kind for kind, words in _KINDS.items() for w in words}
 # the descriptor the rate tables use for each kind of vehicle
@@ -646,9 +667,8 @@ def _read_make_year(q: Query, low: str) -> None:
     harley") is a vehicle's model year. A word the list knows is read as its kind of vehicle (boats and RVs are priced by
     amount, so they keep no year); a word it doesn't know leaves the year guessed (q.year_guess) when the question is about a
     loan (an APR or a loan word) and the word is capitalised or a term is asked: the model decides what it is and which
-    line it is financed under, and with no key the question declines. Two different years, a refinance (whose rows the site
-    keeps on pages of other products) and a superlative ("the lowest APR") are guessed too: a year the list is sure of, and
-    asked plainly, is not guessed."""
+    line it is financed under, and with no key the question declines. Two different years and a superlative ("the lowest
+    APR") are guessed too: a year the list is sure of, and asked plainly, is not guessed."""
     if not (q.attribute == "rate" and not q.years and q.category <= {"loan"}):
         return
     years = sorted({int(y) for y in re.findall(r"\b(?:19|20)\d\d\b", q.raw)})
@@ -677,7 +697,7 @@ def _read_make_year(q: Query, low: str) -> None:
             return
         if len(years) > 1:
             q.years, q.year_guess, q.descriptors = set(years), True, set()
-        elif not kinds or (REFINANCE_WORD.search(low) and not REFINANCE_NEGATED.search(low)) or SUPERLATIVE.search(low):
+        elif not kinds or SUPERLATIVE.search(low):
             q.years, q.year_guess, q.descriptors = {year}, True, set()
         else:
             if not q.category and not DEPOSIT_CUE.search(low):
@@ -686,6 +706,14 @@ def _read_make_year(q: Query, low: str) -> None:
         return
 # A vehicle word names the loan when a model year is asked: "a 72-month loan on a 2016 or older vehicle" is the auto
 # table's question (it has no such row), not a boat or RV loan's.
+def _read_purpose(q: Query, low: str) -> None:
+    """A home project named instead of the loan ("need to redo my roof, around $35k"): the rate of the loan for work on a home."""
+    if q.attribute == "rate" and not q.category and not DEPOSIT_CUE.search(low) and PURPOSE_HOME.search(low):
+        q.category.add("loan")
+        q.descriptors = set(q.descriptors) | {"home", "improvement"}
+        q.tokens = list(dict.fromkeys(q.tokens + [_stem("home"), _stem("improvement")]))
+
+
 def _read_vehicle_year(q: Query, low: str) -> None:
     _read_make_year(q, low)
     if q.attribute == "rate" and q.years and q.category == {"loan"} and not q.descriptors and (v := VEHICLE.search(low)):
@@ -769,6 +797,45 @@ def hours_strong(low: str) -> bool:
             rf"\b(?:do|does)\s+{subj}(?:open|close)\b[^?]*\b(?:same|different)\s+times?\b|"
             rf"\bwhat\s+time\b(?!\s+(?:frame|period|limit)s?\b)[^?]*\b{_FAC}\b", re.I))
     return _STRONG[1].search(low) is not None
+
+
+# A branch, ATM or lobby asked of a place: the facility nouns a place question carries.
+FACILITY_ASK = re.compile(rf"\b{_FAC}\b|\batms?\b|\blabs?\b", re.I)
+# words after "in/at/near" that are no town ("a branch in my area", "in person", "in advance")
+NOT_A_PLACE = set("""town city area state person advance general detail cash order time total fact case branch branches office
+    offices location locations atm atms lobby lobbies the your our my this that these those here there nearby local closest
+    nearest next main downtown drive hours hour walking distance neighborhood community region county country general
+    particular practice writing full bulk addition effect place site store person online mobile same other first second last
+    whole entire only usual regular normal current new old open""".split())
+_PLACE_BY_FACILITY = (re.compile(r"\b(?:branch(?:es)?|location|office|atm|lobby|drive[- ]?up)\s+(?:in|at|near|around|of)\s+(?:the\s+)?"
+                           r"([a-z][a-z'’.-]{3,})", re.I),
+                re.compile(r"\b(?:the|a)\s+([a-z][a-z'’.-]{3,})\s+(?:branch|office|location|atm|lobby)\b", re.I),
+                # "how many branches does Canoeco have in Arizona": a capitalised town a few words after the facility
+                re.compile(r"\b(?:branches|branch|offices|locations|atms?)\b(?:\s+\S+){0,6}?\s+(?:in|at|near)\s+([A-Z][a-z'’.-]{3,})"),
+                # "the Cedar Falls learning lab", "the Grimes Learning Lab branch": capitalised words, then up to two lower-case ones and the facility
+                re.compile(r"\b((?:[A-Z][a-z'’-]{2,}\s+){1,3})(?:[a-zA-Z]+\s+){0,2}?(?:branch|lab|office|location|lobby)\b"))
+
+
+def facility_places(raw: str) -> list:
+    """[(word, capitalised)] for the word a question puts where a town belongs beside a facility noun: after "branch in",
+    "ATM near", or between "the" and "branch" ("is there a canoeco branch in davenport", "the Davenport branch"). Only a word
+    next to the facility counts: a place elsewhere in the question ("my boss at Rivertown Pantry asked how many branch
+    offices ...") is the member's own. The caller keeps a word that is capitalised or that no page writes."""
+    if not FACILITY_ASK.search(raw):
+        return []
+    out = []
+    for pat in _PLACE_BY_FACILITY:
+        for m in pat.finditer(raw):
+            if m.group(1)[:1].isupper() and re.fullmatch(r"\s*|.*[.!?:]\s+|.*\n\s*", raw[:m.start(1)], re.S):
+                continue                                    # the first word of a sentence is capitalised anyway
+            word = " ".join(w for w in m.group(1).split() if w.lower() not in SITE_WORDS and w.lower() not in STOP
+                            and w.lower() not in NOT_A_PLACE)
+            if not word:
+                continue
+            parts = [x for x in re.split(r"[-.'’]", word.lower()) if x]
+            if parts and not any(x in NOT_A_PLACE or x in STOP or x in GENERIC or x in SITE_WORDS or x.isdigit() for x in parts):
+                out.append((word.lower(), word[:1].isupper()))
+    return list(dict.fromkeys(out))
 
 
 def place_phrases(question: str) -> list:
@@ -877,6 +944,12 @@ def _about(index: Index) -> None:
     index._about_done = True
 
 
+def place_on_site(index: Index, q: Query) -> bool:
+    """Does any page write the place the question names ("Davenport")? A place no page writes has no schedule, no
+    address and no status to read."""
+    return any(index.postings.get(t) for t in set().union(*q.places)) if q.places else True
+
+
 def dated_status(index: Index, q: Query) -> bool:
     """Does a passage naming the asked place state, with a full date, that it opens, closes or ends?"""
     named = set().union(*q.places)
@@ -952,12 +1025,14 @@ _DASH = r"[-\u2010-\u2015\s]"                      # a hyphen, a non-breaking hy
 SPELLED_ALT = ("(?:" + "|".join(_TENS) + ")(?:" + _DASH + "(?:" + "|".join(w for w, v in _UNITS.items() if 0 < v < 10) + "))?|"
                + "|".join(w for w, v in _UNITS.items() if v >= 11))
 SPELLED = re.compile(rf"\b(?:{SPELLED_ALT})\b", re.I)
+# the small ones too (two to ten), for an answer to a count: "Eight staff", "six employees" ("one" is a pronoun as often as a number)
+SPELLED_SMALL = re.compile(rf"\b(?:{SPELLED_ALT}|two|three|four|five|six|seven|eight|nine|ten)\b", re.I)
 
 
-def spelled_numbers(text: str) -> dict:
-    """The numbers a text writes in words, {as written: value}: "Thirty-two" -> 32."""
+def spelled_numbers(text: str, small: bool = False) -> dict:
+    """The numbers a text writes in words, {as written: value}: "Thirty-two" -> 32; with `small`, two to ten too."""
     out = {}
-    for m in SPELLED.finditer(text or ""):
+    for m in (SPELLED_SMALL if small else SPELLED).finditer(text or ""):
         out[m.group(0)] = sum(_TENS.get(w, _UNITS.get(w, 0)) for w in re.split(_DASH, m.group(0).lower()))
     return out
 
@@ -984,6 +1059,14 @@ PERIOD_WORDS = {_stem(w) for w in ("last", "this", "past", "previous", "prior", 
 CLAUSE_END = re.compile(r",\s+|;\s+|\s[—–]\s")
 # what a member calls the people who work there, and the site's word for them
 COUNT_SYN = {_stem(w): _stem("employees") for w in ("staff", "staffers", "workers", "personnel")}
+PEOPLE_WORK = re.compile(r"\b(?:people|ppl)\b[^?.]*\b(?:work|works|working|employ|employed|employs)\b|"
+                         r"\b(?:employ|employs)\b[^?.]*\b(?:people|ppl)\b", re.I)
+PLACE_DEICTIC_Q = re.compile(r"\b(?:there|here|lab|nearby|near me)\b", re.I)
+# a part of the institution, or a kind of worker: the site's employee count is no answer to "how many people work in <it>"
+SUBUNIT = re.compile(r"\b(?:departments?|dept|divisions?|teams?|units?|groups?|desks?|part[- ]?time|full[- ]?time|seasonal|temporary|contract|"
+                     r"interns?|volunteers?|headquarters|hq|foundation|board|directors?|executives?|insurance|financial\s+services|"
+                     r"contact\s+center|call\s+center|crew|floors?|building|campus|subsidiar\w*|affiliates?)\b", re.I)
+COUNT_FILLER = {_stem(w) for w in ("total", "altogether", "overall", "combined", "together")}
 COUNT_OF = re.compile(r"\bhow many\s+of\s+(?:the|your|our|its|their|those|these)\s+([a-z-]+)", re.I)
 WHAT_NUMBER = re.compile(r"\bwhat\s+number\s+of\s+(?:(?:the|your|our)\s+)?((?:[a-z-]+\s+)?[a-z-]+)", re.I)
 TEAM_MEMBERS = re.compile(r"\bhow many\s+(?:of\s+(?:the|your|our)\s+)?(?:[a-z]+\s+)?(?:team|staff|crew)\s+members?\b", re.I)
@@ -1025,6 +1108,25 @@ def count_sentence(c: Chunk, q: Query) -> tuple:
     return re.sub(r"\s*\([^()]*$", "", best), (int(m.group(1)) if m else None), cover(best)
 
 
+def _institution_named(low: str) -> bool:
+    """The question is about the credit union itself: its own name, "the credit union", "you" or "your"."""
+    return (any(re.search(rf"\b{re.escape(w)}\b", low) for w in SITE_WORDS)
+            or re.search(r"\bcredit\s+union\b|\byou(?:r)?\b", low) is not None)
+
+
+WORKER_NOUNS = {_stem(w) for w in ("employees", "staff", "workers")}
+WORK_VERB = re.compile(r"\b(?:work|works|working|employ|employs|employed)\b(.*)$", re.I)
+HEADCOUNT_REST = {"at", "for", "in", "by", "the", "your", "our", "a", "is", "are", "does", "do", "have", "has", "there", "total", "altogether",
+                  "overall", "combined", "together", "credit", "union", "cu", "currently", "right", "now", "today", "all", "with", "you"}
+
+
+def _plain_headcount(q: Query, low: str) -> bool:
+    """"How many employees (staff, workers) work at / does <the credit union> employ": the verb, then nothing but the institution.
+    Anything else after it ("work remotely", "work from home") counts something other than the employees."""
+    m = WORK_VERB.search(low)
+    return bool(m and q.count_noun in WORKER_NOUNS and set(re.findall(r"[a-z]+", m.group(1))) <= (HEADCOUNT_REST | set(SITE_WORDS)))
+
+
 def _read_counts(q: Query, low: str) -> None:
     """How many …: the counted noun as the site says it, and the year asked."""
     if q.attribute is None and (m := WHAT_NUMBER.search(low)):
@@ -1037,6 +1139,14 @@ def _read_counts(q: Query, low: str) -> None:
         q.count_noun = _stem("staff")                # "team members": the people who work there
         q.count_said |= {_stem(w) for w in ("team", "crew", "member")}
         q.tokens = [t for t in q.tokens if t not in q.count_said]
+    if (q.attribute == "count" and (q.count_noun in (_stem("people"), "ppl") and PEOPLE_WORK.search(low) or _plain_headcount(q, low))
+            and _institution_named(low)
+            and not FACILITY.search(low) and not PLACE_DEICTIC_Q.search(low) and not place_phrases(q.raw) and not SUBUNIT.search(low)):
+        # "how many people work at <the credit union>": the site's word is employees, in every wording
+        q.count_said |= {_stem(w) for w in ("people", "ppl", "work", "works", "working", "employ", "employed", "employs")}
+        q.count_noun = _stem("employees")
+        q.tokens = list(dict.fromkeys(q.count_noun if t in (_stem("people"), "ppl") else t for t in q.tokens
+                                      if t not in q.count_said and t not in COUNT_FILLER))   # "in total": the whole, not a word to find
     m = COUNT_OF.search(low)
     if m and q.attribute == "count" and q.count_noun in (_stem("of"), "of"):
         q.count_noun = _stem(m.group(1))
@@ -1369,12 +1479,30 @@ def drop_describing_words(index: Index, q: Query) -> set:
     return desc - drop
 
 
+def _own_refinance_rows(index: Index, q: Query) -> bool:
+    """Does a live product row of the kind asked about name the refinance line in its own label or section (a mortgage's
+    "Home Loans - Refinance")? A page that says so only in its title ("Refinance Your Loan & Earn Cash Back") does not."""
+    q2 = copy.deepcopy(q)
+    q2.qualifiers = set(q.qualifiers) - {"refinance"}
+    for c in index.chunks:
+        if (c.is_row and re.search(r"\brefinanc", (c.section or "") + " " + c.label(), re.I)
+                and index.view.pages[c.key].page.kind == "product" and supports(c, q2) and qualify(c, q2)[0] != "mismatch"):
+            return True
+    return False
+
+
 def select(index: Index, q: Query, k: int = 8) -> Evidence:
     view = index.view
+    if "refinance" in q.qualifiers and not _own_refinance_rows(index, q):
+        # refinancing a loan the site gives no refinance rates for ("New, used or refinancing?" over one table): the
+        # product's own rates, as for a purchase
+        q.qualifiers, q.refinance_dropped = set(q.qualifiers) - {"refinance"}, True
+        q.tokens = [t for t in q.tokens if t not in (_stem("refinance"), "refi")]     # the word no row says: not one to find
     if q.soft_hours:
         _about(index)
         q.need_schedule = True
-        if not any(supports(c, q) for c in index._schedules) and (q.loose_hours or not q.places or dated_status(index, q)):
+        if not any(supports(c, q) for c in index._schedules) and (
+                (q.loose_hours and place_on_site(index, q)) or not q.places or dated_status(index, q)):
             # no schedule answers it, and the wording or a dated statement about the place says it asks something
             # else ("when is the <Name> branch open until?"): the question as it read before
             q.attribute, q.qualifiers = q.read_as
@@ -1623,6 +1751,8 @@ def other_kind(c: Chunk, q: Query) -> bool:
 
 
 def _asked(w: str, q: Query) -> bool:
+    if w == "refinance" and q.refinance_dropped:
+        return False
     low = (q.text or q.raw).lower()     # "refinancing", "IRAs" and "refi" ask for that line too
     return (w in q.qualifiers or re.search(rf"\b{re.escape(_stem(w))}", low) is not None
             or (w == "refinance" and re.search(r"\brefi\b", low) is not None))

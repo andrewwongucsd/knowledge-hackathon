@@ -11,6 +11,8 @@ How "current" is decided (also in NOTES.md):
 """
 from __future__ import annotations
 
+import copy
+import math
 import re
 import sys
 from pathlib import Path
@@ -30,11 +32,13 @@ import calendar                        # noqa: E402
 from datetime import date, timedelta   # noqa: E402
 
 from ingest import KIND_RANK, MONTH_RE, MONTHS, STATUS_RANK, Chunk, Store, _on_site, url_key   # noqa: E402
+import ingest                          # noqa: E402
 import retrieve                        # noqa: E402
 from retrieve import (ASKS_ELSE, BACK_REFERENCE, CHAT_FILLERS, DIMENSIONS, FRAME_WORDS, GENERIC, GENERIC_HEADS, HEDGES, MEMBERSHIP_Q,  # noqa: E402
                       PLACE_DEICTIC, QUIET, RESTRICTION, STOP, Evidence, Index, _stem, carried_in_context, count_clause, fee_clause,
-                      lead_names, parse_query, proper_names, qualify, select, terms_in, tokenize, use_proper_names, use_site_words)
-from synth import REFUSAL, Synthesizer, spelled_as_digits  # noqa: E402
+                      ADDRESS_EV, FACILITY_ASK, facility_places, lead_names, parse_query, place_phrases, proper_names, qualify, select, terms_in,
+                      tokenize, use_proper_names, use_site_words)
+from synth import ABSENT, REFUSAL, Synthesizer, _says_absent, spelled_as_digits  # noqa: E402
 
 
 class KnowledgeSystem:
@@ -139,11 +143,193 @@ def _too_new(c: Chunk, view, before: date, dated: dict) -> bool:
     return not (c.effective or first) and (view.taken_on - before).days > UNDATED_REACH_DAYS
 
 
+NO_SUCH = re.compile(r"\bno\b[^.?!]{0,60}\b(?:appears?|listed|found|mentioned)\b|"
+                     r"\b(?:doesn['’]t|does not|don['’]t|do not)\s+(?:list|have|show|publish|operate|appear)\b|"
+                     r"\bnot\s+(?:listed|found|mentioned)\b", re.I)
 FILLERS = {_stem(w) for w in "total altogether all together actual actually even know day days now today".split()}
+
+
+RECOVER_BUDGET = 12000
+# A recovered answer that denies, limits or excludes anything is no recovery: a refusal must be a refusal, and a missed
+# recovery costs nothing (the question stays declined).
+RECOVER_ABSENT = re.compile(r"\b(?:no|none|not|never|nothing|nobody|without|only|cannot|can['’]t|isn['’]t|aren['’]t|doesn['’]t|"
+                            r"don['’]t|didn['’]t|won['’]t|hasn['’]t|haven['’]t)\b", re.I)
 
 
 def _respond(index: Index | None, synth: Synthesizer, question: str, search: str | None = None,
              asked: date | None = None, before: date | None = None, dated: dict | None = None) -> Answer:
+    calls = synth.calls
+    ans = _respond_core(index, synth, question, search, asked, before, dated)
+    if ans.confident or index is None or not synth.enabled or before is not None or synth.calls != calls:
+        return ans                              # only a question the rules declined before any model call can be recovered
+    return _recover(index, synth, question, search, asked) or ans
+
+
+def _recover(index: Index, synth: Synthesizer, question: str, search: str | None, asked: date | None) -> Answer | None:
+    """A decline the rules made before any model call, of a question that may be answerable: the model picks pages by title
+    from the site's own list and answers once from them, under the guards of every model answer (numbers from the evidence,
+    nothing that says the site doesn't have it). Never for a rate or hours question (a term, tier or place the site lacks is
+    the usual reason: "not listed" is the truth), nor a branch or ATM asked of a place no page writes."""
+    q = parse_query(search or question)
+    if q.attribute in ("rate", "hours"):
+        return None
+    named = _places_asked(index, q.raw)
+    if named and (not named[0] or not _place_has_page(index, named[1])):
+        return None                              # a place no page is about has nothing to recover
+    pages, paths = _page_list(index)
+    keys = [paths[p] for p in map(_path, synth.pick_pages(question, pages)) if p in paths]
+    keys = _pages_about(index, q, [set(p) for p in place_phrases(q.raw)] + (named[1] if named else [])) + keys
+    ev = _pages_evidence(index, q, keys, RECOVER_BUDGET) if keys else None
+    if ev is None or not ev.chunks:
+        return None
+    out = synth._llm(question, ev, index.view, asked, q.list_intent)
+    if not out or not out.get("answerable", False):
+        return None
+    accepted = synth._accept(question, q, ev, index.view, out, asked=asked)
+    if accepted is None or _says_absent(accepted[0], question) or RECOVER_ABSENT.search(accepted[0]) or ABSENT.search(accepted[0]):
+        return None                              # an answer that says something is not there is no recovery
+    text, cited, note = accepted
+    if q.attribute == "fee" and not retrieve.WIRE.search(q.raw):
+        focus = retrieve.fee_focus(index, q)
+        if focus[0] and not any(retrieve.chunk_cover(c, q, focus)[1] for c in cited):
+            return None                          # a fee line that names none of what was asked is a near miss, not its fee
+    seen, sources = set(), []
+    for c in cited:
+        vp = index.view.pages[c.key]
+        if (c.key, vp.snapshot_id) not in seen and len(sources) < MAX_SOURCES:
+            seen.add((c.key, vp.snapshot_id))
+            sources.append(Source(url=vp.page.url, snapshot_id=vp.snapshot_id, quote=c.text[:240]))
+    return Answer(text=text, sources=sources, confident=True, conflict_note=note or None)
+
+
+# "Mini-Max Loans: Add 1% to conventional rates": a program the site prices as another line's rate plus a stated amount
+MODIFIER_RE = re.compile(r"([A-Z][\w-]*(?:[ -][A-Z][\w-]*)?)\s+Loans?:\s*Add\s+(\d+(?:\.\d+)?)\s*%\s+to\s+([a-z]+(?:\s+[a-z]+)?)\s+rates?")
+HOW_MUCH_MORE = re.compile(r"\b(?:how much|by how much)\b[^?]{0,60}\b(?:higher|more|extra|above|over)\b|"
+                           r"\b(?:higher|more|extra)\b[^?]{0,40}\bthan\b|\b(?:difference|markup|surcharge|premium)\b", re.I)
+
+
+def _rate_modifiers(index: Index) -> list:
+    """The programs a live product page prices as another line's rate plus an amount: [(name, tokens, percent, base, chunk)]."""
+    found = getattr(index, "_modifiers", None)
+    if found is None:
+        found, seen = [], set()
+        for c in index.chunks:
+            vp = index.view.pages[c.key]
+            if c.is_row or vp.page.kind != "product" or vp.status != "fresh":
+                continue
+            for m in MODIFIER_RE.finditer(c.text):
+                toks = frozenset(tokenize(m.group(1)))
+                if toks and (toks, m.group(2)) not in seen:
+                    seen.add((toks, m.group(2)))
+                    found.append((m.group(1), toks, float(m.group(2)), m.group(3), c))
+        index._modifiers = found
+    return found
+
+
+# a person's biography sits under a heading that gives the name and the title under it: the title is in the section, not the text
+TITLE_ASK = re.compile(r"\b(?:title|role|position|job)\b|\bwho\s+(?:is|was)\b|\bwhat\s+does\b[^?]*\bdo\b", re.I)
+TITLE_ONLY = re.compile(r"\b(?:title|role|position|job)\b", re.I)
+
+
+def _with_heading_title(cited: list, question: str, text: str) -> str:
+    """"Name · Title" over the chunk the answer rests on, the name asked about: say the title ("Name is Title.") for a title
+    question, and put it before the biography for a who-is question, unless the answer already says it."""
+    low = set(tokenize(question))
+    for c in cited:
+        name, _, title = (c.section or "").partition(" · ")
+        if not title or not ingest.NAME_HEADING.fullmatch(name) or not (ingest.ROLE_WORD.search(title) or not ingest.NAME_HEADING.fullmatch(title)) \
+                or title.lower() in text.lower():
+            continue
+        if set(tokenize(name)) <= low:
+            lead = f"{name} is {title}."
+            return lead if TITLE_ONLY.search(question) else f"{lead} {text}"
+    return text
+
+
+def _staff_titles(index: Index) -> dict:
+    """{frozenset of name tokens: (name, title, chunk)} for every "Name · Title" section of a live product page (the staff
+    pages: a name heading and the title heading under it). A name given two different titles is left out. Built once per view."""
+    found = getattr(index, "_staff", None)
+    if found is None:
+        found, clash = {}, set()
+        for c in index.chunks:
+            name, _, title = (c.section or "").partition(" · ")
+            vp = index.view.pages[c.key]
+            if (not title or vp.status != "fresh" or vp.page.kind != "product" or not ingest.NAME_HEADING.fullmatch(name)
+                    or not (ingest.ROLE_WORD.search(title) or not ingest.NAME_HEADING.fullmatch(title)) or len(title) > 70):
+                continue
+            key = frozenset(tokenize(name))
+            if key in found and found[key][1].lower() != title.lower():
+                clash.add(key)
+            found.setdefault(key, (name, title, c))
+        for key in clash:
+            found.pop(key, None)
+        index._staff = found
+    return found
+
+
+def _respond_title(index: Index, question: str) -> Answer | None:
+    """"What is <Name>'s title?": the title the site's staff page gives under the name, whatever a blog post from years ago
+    says (a quote in an old article names the title the person held then)."""
+    if not TITLE_ONLY.search(question):
+        return None
+    low = set(tokenize(question))
+    hits = [v for k, v in _staff_titles(index).items() if k <= low]
+    if len(hits) != 1:
+        return None
+    name, title, c = hits[0]
+    vp = index.view.pages[c.key]
+    return Answer(text=f"{name} is {title}.", sources=[Source(url=vp.page.url, snapshot_id=vp.snapshot_id, quote=c.text[:240])],
+                  confident=True)
+
+
+# a question that sets the program aside ("not Mini-Max", "conventional vs Mini-Max", "the base rate") asks for the plain line
+SETS_ASIDE = re.compile(r"\b(?:not|non|without|excluding|except|instead\s+of|rather\s+than|versus|vs|other\s+than|besides|don['’]t|do\s+not|"
+                        r"base\s+rates?)\b", re.I)
+# a row of the line the footnote prices from: "Auto & Motorcycle Loans — 2024-27 Model Year, 60 Months: 6.39% APR"
+ROW_ANSWER = re.compile(r"^[^.:]+ — [^:]+: .*?\d%")
+
+
+def _on_footnoted_line(chunk, name: str, answer: str) -> bool:
+    """Is the base answer a row of the line the footnote sits under ("Auto Loan Rates: ... <Name> Loans: Add 1% ...")? The
+    footnote's own label ("Auto Loan Rates") names the line; the answer must name it too, or the amount is not for it."""
+    before = chunk.text[:max(chunk.text.find(name), 0)]
+    labels = re.findall(r"((?:[A-Z][\w&]*\s+){1,3})Rates?:", before)
+    words = {_stem(w.lower()) for w in re.findall(r"[A-Za-z]+", labels[-1])} - {_stem(w) for w in ("loan", "loans", "rate", "rates", "apr")} if labels else set()
+    return bool(words) and bool(words & set(tokenize(answer)))
+
+
+def _respond_modifier(index: Index, synth: Synthesizer, question: str, search: str | None, asked: date | None,
+                      before: date | None, dated: dict | None) -> Answer | None:
+    """A rate question that names a program priced as another line plus an amount: that line's rate for the rest of the
+    question, each APR raised by the amount ("Mini-Max loans add 1% to the conventional rate: 6.39% APR ..."); the rule alone
+    when the question asks how much more, or when no one row of the base line answers it."""
+    words = {t for t in tokenize(search or question)}
+    hit = next((m for m in _rate_modifiers(index) if m[1] <= words or _stem(re.sub(r"[\s-]+", "", m[0].lower())) in words), None)
+    if hit is None or SETS_ASIDE.search(question):
+        return None
+    name, toks, pct, base, chunk = hit
+    vp = index.view.pages[chunk.key]
+    rule = f"{name} loans add {pct:g}% to {base} rates."
+    sources = [Source(url=vp.page.url, snapshot_id=vp.snapshot_id, quote=chunk.text[:240])]
+    if HOW_MUCH_MORE.search(question):
+        return Answer(text=rule, sources=sources, confident=True)
+    stripped = re.sub(r"\b" + r"[\s-]*".join(re.escape(w) for w in re.split(r"[\s-]+", name.lower())) + r"\b(?:\s+(?:loans?|program|plan))?",
+                      " ", search or question, flags=re.I)
+    plain = copy.copy(synth)
+    plain.enabled = False                                # the base line's own row: no model, so the figures are the site's
+    ans = _respond_core(index, plain, stripped, None, asked, before, dated, modifiers=False)
+    figures = re.findall(r"(\d+(?:\.\d+)?)%", ans.text) if ans.confident else []
+    if not figures or len(set(figures)) > 6 or not ROW_ANSWER.search(ans.text) or not _on_footnoted_line(chunk, name, ans.text):
+        return Answer(text=rule, sources=sources, confident=True)
+    raised = re.sub(r"(\d+(?:\.\d+)?)%", lambda m: f"{float(m.group(1)) + pct:.2f}%", ans.text)
+    return Answer(text=f"{name} loans add {pct:g}% to {base} rates: {raised}", sources=ans.sources[:MAX_SOURCES - 1] + sources,
+                  confident=True)
+
+
+def _respond_core(index: Index | None, synth: Synthesizer, question: str, search: str | None = None,
+                  asked: date | None = None, before: date | None = None, dated: dict | None = None,
+                  modifiers: bool = True) -> Answer:
     """`before`: the question asks about a day before the first crawl, answered from the first crawl. The answer
     stands only if nothing it rests on took effect after that day (see _too_new)."""
     if index is None:
@@ -151,6 +337,10 @@ def _respond(index: Index | None, synth: Synthesizer, question: str, search: str
     view = index.view
     q = parse_query(search or question)       # the model still sees the full question
     q.spelled_counts = synth.enabled          # a count a page spells in words is for the model to read
+    if modifiers and q.attribute == "rate" and (modified := _respond_modifier(index, synth, question, search, asked, before, dated)):
+        return modified
+    if (titled := _respond_title(index, question)) is not None:
+        return titled
     linking = LINK_Q.search(question) is not None
     vocab = _anchor_vocab(index) if linking else None
     named = _title_names(index) if linking else None
@@ -159,6 +349,9 @@ def _respond(index: Index | None, synth: Synthesizer, question: str, search: str
         q.expansion = q.expansion + [_stem("join")]        # "sign up as a member": the link to join
         q.tokens = q.tokens + [_stem("join")]
     ev = select(index, q)
+    named = _places_asked(index, q.raw)
+    if named and not named[0]:
+        return Answer(text=REFUSAL, confident=False)       # a branch or ATM asked of a place that no page of the site writes
     lead_split = count_clause(q.raw) if q.attribute == "count" else fee_clause(q.raw) if q.attribute == "fee" else None
     antecedent = []
     if lead_split and not ev.supported:
@@ -188,6 +381,8 @@ def _respond(index: Index | None, synth: Synthesizer, question: str, search: str
         ev.context = _with_count_chunks(index, q, ev, list(q.tokens) + antecedent)
     if q.list_intent and synth.enabled:
         ev.context = _with_listed_pages(index, q, ev)
+    if synth.enabled and named and q.attribute in (None, "address") and _place_has_page(index, named[1]):
+        ev.context = _with_place_chunks(index, q, ev, named[1])
     if q.year_kind and not _model_year_rows(index, q):
         return Answer(text=REFUSAL, confident=False)       # the vehicle's year and term fit no row of its kind
     if q.year_guess:
@@ -213,10 +408,21 @@ def _respond(index: Index | None, synth: Synthesizer, question: str, search: str
     text, cited, confident, note = synth.compose(told, q, ev, view, asked,
                                                  lookup=lambda text: select(index, parse_query(text)),
                                                  second_look=second_look)
+    if not confident and q.list_intent and q.attribute is None and not before:
+        listed = [c for c in _outline_chunks(index, q) if " lists: " in c.text]
+        if listed:                                   # the model declined a list the best page spells out heading by heading
+            vp = view.pages[listed[0].key]
+            return Answer(text=listed[0].text.split(". ")[0].rstrip(".") + ".", confident=True,
+                          sources=[Source(url=vp.page.url, snapshot_id=vp.snapshot_id, quote=listed[0].text[:240])])
     if not confident or (before and any(_too_new(c, view, before, dated or {}) for c in cited)):
         return Answer(text=REFUSAL, confident=False)
+    if named and (NO_SUCH.search(text) or ABSENT.search(text)) and not _is_a_branch(index, named[1]) \
+            and not any(_page_is_about(index, c, named[1]) for c in cited):
+        return Answer(text=REFUSAL, confident=False)       # "no branch in X is listed" and nothing cited is about X: no other figure answers it
     if q.attribute == "count" and synth.enabled:
-        text = spelled_as_digits(text)                    # "Thirty-two" on the page: the member and the scorer read "32"
+        text = spelled_as_digits(text, small=True)        # "Thirty-two" on the page: the member and the scorer read "32"
+    if TITLE_ASK.search(question):
+        text = _with_heading_title(cited, question, text)
     if fact:
         text, stated = fact_guard(text, fact)
         if stated is not None:
@@ -535,7 +741,9 @@ CHANGE_ASK = re.compile(
     r"\bhow (?:did|has|have|had)\b[^?]{0,120}?\bchange[ds]?\b|"
     r"\b(?:did|has|have|had)\b[^?]{0,120}?\b(?:go(?:ne)? (?:up|down)|went (?:up|down)|increase[ds]?|"
     r"decrease[ds]?|rise[ns]?|rose|fall(?:en)?|fell|drop(?:ped)?|change[ds]?)\b|"
-    r"\bwhat (?:was|is|were) the change\b|\bwhat happened to\b", re.I)
+    r"\bwhat (?:was|is|were) the change\b|\bwhat happened to\b|"
+    r"\bwhat(?:['’]s|\s+has|\s+have)?\s+(?:been\s+)?(?:changed|changes?|different|updated)\b|"
+    r"\bwhat\s+(?:are|were)\s+the\s+(?:changes|differences)\b|\b(?:anything|something)\s+(?:changed|different)\b", re.I)
 # "Was it the same on May 12 and June 9, 2026?", "compare … on A with … on B": a comparison across two dates
 COMPARE_ASK = re.compile(r"\b(?:was|were|is|are)\b[^?]{0,120}?\bthe same\b|\bcompare[ds]?\b|\b(?:differ|different)\b", re.I)
 _MONTH = "|".join(MONTHS) + "|sept?|jan|feb|mar|apr|jun|jul|aug|oct|nov|dec"
@@ -1168,6 +1376,10 @@ def match_fact(facts: list[dict], q, index: Index) -> dict | None:
     limit = FACT_RARE * max(1, len(index.chunks))
     best = None
     for f in facts:
+        if f["topic"].startswith("Boilerplate figure ("):
+            if _asks_the_figure(q, f["topic"]):
+                return f                               # "how much in assets does <the credit union> have?"
+            continue
         # a count is the fact asked about only when the question counts that same thing
         if re.match(r"\s*\d", f.get("resolution", "")) and not (
                 q.attribute == "count" and q.count_noun and q.count_noun in set(tokenize(f["topic"]))):
@@ -1178,8 +1390,18 @@ def match_fact(facts: list[dict], q, index: Index) -> dict | None:
     return best[1] if best else None
 
 
+def _asks_the_figure(q, topic: str) -> bool:
+    """Is the question only about the thing a boilerplate figure counts ("assets", "membership"), plus the site's own name:
+    no place, and no other word that would make it a different question ("members who got a payout")?"""
+    label = topic.split("(", 1)[1].split(")", 1)[0]
+    labels = {label} | ({_stem("member"), _stem("membership")} if label in (_stem("member"), _stem("membership")) else set())
+    site = {_stem(w) for w in retrieve.SITE_WORDS}
+    other = {t for t in q.tokens if t not in GENERIC and t not in STOP and t not in site and not t[0].isdigit()} - labels
+    return bool(labels & set(q.tokens)) and not other and not FACILITY_ASK.search(q.raw)
+
+
 def _fact_token(value: str) -> str:
-    m = re.match(r"\s*([\d,]+|[a-z]+)", value.lower())          # "12 branches" -> 12, "third" -> third
+    m = re.match(r"\s*(\$[\d,.]+(?:\s+(?:billion|million))?|[\d,]+|[a-z]+)", value.lower())   # "12 branches" -> 12, "$3.6 billion"
     return m.group(1) if m else ""
 
 
@@ -1190,7 +1412,7 @@ def _beaten(fact: dict) -> list:
     for v in fact["_losers"]:
         m = re.match(r"\s*([\d,]+)\+?\s+([a-z]+)", v.lower())
         pats.append(rf"\b{re.escape(m.group(1))}\+?\s+(?:[\w’'-]+\s+){{0,2}}{re.escape(m.group(2)[:5])}" if m
-                    else rf"\b{re.escape(v)}\b")
+                    else rf"(?<![\w$]){re.escape(v)}(?!\w)")
     for s in fact.get("_streaks", ()):
         if m := re.search(r"\b\w+\s+(?:years?\s+in\s+a\s+row|consecutive\s+years?|straight\s+years?)", s, re.I):
             pats.append(rf"\b{re.escape(m.group(0))}\b")
@@ -1204,7 +1426,7 @@ def fact_guard(text: str, fact: dict) -> tuple[str, Chunk | None]:
     if any(p.search(text) for p in _beaten(fact)):
         return sentence, fact["_win_chunk"]
     win = _fact_token(fact["resolution"])
-    if not win or re.search(rf"\b{re.escape(win)}\b", text, re.I):
+    if not win or re.search(rf"(?<![\w$]){re.escape(win)}(?!\w)", text, re.I):
         return text, None
     return f"{text.rstrip()} {sentence}", fact["_win_chunk"]
 
@@ -1416,6 +1638,108 @@ def _with_count_chunks(index: Index, q, ev: Evidence, tokens: list) -> list:
     return have + out
 
 
+def _places_asked(index: Index, raw: str) -> tuple | None:
+    """(any named place is on a page, the places as sets of stems) for a branch, ATM or lobby asked of a town written next
+    to the facility ("a branch in davenport"). A lower-case word that is on the site ("the same lobby hours") is no town;
+    None when the question names none."""
+    places = []
+    for word, capitalised in facility_places(raw):
+        stems = set(tokenize(word))                           # tokens are the index's own stems
+        if capitalised or not any(index.postings.get(t) for t in stems):
+            places.append(stems)
+    if not places:
+        return None
+    return any(index.postings.get(t) for p in places for t in p), places
+
+
+DATELINE = re.compile(r"(?:^|\n)\s*([A-Z][A-Z .'’-]{2,},\s*[A-Za-z.]+)\s*[–—-]")
+
+
+DATELINE_MID = re.compile(r"(?:^|\n|\)\s)([A-Z][A-Z .'’-]{2,},\s*[A-Za-z.]+)\s*[–—-]")
+FACILITY_WORD = re.compile(r"\b(?:branch|office|learning lab|lab|location|ATM|lobby|drive-?up)\b", re.I)
+FACILITY_FACT = re.compile(r"\b(?:located|address|phone number|hours)\b", re.I)
+
+
+def _facility_dateline(text: str):
+    """A dateline that follows a byline on the same line ("... (link) MAPLE GROVE, Ohio–Finishing touches ..."), accepted only for a
+    page about a facility: a facility word within 500 characters after it and an address, phone number or hours on the page. A
+    member's story datelined from their hometown is not a page about a place the credit union is in."""
+    m = DATELINE_MID.search(text[:1500])
+    if m and FACILITY_WORD.search(text[m.end():m.end() + 500]) and FACILITY_FACT.search(text[:3000]):
+        return m
+    return None
+
+
+def _page_subjects(index: Index) -> dict:
+    """Each page's subject words: its title and its dateline ("MAPLE GROVE, Ohio-"). A page that only mentions a place in
+    its text is not about it. Built once per view."""
+    subjects = getattr(index, "_subjects", None)
+    if subjects is None:
+        texts = _page_texts(index)
+        subjects = index._subjects = {}
+        for key, vp in index.view.pages.items():
+            if vp.status != "missing":
+                text = texts.get(key, "")
+                dateline = DATELINE.search(text[:1500]) or _facility_dateline(text)
+                subjects[key] = set(tokenize(f"{vp.page.title} {dateline.group(1) if dateline else ''}"))
+    return subjects
+
+
+def _pages_about(index: Index, q, places: list, n: int = 2) -> list:
+    """The pages named for a place in their title or opening (a press release about one branch: its dateline), those that
+    share most with the question first. Press releases are not in the site's page list, so a question about one place's
+    staff or phone number would never reach them."""
+    if not places:
+        return []
+    want, subjects = set(q.tokens), _page_subjects(index)
+    keys = [k for k, words in subjects.items() if index.view.pages[k].status == "fresh" and any(p <= words for p in places)]
+    return sorted(keys, key=lambda k: (-len(want & subjects[k]), k))[:n]
+
+
+PHONE_ADDRESS_ASK = {_stem(w) for w in ("phone", "number", "address", "call", "street", "located", "where")}
+PHONE_ADDRESS_Q = re.compile(r"\b(?:phone|number|address|call|street|located|where)\b", re.I)
+
+
+def _with_place_chunks(index: Index, q, ev: Evidence, places: list) -> list:
+    """A question about one branch ("the phone number and address of the Grimes branch") shows the model the paragraphs of the
+    pages about that branch that share words with it, besides what the search ranked first: the phone number and the address
+    are often two paragraphs of one page."""
+    have = ev.context or ev.chunks
+    if q.attribute != "address" and not PHONE_ADDRESS_Q.search(q.raw):
+        return have                                 # whether a branch is still open or what became of it: the page's own answer
+    seen = {c.id for c in have}
+    want = set(q.tokens) | PHONE_ADDRESS_ASK
+    extra = []
+    for key in _pages_about(index, q, places, 2):
+        cands = [(len(want & set(c.tf or ())), c) for c in index.view.pages[key].page.chunks if c.id not in seen and not c.is_row]
+        extra += [c for n, c in sorted(cands, key=lambda x: (-x[0], x[1].id)) if n][:3]
+    return have + extra
+
+
+def _is_a_branch(index: Index, places: list) -> bool:
+    """Does a page that is not an article give one of the places an address? Then it is a branch or an ATM the site lists;
+    a town that only news and blog posts mention is not."""
+    for p in places:
+        first = next(iter(p))
+        for pos, _ in index.postings.get(first, ()):
+            c = index.chunks[pos]
+            if c.kind != "article" and p <= set(c.tf or ()) and ADDRESS_EV.search(c.text):
+                return True
+    return False
+
+
+def _place_has_page(index: Index, places: list) -> bool:
+    """Is some page of the site about one of the places (named in its title or its opening)?"""
+    return any(p <= words for words in _page_subjects(index).values() for p in places)
+
+
+def _page_is_about(index: Index, c: Chunk, places: list) -> bool:
+    """Does the page a chunk is on name one of the places in its title or its opening (a heading, a dateline)? A page that
+    only mentions a place in passing ("shared branches in Arizona") is not about it."""
+    opening = _page_subjects(index).get(c.key, set())
+    return any(p <= opening for p in places)
+
+
 def _model_year_rows(index: Index, q) -> list:
     """A year written beside a make or model ("a 2022 <make> <model>") can be the model year of any line that prices by
     model year. Every such row of a live product page that the year and the asked term fit, the most authoritative of
@@ -1439,6 +1763,73 @@ def _model_year_rows(index: Index, q) -> list:
 
 
 LIST_PAGES, LIST_BUDGET = 2, 8000
+
+
+OUTLINE_SKIP = re.compile(r"\b(?:frequently|faq|handpicked|fine print|contact|questions|team|carriers?|disclosures?|related|resources?|about|"
+                          r"footer|menu|calculators?|support|help|rates?)\b", re.I)
+OUTLINE_GENERIC = {_stem(w) for w in ("kind kinds type types list every all what which can offer offers have does do you your u guy guys "
+                                      "will get need maybe later run provide through for apply open individuals individual personal "
+                                      "rate rates apr would like know please sponsor give out sell are the").split()}
+
+
+def _page_outlines(index: Index) -> dict:
+    """{page key: (title, [section headings that name something], lead text)} for live product pages: a landing page's tiles
+    ("Kayak Loan", "Canoe Loan", ...) are its sections. Built once per view."""
+    found = getattr(index, "_outlines", None)
+    if found is None:
+        found = index._outlines = {}
+        for key, vp in index.view.pages.items():
+            if vp.status != "fresh" or vp.page.kind != "product":
+                continue
+            secs = list(dict.fromkeys((c.section or "").split(" · ")[0] for c in vp.page.chunks if c.section))
+            secs = [x for x in secs if x and len(x) < 45 and not OUTLINE_SKIP.search(x)]
+            lead = next((c.text for c in vp.page.chunks if not c.is_row and len(c.text) > 60), "")
+            found[key] = (vp.page.title.split("|")[0].strip(), secs, lead)
+    return found
+
+
+def _outline_chunks(index: Index, q) -> list:
+    """For a list question, one chunk per best page that lists what the page offers: its section headings (a landing page's
+    product tiles), and for a page named for the thing asked ("Recreational Loans") its opening sentence. Pages rank by the
+    question's salient words in the title and headings; business pages only when the question says business, personal ones
+    when it says personal or individuals."""
+    raw = q.raw.lower()
+    business = re.search(r"\bbusiness", raw) is not None
+    personal = re.search(r"\b(?:personal|individuals?|my|me)\b", raw) is not None
+    want = {t for t in q.tokens if t not in OUTLINE_GENERIC}
+    if re.search(r"\bindividuals?\b", raw):
+        want.add(_stem("personal"))                  # "loans for individuals": the pages named personal
+    scored, outlines = [], _page_outlines(index)
+    df = Counter(t for title, secs, _ in outlines.values() for t in want & set(tokenize(" ".join([title] + secs))))
+    weight = {t: math.log(1 + len(outlines) / df[t]) for t in df}        # a word few pages use says more than "auto" or "loan"
+    rare = min(df, key=df.get) if df and min(df.values()) <= 5 else None
+    for key, (title, secs, lead) in outlines.items():
+        in_title = want & set(tokenize(title))
+        sc = (3 * sum(weight.get(t, 0) for t in in_title)
+              + sum(weight.get(t, 0) for t in {t for x in secs for t in want & set(tokenize(x))}))
+        if rare and rare in in_title:
+            sc += 10                                                      # a page named for the rarest word asked
+        if sc > 0:
+            sc += min(12, 3 * sum(k.startswith(key + "/") for k in outlines))   # a landing page: its child pages are the lines it offers
+            sc += 0.1 * min(10, sum(len(x.split()) <= 3 for x in secs))   # tiles are short names
+        if sc > 0 and personal and not business and ("/personal" in key or "personal" in title.lower()):
+            sc += 4
+        if "/business" in key and not business and personal:
+            sc *= 0.4
+        if "/personal" in key and business:
+            sc *= 0.4
+        if sc > 0:
+            scored.append((sc, key, title, secs, lead))
+    scored.sort(key=lambda x: (-x[0], x[1]))
+    out = []
+    for sc, key, title, secs, lead in scored[:2]:
+        named = bool(want & set(tokenize(title)))
+        text = (f"{title} lists: " + "; ".join(secs) + "." if len(secs) >= 3 else "") + (f" {title}: {lead[:260]}" if lead and named else "")
+        if not text.strip():
+            continue
+        text = text.strip()
+        out.append(Chunk(-1, key, "product", text, text))
+    return out
 
 
 def _with_listed_pages(index: Index, q, ev: Evidence) -> list:
@@ -1467,6 +1858,8 @@ def _with_listed_pages(index: Index, q, ev: Evidence) -> list:
         if titles:
             text = "Pages under this one: " + "; ".join(dict.fromkeys(titles))
             out.append(Chunk(-1, keys[0], "product", text, text))
+    if q.attribute is None:
+        out = _outline_chunks(index, q) + out         # the outline first: it names every line the best pages offer
     top = next((c for c in ev.chunks if c.is_row and retrieve.supports(c, q)), None)
     if top is not None and retrieve.LIST_EACH.search(q.raw):
         # "what APR at each term?": every row of the table the best row sits in that the question's other words fit

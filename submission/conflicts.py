@@ -38,10 +38,17 @@ COUNT_FACT_RE = re.compile(r"((?:[a-z’'-]+\s+){0,3})(?<![\d,.$])(?!(?:19|20)\d
 # Measures and amounts, not counted things: "30 minutes", "5 percent", "2 million".
 NOT_COUNTED = {"second", "minute", "hour", "day", "week", "month", "year", "time", "mile", "percent", "point",
                "dollar", "cent", "million", "billion", "thousand", "hundred", "share", "step", "way", "tip"}
+# A large figure in a boilerplate sentence: dollars in millions or billions ("assets exceeding $3.6 billion") or a number with
+# thousands separators ("membership has grown to more than 181,000"), whatever noun follows (or none).
+# what a credit union's boilerplate says about itself and what members look up: its assets and its membership
+INSTITUTION_FIGURES = {_stem(w) for w in ("assets", "members", "membership")}
+FIGURE_RE = re.compile(r"(\$\s?\d[\d,.]*\s?(?:billion|million)\b|(?<![\d,.$])\d{1,3}(?:,\d{3})+(?![\d,]))")
 PROSE_RATE_RE = re.compile(r"((?:[\w$-]+\s+){1,5}?(?:apy|apr|rate|dividend)s?)\s*(?:is|of|:)?\s*"
                            r"(\d+(?:\.\d+)?\s*%)", re.I)
 QUANTITY_WORDS = {"over", "nearly", "more", "than", "about", "approximately", "almost", "around", "roughly",
                   "some", "of", "its"}
+FIGURE_LEAD = QUANTITY_WORDS | {"exceeding", "exceeds", "totaling", "totals", "total", "grown", "grew", "reached", "serving", "serves",
+                                "has", "have", "over", "than", "to", "approximately"}
 MAX_PCT_GAP = 2.0       # rows further apart than this are different products, not a stale copy
 
 
@@ -213,6 +220,19 @@ def statement_conflicts(view: View) -> list[dict]:
             if tail:
                 phrases[(key, f"{n} {noun}")].add(" ".join(tail + [n, noun]))
             shown.setdefault(key, f'Number of {noun}: "{" ".join((before + "N " + noun).split())}"')
+        for i, fm in enumerate(FIGURE_RE.finditer(sent) if repeated else ()):
+            value = " ".join(fm.group(1).split())
+            around = [re.findall(r"[a-z]+", sent[max(0, fm.start() - 60):fm.start()].lower()),
+                      re.findall(r"[a-z]+", sent[fm.end():fm.end() + 40].lower())]
+            before = [w for w in around[0] if w not in STOP][-4:]
+            after = [w for w in around[1] if w not in STOP][:2]
+            label = next((_stem(w) for w in reversed(before) if w not in FIGURE_LEAD), after[0] if after else "")
+            if label not in INSTITUTION_FIGURES:
+                continue
+            key = ("figure", label)                         # one fact per thing the figure counts: every wording of the line
+            facts[key][value].append(c)
+            said.setdefault((key, value, c.id), sent.strip())
+            shown.setdefault(key, f'Boilerplate figure ({label}): "{" ".join(before)} N {" ".join(after)}"'.replace("  ", " "))
         for om in ORD_RE.finditer(sent):
             ordinal, rest = om.groups()
             key = ("ordinal", " ".join(_stem(w) for w in re.findall(r"[a-z]+", rest.lower())))
@@ -231,9 +251,14 @@ def statement_conflicts(view: View) -> list[dict]:
                     said.setdefault((("rate", words), value, c.id), sent.strip())
                     shown.setdefault(("rate", words), f"Quoted rate: {' '.join(m.group(1).split())}")
     out = []
+    # the pages of every count that disagrees: a figure of the same boilerplate paragraph conflicts with it, any other doesn't
+    count_pages = [{c.key for cs in by_value.values() for c in cs} for (kind, _), by_value in facts.items()
+                   if kind == "count" and len(by_value) >= 2]
     for (kind, key), by_value in facts.items():
         pages = {c.key for cs in by_value.values() for c in cs}
-        if len(by_value) < 2 or len(pages) < (5 if kind == "count" else 2):
+        if len(by_value) < 2 or len(pages) < (5 if kind in ("count", "figure") else 2):
+            continue
+        if kind == "figure" and not any(len(pages & cp) >= 3 for cp in count_pages):
             continue
         best = {v: min(cs, key=lambda c: (c.expired_on is not None, _rank(c, view))) for v, cs in by_value.items()}
         win_val = min(best, key=lambda v: (best[v].expired_on is not None,
