@@ -2913,6 +2913,27 @@ class Rev50(unittest.TestCase):
         for item in ("Kayak Pay", "Canoe Pay", "Raft Pay"):
             self.assertIn(item, text)
 
+    def test_duration_questions_skip_the_link_shortcut_and_a_year_asked_puts_its_figure_first(self):
+        from solution import DURATION_ASK, EXISTS_Q
+        from synth import PERIOD_YEAR
+        self.assertTrue(DURATION_ASK.search("A friend sent a referral link. How long do I have to open it?"))
+        self.assertIsNone(DURATION_ASK.search("What is the link to apply?"))
+        self.assertEqual(PERIOD_YEAR.search("how much did members save in 2029?").group(1), "2029")
+        self.assertIsNone(PERIOD_YEAR.search("the 2029-30 model year"))
+        self.assertTrue(EXISTS_Q.search("Is there a Canoeco branch in Maple Grove?"))
+        self.assertIsNone(EXISTS_Q.search("What are the lobby hours at the Maple Grove branch?"))
+
+    def test_a_town_with_a_release_titled_for_its_facility_is_a_facility_town_and_a_member_story_town_is_not(self):
+        lab = ("# Canoeco celebrates completion of newest learning lab\n\nJane Doe (canoeco.example.org/a/jane-doe) MAPLE GROVE, Ohio–Finishing touches "
+               "were completed at the new branch, a learning lab, located at 5 Quay Road. The phone number for the lab is (555) 010-0199. Hours: 9-5.\n")
+        story = ("# A couple pays off their boat\n\nJane Doe (canoeco.example.org/a/jane-doe) HOLLOW CREEK, Ohio–A couple at the lake paid off "
+                 "a boat loan and mention a branch visit and the hours they like.\n")
+        ks, _ = self._site([("news/lab", lab), ("learn/blog/boat", story), ("about", Rev47.ABOUT)])
+        from solution import _facility_towns
+        towns = _facility_towns(ks._indexes[-1])
+        self.assertTrue(any(set(tokenize("maple grove")) <= t for t in towns), towns)
+        self.assertFalse(any(set(tokenize("hollow creek")) <= t for t in towns), towns)
+
     # --- vehicle list ----------------------------------------------------------------------------------------------------
     def test_more_model_words_each_name_one_kind_and_the_plain_english_ones_stay_out(self):
         from retrieve import VEHICLE_KIND

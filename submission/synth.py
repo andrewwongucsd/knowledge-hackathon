@@ -251,6 +251,7 @@ WIRE_KIND_NAMED = {"incoming": r"\b(?:incoming|inbound|receiv\w*)\b", "domestic"
                    "international": r"\b(?:international\w*|abroad|overseas|foreign)\b"}
 
 
+PERIOD_YEAR = re.compile(r"\b(?:in|during|for|of)\s+(?:the year\s+)?(20[12]\d)\b(?!\s*[-/])", re.I)
 YES_NO_ASK = re.compile(r"^\s*(?:can|could|do|does|is|are|will)\s", re.I)
 ENUM_RUN = re.compile(r"\b[A-Z][a-z]+(?: [A-Z][a-z]+)?, [A-Z][a-z]+(?: [A-Z][a-z]+)?,? (?:or|and) [A-Z][a-z]+(?: [A-Z][a-z]+)?\b")
 ENUM_GENERIC = {_stem(w) for w in "can could do does is are will you your i my me we our the a an to and or of in on for with kind kinds type types list "
@@ -611,7 +612,13 @@ class Synthesizer:
 
     def _llm(self, question: str, ev: Evidence, view: View, asked: date | None = None, listing: bool = False,
              guess: bool = False) -> dict | None:
-        excerpts = "\n\n".join(f"[{i}] ({describe(c, view)})\n{c.text}" for i, c in enumerate(_llm_chunks(ev), 1))
+        chunks = _llm_chunks(ev)
+        year, stated = PERIOD_YEAR.search(question), []
+        if year:                               # "how much did members save in 2025": the excerpts that state 2025 and a figure first
+            stated = [c for c in chunks if re.search(rf"\b{year.group(1)}\b", c.text) and re.search(r"\d[\d,.]*\s*(?:million|billion|%)|\$\s?\d", c.text)]
+            if stated and len(stated) < len(chunks):
+                chunks = stated + [c for c in chunks if c not in stated]
+        excerpts = "\n\n".join(f"[{i}] ({describe(c, view)})\n{c.text}" for i, c in enumerate(chunks, 1))
         # A dated question is answered from the site as it stood that day, i.e. the newest crawl
         # on or before it; showing the crawl's own (earlier) day reads as "can't confirm".
         if asked and asked < view.taken_on:
@@ -621,6 +628,10 @@ class Synthesizer:
                     f"before it, or none).")
         else:
             head = f"Website snapshot date: {(asked if asked and asked > view.taken_on else view.taken_on).isoformat()}"
+        if year and stated:
+            head += (f"\nThe member asks about {year.group(1)}: use the figure the excerpts state for {year.group(1)}, not one stated "
+                     f"for another year or rounded in a different article. Give the figure exactly as the excerpt writes it; do not round it or "
+                     f"restate it in other units.")
         if guess:                              # a year beside a word that may be a vehicle's make or model
             head += ("\nThe member gives a year beside a name that may be a vehicle's make or model. If it is a vehicle, answer with "
                      "the row of the product line that vehicle is financed under; if it is not a vehicle, set answerable=false.")

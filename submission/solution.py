@@ -371,7 +371,7 @@ def _respond_core(index: Index | None, synth: Synthesizer, question: str, search
         return modified
     if (titled := _respond_title(index, question)) is not None:
         return titled
-    linking = LINK_Q.search(question) is not None
+    linking = LINK_Q.search(question) is not None and not DURATION_ASK.search(question)
     vocab = _anchor_vocab(index) if linking else None
     named = _title_names(index) if linking else None
     joining, _, wanted = joining_info(q, vocab, named) if linking else (False, set(), set())
@@ -449,6 +449,9 @@ def _respond_core(index: Index | None, synth: Synthesizer, question: str, search
     if named and (NO_SUCH.search(text) or ABSENT.search(text)) and not _is_a_branch(index, named[1]) \
             and not any(_page_is_about(index, c, named[1]) for c in cited):
         return Answer(text=REFUSAL, confident=False)       # "no branch in X is listed" and nothing cited is about X: no other figure answers it
+    if named and confident and EXISTS_Q.search(question) and not _is_a_branch(index, named[1]) \
+            and not (set(tokenize(text)) & {t for p in named[1] for t in p}):
+        return Answer(text=REFUSAL, confident=False)       # "the branches shown are in A, B and C" never names the town asked about
     if q.attribute == "count" and synth.enabled:
         text = spelled_as_digits(text, small=True)        # "Thirty-two" on the page: the member and the scorer read "32"
     if TITLE_ASK.search(question):
@@ -1000,6 +1003,9 @@ def strip_temporal(question: str, same_view, stated=frozenset()) -> str:
 
 LINK_Q = re.compile(r"\b(link|url|web ?page|website address|web ?address)\b|"
                     r"\b(?:what|which)(?:['’]s|\s+is|\s+are)?\s+(?:the\s+|your\s+)?(?:web)?(?:site|page)\b", re.I)
+# a question that asks how long or how much, with the word "link" only describing something else ("a referral link by email.
+# How long do I have to open an account?"), asks for the sentence, not the link
+DURATION_ASK = re.compile(r"\bhow (?:long|soon|much|many (?:days|weeks|months|years|business days))\b|\bdeadline\b", re.I)
 LINK_RE = re.compile(r"([^()\n]{0,80})\(([a-z0-9.-]+\.[a-z]{2,}(?:/[^)\s]*)?)\)")
 LINK_WORDS = set(tokenize("link url use see find page web webpage website address where visit view check look browse"))
 MEDIUM_WORDS = set(tokenize("online"))      # how, not what: "join online" asks for the link to join
@@ -1668,6 +1674,32 @@ def _with_count_chunks(index: Index, q, ev: Evidence, tokens: list) -> list:
     return have + out
 
 
+def _facility_towns(index: Index) -> list:
+    """Towns (as sets of stems) the site has a facility page for: a release datelined there whose title says what the facility is
+    ("... celebrates completion of newest learning lab"), and at most three other pages datelined there (a town of member
+    stories, or the headquarters town, is no facility's town). Built once per view."""
+    found = getattr(index, "_towns", None)
+    if found is None:
+        facility, other = Counter(), Counter()
+        for key, text in _page_texts(index).items():
+            vp = index.view.pages[key]
+            if vp.status == "missing":
+                continue
+            m = DATELINE.search(text[:1500]) or _facility_dateline(text)
+            if not m:
+                continue
+            town = m.group(1).split(",")[0].strip().lower()
+            (facility if FACILITY_WORD.search(f"{vp.page.title} {key}".replace("-", " ")) else other)[town] += 1
+        found = index._towns = [set(tokenize(t)) for t in facility if other[t] <= 3]
+    return found
+
+
+PLACE_ASK = re.compile(r"\b(?:phone|number|address|call|street|located|where|hours|open|close|closes|opens)\b|#", re.I)
+
+
+EXISTS_Q = re.compile(r"\b(?:is|are) there\b|\bdo(?:es)?\s+(?:\w+\s+){0,3}(?:have|operate|keep)\b|\bany\s+(?:\w+\s+){0,2}(?:branch|atm|office)", re.I)
+
+
 def _places_asked(index: Index, raw: str) -> tuple | None:
     """(any named place is on a page, the places as sets of stems) for a branch, ATM or lobby asked of a town written next
     to the facility ("a branch in davenport"). A lower-case word that is on the site ("the same lobby hours") is no town;
@@ -1677,6 +1709,9 @@ def _places_asked(index: Index, raw: str) -> tuple | None:
         stems = set(tokenize(word))                           # tokens are the index's own stems
         if capitalised or not any(index.postings.get(t) for t in stems):
             places.append(stems)
+    if not places and PLACE_ASK.search(raw):
+        words = set(tokenize(raw))                            # "the maple grove branch", "the maple grove canoeco ... phone #"
+        places = [t for t in _facility_towns(index) if t <= words]
     if not places:
         return None
     return any(index.postings.get(t) for p in places for t in p), places
