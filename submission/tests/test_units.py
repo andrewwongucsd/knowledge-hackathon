@@ -2984,6 +2984,72 @@ class Rev50(unittest.TestCase):
         self.assertIsNone(solution._recover(ks._indexes[-1], ks._synth, "What APR do you charge on a 9-month Maple Grove loan?", None, None))
 
 
+class Rev51(unittest.TestCase):
+    """A lead-in is not the fee asked about, sums of the member's own figures, an average payout is not a rate, a minimum
+    score asked outright, phone beside hours, "introductory" is "intro" (synthetic data only)."""
+
+    _site = Rev47._site
+
+    def test_sums_and_differences_of_the_figures_the_member_gave_are_not_made_up(self):
+        from synth import _sums_of_given
+        self.assertEqual(_sums_of_given("I keep $500 in savings and $1,500 in checking."), {2000.0, 1000.0})
+        self.assertEqual(_sums_of_given("I have no figures at all."), set())
+        self.assertEqual(max(_sums_of_given("$1 $2 $3 $4 $5 $6 $7")), 9.0)       # at most five figures: 4 + 5, never 6 or 7
+
+    def test_the_fee_asked_is_the_last_sentence_not_the_lead_in(self):
+        from solution import _asked_sentence
+        q = parse_query("My niece is 9 and saves coins in a jar. Does Canoeco have kids accounts? How much does it take to open one?")
+        self.assertEqual(_asked_sentence(q).raw, "How much does it take to open one?")
+        one = parse_query("How much does it take to open a kids account?")
+        self.assertIs(_asked_sentence(one), one)                                   # one sentence: unchanged
+        self.assertIsNone(_asked_sentence(q).focus)
+
+    def test_an_average_payout_is_not_a_dividend_rate(self):
+        self.assertIsNone(parse_query("What was the average dividend per participating member in 2022?").attribute)
+        self.assertEqual(parse_query("What is the dividend rate on savings?").attribute, "rate")
+        self.assertEqual(parse_query("What is the average dividend rate on savings?").attribute, "rate")
+
+    def test_a_minimum_score_asked_outright_leads_the_evidence(self):
+        from synth import MIN_SCORE_ASK, SCORE_REQUIRED
+        self.assertTrue(MIN_SCORE_ASK.search("is there a minimum credit score for the boat loan"))
+        self.assertTrue(MIN_SCORE_ASK.search("what credit score is required for the boat loan?"))
+        self.assertFalse(MIN_SCORE_ASK.search("what credit score do I need for your lowest rate?"))
+        self.assertTrue(SCORE_REQUIRED.search("for owners with a credit score of 640 or higher"))
+        self.assertFalse(SCORE_REQUIRED.search("pay your credit card bill online"))
+
+    HOURS = ("# Canoeco celebrates the Pinehurst branch\n\n"
+             "PINEHURST, Ohio–Canoeco Credit Union celebrated the completion of its remodeled Pinehurst branch with a ribbon "
+             "cutting attended by members, staff and the local chamber of commerce.\n\n"
+             "The Pinehurst branch is located at 12 Elm Road, and the phone number is (555) 410-2288. Branch hours are:\n\n"
+             "**Lobby** Monday-Thursday: 8:10 a.m.-4:35 p.m.\n\nFriday: 8:10 a.m.-5:25 p.m.\n\nSaturday: Closed\n\nSunday: Closed\n\n"
+             "**ABOUT CANOECO:**\n\nCanoeco is a not-for-profit financial cooperative owned by its members.\n")
+
+    def test_hours_asked_with_a_phone_number_give_both(self):
+        ks, _ = self._site([("pinehurst", self.HOURS)])
+        text = ks.answer("what's the phone number for the pinehurst branch and what time does the lobby close on fridays").text
+        self.assertIn("5:25 p.m.", text)
+        self.assertIn("(555) 410-2288", text)
+        hours_only = ks.answer("what time does the pinehurst lobby close on fridays").text
+        self.assertNotIn("410-2288", hours_only)                                   # not asked: not added
+
+    INTRO = ("# Rates\n\n## Canoe Credit Line\n\n| Loan Program | Annual Percentage Rate |\n|---|---|\n"
+             "| Canoe Intro Rate | 1.50% intro APR for the first 3 months, after that a variable rate as low as 6.10% APR will apply. |\n"
+             "| Canoe Standard | 6.10% |\n")
+
+    def test_introductory_matches_a_row_that_says_intro(self):
+        ks, _ = self._site([("rates", self.INTRO)])
+        for q in ("What is the introductory Canoe credit line rate?", "What is the Canoe credit line intro rate?"):
+            self.assertIn("1.50%", ks.answer(q).text, q)
+
+    def test_a_negation_the_member_wrote_is_not_the_site_saying_it_is_absent(self):
+        from solution import _negates_beyond
+        q = "Will they charge me a monthly fee? There is no direct deposit on the checking yet. How do I avoid it?"
+        self.assertFalse(_negates_beyond("With about $2,000 combined and no direct deposit yet, you would be charged.", q))
+        self.assertTrue(_negates_beyond("The site does not list a fee for that.", q))
+        self.assertTrue(_negates_beyond("There is no minimum for that account.", q))
+        self.assertFalse(_negates_beyond("You can open it with $25.", q))
+
+
 class Selftest(unittest.TestCase):
     """The kit's synthetic snapshots: as_of, an expired promo, a page that left the crawl, a refusal."""
 

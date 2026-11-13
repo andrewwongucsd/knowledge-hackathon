@@ -33,7 +33,7 @@ what whats which who whom how when where why your you our my me i we it its this
 from by as any all there their them they about tell give get please provide current
 currently now right today know like want need would there's many much have has had still offer""".split())
 # General banking synonyms: members say "mortgage", rate tables usually say "home loans".
-SYNONYMS = {"mortgage": ["home", "loan"], "cd": ["certificate"], "car": ["auto", "vehicle"],
+SYNONYMS = {"introductory": ["intro"], "mortgage": ["home", "loan"], "cd": ["certificate"], "car": ["auto", "vehicle"],
             "vehicle": ["auto"], "heloc": ["home", "equity", "line"],
             # standard US banking equivalents: a cashier's check is also called an official check; a wire abroad is international
             "cashier": ["official"], "foreign": ["international"], "overseas": ["international"]}
@@ -419,6 +419,10 @@ class Query:
         return {n for n, _ in self.terms} | self.years | {int(a) for a in self.amounts}
 
 
+PAYOUT_AVERAGE = re.compile(r"\baverage\s+(?:\w+\s+){0,2}?(?:dividend|payout|bonus)\b|\bparticipation\s+dividend", re.I)
+PERCENT_ASKED = re.compile(r"\b(?:rate|apy|apr|yield|percent(?:age)?)\b|%", re.I)
+
+
 def parse_query(question: str) -> Query:
     question = written_amounts(question)  # "15k", "fifteen thousand dollars", "between 10k and 25k": dollar amounts
     raw = question                       # the model still sees the member's own words
@@ -581,6 +585,8 @@ def parse_query(question: str) -> Query:
     if q.attribute == "rate" and (cue := NOT_A_RATE.search(raw_low)) and not VALUE_REQUESTED.search(raw_low) \
             and (word := RATE_Q.search(raw_low)) and cue.start() < word.start():
         q.attribute = None                              # "how long are the rates locked", "what credit score for the lowest rate": about a rate, not its value
+    if q.attribute == "rate" and PAYOUT_AVERAGE.search(raw_low) and not PERCENT_ASKED.search(raw_low):
+        q.attribute = None                              # "the average dividend per participating member": a payout in dollars, not a dividend rate
     _read_hours(q, raw_low)
     _read_counts(q, raw_low)
     _read_vehicle_year(q, raw_low)

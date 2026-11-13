@@ -38,7 +38,7 @@ from retrieve import (ASKS_ELSE, BACK_REFERENCE, CHAT_FILLERS, DIMENSIONS, FRAME
                       PLACE_DEICTIC, QUIET, RESTRICTION, STOP, Evidence, Index, _stem, carried_in_context, count_clause, fee_clause,
                       ADDRESS_EV, FACILITY_ASK, facility_places, lead_names, parse_query, place_phrases, proper_names, qualify, select, terms_in,
                       tokenize, use_proper_names, use_site_words)
-from synth import ABSENT, REFUSAL, Synthesizer, _says_absent, spelled_as_digits  # noqa: E402
+from synth import ABSENT, MIN_SCORE_ASK, REFUSAL, SCORE_REQUIRED, Synthesizer, _says_absent, spelled_as_digits  # noqa: E402
 
 
 class KnowledgeSystem:
@@ -186,6 +186,19 @@ RECOVER_ABSENT = re.compile(r"\b(?:no|none|not|never|nothing|nobody|without|only
                             r"don['’]t|didn['’]t|won['’]t|hasn['’]t|haven['’]t)\b", re.I)
 
 
+def _negates_beyond(text: str, question: str) -> bool:
+    """Does the answer carry a negation the question did not? "No direct deposit yet" in the answer is the member's own
+    "no direct deposit" handed back; "isn't offered" is the site's. A negation counts unless it and the two words after it
+    are in the question."""
+    asked = " ".join(re.findall(r"[a-z0-9']+", question.lower().replace("’", "'")))
+    said = re.findall(r"[a-z0-9']+", text.lower().replace("’", "'"))
+    for m in RECOVER_ABSENT.finditer(" ".join(said)):
+        phrase = " ".join(" ".join(said)[m.start():].split()[:3])
+        if phrase not in asked:
+            return True
+    return False
+
+
 def _respond(index: Index | None, synth: Synthesizer, question: str, search: str | None = None,
              asked: date | None = None, before: date | None = None, dated: dict | None = None) -> Answer:
     calls = synth.calls
@@ -193,6 +206,33 @@ def _respond(index: Index | None, synth: Synthesizer, question: str, search: str
     if ans.confident or index is None or not synth.enabled or before is not None or synth.calls != calls:
         return ans                              # only a question the rules declined before any model call can be recovered
     return _recover(index, synth, question, search, asked) or ans
+
+
+PHONE_ALSO = re.compile(r"\b(?:phone(?:\s+number)?|telephone|call(?:ing)?\s+(?:number|them)|number\s+(?:to|for)\s+call)\b", re.I)
+PHONE_NUMBER = re.compile(r"\(?\b\d{3}\)?[\s.-]\d{3}-\d{4}\b|\b\d{3}-\d{4}\b")
+PHONE_GIVEN = re.compile(r"\bphone(?:\s+number)?\b[^.()]{0,40}?\s(\(?\d{3}\)?[\s.-]\d{3}-\d{4})", re.I)
+
+
+def _with_phone(text: str, cited: list, ev: Evidence) -> str:
+    """An hours answer to a question that also asks for the phone number: the number, from a page the hours came from (a
+    branch page gives it beside the hours)."""
+    keys = {c.key for c in cited}
+    for c in [c for c in (ev.context or ev.chunks) if c.key in keys]:
+        m = PHONE_GIVEN.search(c.text)
+        if m:
+            return f"{text.rstrip()} The phone number is {m.group(1)}."
+    return text
+
+
+def _asked_sentence(q: Query) -> Query:
+    """The query as only its last sentence asks it: a lead-in ("My nephew saves in a coffee can. How much does it take to
+    open one?") is the member's story, and its words are not the fee asked about. A one-sentence question is unchanged."""
+    parts = [s for s in re.split(r"(?<=[.?!])\s+", q.raw.strip()) if s]
+    if len(parts) < 2:
+        return q
+    q2 = copy.copy(q)
+    q2.raw, q2.focus = parts[-1], None
+    return q2
 
 
 def _recover(index: Index, synth: Synthesizer, question: str, search: str | None, asked: date | None) -> Answer | None:
@@ -216,11 +256,11 @@ def _recover(index: Index, synth: Synthesizer, question: str, search: str | None
     if not out or not out.get("answerable", False):
         return None
     accepted = synth._accept(question, q, ev, index.view, out, asked=asked)
-    if accepted is None or _says_absent(accepted[0], question) or RECOVER_ABSENT.search(accepted[0]) or ABSENT.search(accepted[0]):
+    if accepted is None or _says_absent(accepted[0], question) or _negates_beyond(accepted[0], question) or ABSENT.search(accepted[0]):
         return None                              # an answer that says something is not there is no recovery
     text, cited, note = accepted
     if q.attribute == "fee" and not retrieve.WIRE.search(q.raw):
-        focus = retrieve.fee_focus(index, q)
+        focus = retrieve.fee_focus(index, _asked_sentence(q))
         if focus[0] and not any(retrieve.chunk_cover(c, q, focus)[1] for c in cited):
             return None                          # a fee line that names none of what was asked is a near miss, not its fee
     seen, sources = set(), []
@@ -452,6 +492,8 @@ def _respond_core(index: Index | None, synth: Synthesizer, question: str, search
     if named and confident and EXISTS_Q.search(question) and not _is_a_branch(index, named[1]) \
             and not (set(tokenize(text)) & {t for p in named[1] for t in p}):
         return Answer(text=REFUSAL, confident=False)       # "the branches shown are in A, B and C" never names the town asked about
+    if q.attribute == "hours" and PHONE_ALSO.search(question) and not PHONE_NUMBER.search(text):
+        text = _with_phone(text, cited, ev)               # "the phone number and what time does the lobby close": both asked
     if q.attribute == "count" and synth.enabled:
         text = spelled_as_digits(text, small=True)        # "Thirty-two" on the page: the member and the scorer read "32"
     if TITLE_ASK.search(question):
@@ -1572,6 +1614,8 @@ def _pages_evidence(index: Index, q, keys: list, budget: int | None = None) -> E
     live = lambda c: not (c.expired_on and c.expired_on < view.taken_on)
     best = [c for _, c in index.search(q.tokens, top=3000) if c.key in wanted and live(c)][:8]
     pages = [[c for c in view.pages[k].page.chunks if live(c)] for k in keys]
+    if MIN_SCORE_ASK.search(q.raw):        # "is there a minimum credit score": the paragraphs that state a score requirement lead
+        best = [c for page in pages for c in page if SCORE_REQUIRED.search(c.text)][:4] + best
     sections = {(c.key, c.section) for c in best if c.section}
     near = [c for page in pages for c in page if (c.key, c.section) in sections]
     opening = [c for page in pages for c in page[:5]]

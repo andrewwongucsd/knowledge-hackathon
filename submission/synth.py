@@ -90,6 +90,23 @@ def numbers(text: str) -> set[float]:
             for m in NUM_RE.finditer(text or "")}
 
 
+MIN_SCORE_ASK = re.compile(r"\b(?:minimum|at least|least|requirements?|required)\b[^?.]{0,30}\bcredit\s+score\b|"
+                           r"\bcredit\s+score\b[^?.]{0,30}\b(?:minimum|requirements?|required|at least)\b", re.I)
+SCORE_REQUIRED = re.compile(r"\bcredit\s+score\s+(?:of\s+)?(?:at least\s+)?\d{3}\b|\b\d{3}\s+(?:credit\s+)?score\b|\bscore\s+of\s+\d{3}\b", re.I)
+DOLLARS_GIVEN = re.compile(r"\$\s?(\d[\d,]*(?:\.\d+)?)")
+
+
+def _sums_of_given(question: str) -> set[float]:
+    """The totals and differences of the dollar figures the member gave ("$500 in the HSA and $1,500 in checking" -> 2,000):
+    a model that adds them up has not made a figure up. Two figures at a time, at most five of them."""
+    given = [float(m.replace(",", "")) for m in DOLLARS_GIVEN.findall(question or "")][:5]
+    out = set()
+    for i, a in enumerate(given):
+        for b in given[i + 1:]:
+            out |= {a + b, abs(a - b)}
+    return out
+
+
 def describe(c: Chunk, view: View) -> str:
     vp = view.pages[c.key]
     meta = [vp.page.url, vp.page.kind]
@@ -618,6 +635,11 @@ class Synthesizer:
             stated = [c for c in chunks if re.search(rf"\b{year.group(1)}\b", c.text) and re.search(r"\d[\d,.]*\s*(?:million|billion|%)|\$\s?\d", c.text)]
             if stated and len(stated) < len(chunks):
                 chunks = stated + [c for c in chunks if c not in stated]
+        min_score = MIN_SCORE_ASK.search(question) is not None
+        if min_score:                          # "is there a minimum credit score": the excerpts that state a score requirement first
+            said = [c for c in chunks if SCORE_REQUIRED.search(c.text)]
+            if said and len(said) < len(chunks):
+                chunks = said + [c for c in chunks if c not in said]
         excerpts = "\n\n".join(f"[{i}] ({describe(c, view)})\n{c.text}" for i, c in enumerate(chunks, 1))
         # A dated question is answered from the site as it stood that day, i.e. the newest crawl
         # on or before it; showing the crawl's own (earlier) day reads as "can't confirm".
@@ -632,6 +654,9 @@ class Synthesizer:
             head += (f"\nThe member asks about {year.group(1)}: use the figure the excerpts state for {year.group(1)}, not one stated "
                      f"for another year or rounded in a different article. Give the figure exactly as the excerpt writes it; do not round it or "
                      f"restate it in other units.")
+        if min_score:
+            head += ("\nThe member asks for a minimum credit score. A sentence that says a loan is for people \"with a credit score of N or "
+                     "higher\" (or \"at least N\") states that minimum for the loan it describes: answer with it.")
         if guess:                              # a year beside a word that may be a vehicle's make or model
             head += ("\nThe member gives a year beside a name that may be a vehicle's make or model. If it is a vehicle, answer with "
                      "the row of the product line that vehicle is financed under; if it is not a vehicle, set answerable=false.")
@@ -753,6 +778,7 @@ class Synthesizer:
             text = spelled_as_digits(text, said, small=True)           # "Thirty-two" on the page, asked how many: the figure
         allowed = (numbers(question) | numbers(" ".join(f"{c.text} {describe(c, view)}" for c in shown))
                    | {float(v) for v in said.values()})
+        allowed |= _sums_of_given(question)     # "$500 and $1,500 ... about $2,000 combined": arithmetic on the member's own figures
         if asked:                              # the day it was told it may write back, in any form
             allowed |= numbers(f"{asked.isoformat()} {asked.day} {asked.year} {asked.month}")
         if not text or not numbers(text) <= allowed:
