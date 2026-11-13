@@ -3049,6 +3049,62 @@ class Rev51(unittest.TestCase):
         self.assertTrue(_negates_beyond("There is no minimum for that account.", q))
         self.assertFalse(_negates_beyond("You can open it with $25.", q))
 
+class Rev52(unittest.TestCase):
+    """A paragraph split off its sentence, sources that state the figures, a release published by the asked day, a month and
+    year asked of a count (synthetic data only)."""
+
+    _site = Rev47._site
+
+    def test_a_paragraph_that_begins_mid_sentence_is_one_excerpt_with_the_one_before_it(self):
+        from solution import _with_predecessors
+        from ingest import Chunk
+        mk = lambda i, t, row=False: Chunk(id=i, key="p", kind="document", text=t, index_text=t, is_row=row)
+        before, split, other = mk(1, "Meet the neighbors: 50 of them"), mk(2, "received a $20 Canoeco Gift. Support totaled $9,000."), mk(3, "A new paragraph.")
+        view = SimpleNamespace(pages={"p": SimpleNamespace(page=SimpleNamespace(chunks=[before, split, other]))})
+        out, absorbed = _with_predecessors([before, split, other], view)
+        self.assertEqual([c.id for c in out], [2, 3])                                   # the paragraph before is not listed again
+        self.assertEqual(absorbed, {1})
+        self.assertEqual(out[0].text, "Meet the neighbors: 50 of them received a $20 Canoeco Gift. Support totaled $9,000.")
+        self.assertEqual(split.text[:8], "received")                                    # the page's own chunk is not changed
+        row = mk(5, "lowercase row", row=True)
+        self.assertEqual(_with_predecessors([row], view)[0], [row])                    # a table row is left alone
+        self.assertEqual(_with_predecessors([other], view)[0], [other])                # a paragraph that begins a sentence is left alone
+
+    def test_figures_an_answer_states_become_patterns_to_find_on_a_page(self):
+        from solution import _stated_phrases
+        pats = _stated_phrases("Canoeco has over 340 employees, and the window closes Nov. 12, 2031.", "How many people work at Canoeco?")
+        page = "Supported by 340+ employees. The window runs through November 12, 2031."
+        self.assertEqual(len(pats), 2)
+        self.assertTrue(all(p.search(page) for p in pats))
+        self.assertEqual(_stated_phrases("It takes 30 days.", "Is 30 days enough?"), [])           # a figure the member wrote
+        self.assertEqual(_stated_phrases("It opened in 2029.", "When did it open?"), [])           # a year alone
+
+    def test_pages_that_state_the_figures_come_before_articles_in_the_sources(self):
+        about = "# About Canoeco\n\nCanoeco is supported by 340+ employees across 14 branches.\n"
+        news = "# A story\n\nCanoeco has over 340 employees and 14 branches, the team said this week.\n"
+        ks, _ = self._site([("about", about), ("news/story", news)])
+        from solution import _pages_stating
+        keys = _pages_stating(ks._indexes[-1], set(), [__import__("re").compile(r"(?<![\d,.])340\+?\s+emplo")])
+        self.assertTrue(keys[0].endswith("about"), keys)
+
+    def test_a_release_published_by_the_asked_day_is_dated(self):
+        from datetime import date as _d
+        from solution import _too_new
+        page = SimpleNamespace(publish=_d(2030, 10, 31))
+        view = SimpleNamespace(pages={"p": SimpleNamespace(page=page)}, taken_on=_d(2033, 5, 12))
+        chunk = SimpleNamespace(effective=None, key="p")
+        self.assertFalse(_too_new(chunk, view, _d(2030, 10, 31), {}))          # published that day: in effect
+        self.assertTrue(_too_new(chunk, view, _d(2030, 9, 30), {}))            # published after the asked day
+        undated = SimpleNamespace(pages={"p": SimpleNamespace(page=SimpleNamespace(publish=None))}, taken_on=_d(2033, 5, 12))
+        self.assertTrue(_too_new(chunk, undated, _d(2030, 10, 31), {}))        # no date at all, years before the crawl
+
+    def test_a_month_and_year_asked_of_a_count_are_read_from_the_full_question(self):
+        from retrieve import MONTH_YEAR_ASKED, _MONTHS
+        m = MONTH_YEAR_ASKED.search("How many members received a payout in October 2030, and what was the average?")
+        self.assertEqual((m.group(1)[:3].lower(), int(m.group(2))), ("oct", 2030))
+        self.assertEqual(_MONTHS.index("oct") + 1, 10)
+        self.assertIsNone(MONTH_YEAR_ASKED.search("How many members received a payout in 2030?"))
+
 
 class Selftest(unittest.TestCase):
     """The kit's synthetic snapshots: as_of, an expired promo, a page that left the crawl, a refusal."""

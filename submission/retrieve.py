@@ -398,6 +398,7 @@ class Query:
     text: str = ""                                   # the question without the lines it rules out
     specs: set = field(default_factory=set)          # loan-type specs ("7/1"), each must be on the row
     expansion: list = field(default_factory=list)    # search words the wording implies ("eligible" for "who can join?")
+    month_asked: tuple | None = None                 # ("oct", 2023): a count asked of a month the question dated (read from the full text)
     rate_kind: str | None = None                     # "intro": every rate asked about is an introductory rate;
                                                      # "offer": ...of a special or promo the question names
     period: object = None                            # a count asked of a year: "last", "this", ... or a calendar year
@@ -1059,6 +1060,9 @@ def count_re(noun: str, spelled: bool = False):
 
 # A count asked of a year ("how many … last year", "… in 2023"): the site states such counts as dated sentences, one per
 # year, so the answer is the sentence for the asked year (see select and count_sentence).
+MONTH_WORD = r"(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?"
+MONTH_YEAR_ASKED = re.compile(rf"\b({MONTH_WORD})\s+((?:19|20)\d\d)\b", re.I)
+_MONTHS = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"]
 PERIOD_Q = re.compile(r"\b(last|this|past|previous|prior)\s+year\b|\b(?:in|during|for|of)\s+((?:19|20)\d\d)\b", re.I)
 YEAR_IN = re.compile(r"\b(?:in|during|for)\s+((?:19|20)\d\d)\b", re.I)
 PERIOD_WORDS = {_stem(w) for w in ("last", "this", "past", "previous", "prior", "year")}
@@ -1673,6 +1677,16 @@ def select(index: Index, q: Query, k: int = 8) -> Evidence:
             ids = {c.id for _, _, c in q.series}
             dropped = [sc for sc in dropped if sc[1].id not in ids]
             kept = [(by_year[y][1], by_year[y][2]) for y in years] + [sc for sc in kept if sc[1].id not in ids]
+    if q.attribute == "count" and q.month_asked:
+        # "paid out in October 2023": a release published that month is the event's own report, not a stale copy of a later one
+        # (a year alone is not enough: a summary of 2024 is published in 2025)
+        mon, yr = _MONTHS.index(q.month_asked[0]) + 1, q.month_asked[1]
+        revived = [sc for sc in dropped if (pub := view.pages[sc[1].key].page.publish) and (pub.year, pub.month) == (yr, mon)
+                   and count_re(q.count_noun).search(sc[1].text.lower()) and qualify(sc[1], q)[0] != "mismatch"][:2]
+        if revived:
+            gone = {sc[1].id for sc in revived}
+            dropped = [sc for sc in dropped if sc[1].id not in gone]
+            kept = revived + kept
     per_page: Counter = Counter()
     chosen, overflow = [], []
     for s, c in kept:

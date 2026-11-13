@@ -12,6 +12,7 @@ How "current" is decided (also in NOTES.md):
 from __future__ import annotations
 
 import copy
+import dataclasses
 import math
 import re
 import sys
@@ -38,7 +39,7 @@ from retrieve import (ASKS_ELSE, BACK_REFERENCE, CHAT_FILLERS, DIMENSIONS, FRAME
                       PLACE_DEICTIC, QUIET, RESTRICTION, STOP, Evidence, Index, _stem, carried_in_context, count_clause, fee_clause,
                       ADDRESS_EV, FACILITY_ASK, facility_places, lead_names, parse_query, place_phrases, proper_names, qualify, select, terms_in,
                       tokenize, use_proper_names, use_site_words)
-from synth import ABSENT, MIN_SCORE_ASK, REFUSAL, SCORE_REQUIRED, Synthesizer, _says_absent, spelled_as_digits  # noqa: E402
+from synth import ABSENT, MIN_SCORE_ASK, REFUSAL, SCORE_REQUIRED, Synthesizer, _says_absent, numbers, spelled_as_digits  # noqa: E402
 
 
 class KnowledgeSystem:
@@ -156,7 +157,8 @@ def point_before_first_crawl(question: str, as_of: str | None, first: date) -> b
     return False
 
 
-MAX_SOURCES = 8     # pages that state the values given; the same page is often served under several URL variants
+EVIDENCE_SOURCES = 8   # pages the answer was read from come first; the pages that state the same figures take the places up to MAX_SOURCES
+MAX_SOURCES = 12     # pages that state the values given; the same page is often served under several URL variants
 
 
 UNDATED_REACH_DAYS = 365     # how far before the first crawl an undated page is taken to have read the same
@@ -164,13 +166,13 @@ UNDATED_REACH_DAYS = 365     # how far before the first crawl an undated page is
 
 def _too_new(c: Chunk, view, before: date, dated: dict) -> bool:
     """Before the first crawl, a chunk can't answer for a day before it took effect (its own effective date, or
-    the earliest any crawl gives its page) or before its page was published; an undated one answers only for
+    the earliest any crawl gives its page) or before its page was published; one with no date at all answers only for
     the year before the first crawl."""
     vp = view.pages[c.key]
     first = dated.get(c.key)
     if (c.effective and c.effective > before) or (first and first > before) or (vp.page.publish and vp.page.publish > before):
         return True
-    return not (c.effective or first) and (view.taken_on - before).days > UNDATED_REACH_DAYS
+    return not (c.effective or first or vp.page.publish) and (view.taken_on - before).days > UNDATED_REACH_DAYS     # a release published by then is dated
 
 
 NO_SUCH = re.compile(r"\bno\b[^.?!]{0,60}\b(?:appears?|listed|found|mentioned)\b|"
@@ -407,6 +409,8 @@ def _respond_core(index: Index | None, synth: Synthesizer, question: str, search
     view = index.view
     q = parse_query(search or question)       # the model still sees the full question
     q.spelled_counts = synth.enabled          # a count a page spells in words is for the model to read
+    if q.attribute == "count" and before is not None and (m := retrieve.MONTH_YEAR_ASKED.search(question)):
+        q.month_asked = (m.group(1)[:3].lower(), int(m.group(2)))      # the date was cut from the search text: read it from the question
     if modifiers and q.attribute == "rate" and (modified := _respond_modifier(index, synth, question, search, asked, before, dated)):
         return modified
     if (titled := _respond_title(index, question)) is not None:
@@ -507,28 +511,33 @@ def _respond_core(index: Index | None, synth: Synthesizer, question: str, search
     # (extra citations cost nothing and the "official" page is often the second copy).
     vals = set(re.findall(r"\d+(?:\.\d+)?\s*%|\$\s?[\d,]+(?:\.\d+)?|\b\d{1,2}(?::\d\d)?\s?[ap]\.m\.|"
                           r"\b\d{3}-\d{3}-\d{4}\b|\b\d{6,}\b", text))   # rates, amounts, times, phones, IDs
+    phrases = _stated_phrases(text, question)
     also = [c for c in ev.chunks if c not in cited and vals and any(v in c.text for v in vals)]
     sources, seen = [], set()
     if defined_on:
         vp = view.pages[defined_on]
         sources.append(Source(url=vp.page.url, snapshot_id=vp.snapshot_id))
         seen.add(defined_on)
-    for c in cited + also:
-        for key in [c.key] + ev.copies.get(c.id, []):     # identical rows on other pages count too
-            vp = view.pages[key]
-            if key in seen or len(sources) >= MAX_SOURCES:
-                continue
-            seen.add(key)
-            sources.append(Source(url=vp.page.url, snapshot_id=vp.snapshot_id, quote=c.text[:240]))
-    # Then any other live page on the site that states one of those values (the routing number, a
-    # phone number, a time), official product pages first.
-    for key in _pages_stating(index, vals):
+
+    def add_evidence(limit: int) -> None:
+        for c in cited + also:
+            for key in [c.key] + ev.copies.get(c.id, []):     # identical rows on other pages count too
+                vp = view.pages[key]
+                if key in seen or len(sources) >= limit:
+                    continue
+                seen.add(key)
+                sources.append(Source(url=vp.page.url, snapshot_id=vp.snapshot_id, quote=c.text[:240]))
+    add_evidence(EVIDENCE_SOURCES)                           # the pages the answer was read from lead
+    # Then any other live page on the site that states one of those values (the routing number, a phone number, a time, "30 days",
+    # "Nov. 12, 2026"), official product pages first.
+    for key in _pages_stating(index, vals, phrases):
         if key in seen or len(sources) >= MAX_SOURCES:
             continue
         vp = view.pages[key]
-        quote = next((c.text[:240] for c in vp.page.chunks if any(v in c.text for v in vals)), None)
+        quote = next((c.text[:240] for c in vp.page.chunks if any(v in c.text for v in vals) or any(p.search(c.text) for p in phrases)), None)
         seen.add(key)
         sources.append(Source(url=vp.page.url, snapshot_id=vp.snapshot_id, quote=quote))
+    add_evidence(MAX_SOURCES)
     return Answer(text=text, sources=sources, confident=True, conflict_note=note or None)
 
 
@@ -1607,6 +1616,23 @@ def _path(ref: str) -> str:
 PAGES_BUDGET = 16000      # characters of the picked pages the model reads on a second look
 
 
+def _with_predecessors(chunks: list, view) -> tuple:
+    """(chunks, ids absorbed). A paragraph that begins mid-sentence ("received a $1,000 ... Grant", the count in the paragraph
+    before it) is shown as one excerpt with the paragraph before it, which the page's layout split off: the model reads two
+    numbered excerpts as two facts. Only short prose; the absorbed paragraph is not listed again on its own."""
+    out, absorbed = [], set()
+    for c in chunks:
+        if c.text[:1].islower() and not c.is_row:
+            page = view.pages[c.key].page.chunks
+            pos = next((i for i, x in enumerate(page) if x.id == c.id), 0)
+            prev = page[pos - 1] if pos else None
+            if prev is not None and not prev.is_row and len(prev.text) <= 400:
+                c = dataclasses.replace(c, text=f"{prev.text} {c.text}")
+                absorbed.add(prev.id)
+        out.append(c)
+    return [c for c in out if c.id not in absorbed], absorbed
+
+
 def _pages_evidence(index: Index, q, keys: list, budget: int | None = None) -> Evidence | None:
     """Evidence from the pages picked: the paragraphs that best match the question, the rest of the sections they
     sit in, each page's opening paragraphs, then whatever else the page says, in page order, to a size budget."""
@@ -1614,6 +1640,7 @@ def _pages_evidence(index: Index, q, keys: list, budget: int | None = None) -> E
     live = lambda c: not (c.expired_on and c.expired_on < view.taken_on)
     best = [c for _, c in index.search(q.tokens, top=3000) if c.key in wanted and live(c)][:8]
     pages = [[c for c in view.pages[k].page.chunks if live(c)] for k in keys]
+    best, absorbed = _with_predecessors(best, view)
     if MIN_SCORE_ASK.search(q.raw):        # "is there a minimum credit score": the paragraphs that state a score requirement lead
         best = [c for page in pages for c in page if SCORE_REQUIRED.search(c.text)][:4] + best
     sections = {(c.key, c.section) for c in best if c.section}
@@ -1621,7 +1648,11 @@ def _pages_evidence(index: Index, q, keys: list, budget: int | None = None) -> E
     opening = [c for page in pages for c in page[:5]]
     rest = [c for page in pages for c in page]
     chunks, used = [], 0
-    for c in {c.id: c for c in best + near + opening + rest}.values():
+    seen: set = set()
+    for c in best + [x for x in near + opening + rest if x.id not in absorbed]:
+        if c.id in seen:
+            continue                          # the first copy wins: a merged paragraph is not replaced by its plain self
+        seen.add(c.id)
         if used + len(c.text) > (budget or PAGES_BUDGET) or len(chunks) >= 60:
             continue
         chunks.append(c)
@@ -1999,12 +2030,33 @@ def _page_texts(index: Index) -> dict:
     return texts
 
 
-def _pages_stating(index: Index, vals: set) -> list[str]:
-    if not vals:
+PHRASE_NOUNS = re.compile(r"\b(\d[\d,]*(?:\.\d+)?)\+?\s+([A-Za-z]{3,})")
+WRITTEN_DATE = re.compile(r"\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+((?:19|20)\d\d)\b", re.I)
+PHRASE_SKIP = {"percent", "per", "and", "the", "for", "are", "you", "out", "off", "from", "with", "that", "than"}
+
+
+def _stated_phrases(text: str, question: str) -> list:
+    """Figures an answer states that the dollar/percent patterns miss, as patterns to find on a page: a count or a span with its
+    noun ("340 workers", "21 days"), and a date written out ("Nov. 12, 2026"). Not a number the member wrote, not a year alone."""
+    asked = numbers(question)
+    out = []
+    for m in PHRASE_NOUNS.finditer(text):
+        num, noun = m.group(1), m.group(2).lower()
+        digits = num.replace(",", "")
+        if noun in PHRASE_SKIP or float(digits) in asked or (len(digits) == 4 and digits[:2] in ("19", "20")):
+            continue
+        out.append(re.compile(rf"(?<![\d,.]){re.escape(num)}\+?\s+{re.escape(noun[:5])}", re.I))
+    for m in WRITTEN_DATE.finditer(text):
+        out.append(re.compile(rf"\b{m.group(1)}[a-z]*\.?\s+0?{int(m.group(2))}(?:st|nd|rd|th)?,?\s+{m.group(3)}\b", re.I))
+    return out[:6]
+
+
+def _pages_stating(index: Index, vals: set, phrases: list = ()) -> list[str]:
+    if not vals and not phrases:
         return []
     texts = _page_texts(index)
     pages = index.view.pages
-    return sorted((k for k, t in texts.items() if any(v in t for v in vals)),
+    return sorted((k for k, t in texts.items() if any(v in t for v in vals) or any(p.search(t) for p in phrases)),
                   key=lambda k: (KIND_RANK[pages[k].page.kind], STATUS_RANK[pages[k].status], k))
 
 
