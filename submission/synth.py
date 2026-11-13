@@ -18,7 +18,7 @@ from ingest import Chunk, View, url_key
 from collections import Counter
 from types import SimpleNamespace
 
-from retrieve import (ASKS_THRESHOLD, KIND_NAME, SOFT_QUALIFIERS, SPELLED, SPELLED_SMALL, SYNONYMS, WIRE, WIRE_FEE_LINE, Evidence, Query, _asked,
+from retrieve import (_stem, ASKS_THRESHOLD, KIND_NAME, SOFT_QUALIFIERS, SPELLED, SPELLED_SMALL, SYNONYMS, WIRE, WIRE_FEE_LINE, Evidence, Query, _asked,
                       asked_kinds, chunk_cover, count_sentence, fee_cover, fee_items, kinds_in, names_line, on_other_line, other_kind, other_lines,
                       place_phrases, product_name, qualify, spelled_numbers, supports, terms_in, tier_width, tokenize, wire_direction,
                       STATUS_DATE, STATUS_EV)
@@ -251,6 +251,30 @@ WIRE_KIND_NAMED = {"incoming": r"\b(?:incoming|inbound|receiv\w*)\b", "domestic"
                    "international": r"\b(?:international\w*|abroad|overseas|foreign)\b"}
 
 
+YES_NO_ASK = re.compile(r"^\s*(?:can|could|do|does|is|are|will)\s", re.I)
+ENUM_RUN = re.compile(r"\b[A-Z][a-z]+(?: [A-Z][a-z]+)?, [A-Z][a-z]+(?: [A-Z][a-z]+)?,? (?:or|and) [A-Z][a-z]+(?: [A-Z][a-z]+)?\b")
+ENUM_GENERIC = {_stem(w) for w in "can could do does is are will you your i my me we our the a an to and or of in on for with kind kinds type types list "
+                                  "every all what which offer offers have has get add use".split()}
+
+
+def enumeration_sentence(q: Query, pool: list) -> tuple[str, list] | None:
+    """A question that asks what is supported or offered, with no figure to find: the evidence sentence that names three or
+    more items in a row ("Kayak Pay, Canoe Pay or Raft Pay") and shares at least two of the question's words."""
+    want = {t for t in q.tokens if t not in ENUM_GENERIC}
+    best = (0, None, None)
+    for c in pool:
+        if c.is_row or c.kind in ("article", "calculator"):
+            continue
+        for sent in _sentences(c.text):
+            if len(sent) <= 240 and ENUM_RUN.search(sent):
+                overlap = len(want & set(tokenize(sent)))
+                if overlap > best[0]:
+                    best = (overlap, sent.strip(), c)
+    if best[0] >= 3 and best[1]:
+        return best[1], [best[2]]
+    return None
+
+
 def extractive(q: Query, ev: Evidence, view: View) -> tuple[str, list[Chunk]]:
     pool = [c for c in ev.chunks if supports(c, q)] if q.attribute else ev.chunks
     if _leads_with_other_kind(q, ev):
@@ -277,6 +301,8 @@ def extractive(q: Query, ev: Evidence, view: View) -> tuple[str, list[Chunk]]:
         both = compare_hours(q)
         if both:
             return both
+    if q.attribute is None and YES_NO_ASK.search(q.raw) and (listed := enumeration_sentence(q, pool)):
+        return listed
     if q.attribute is None and STATUS_Q.search(q.raw):
         # the passage that states a closing, ending or opening with a full date and names the place asked about
         asked = place_phrases(q.raw)

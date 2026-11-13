@@ -73,6 +73,8 @@ class KnowledgeSystem:
 
     def answer(self, question: str, as_of: str | None = None) -> Answer:
         _own_site(self._store)
+        if self._store.views and point_before_first_crawl(question, as_of, self._store.views[0].taken_on):
+            return Answer(text=REFUSAL, confident=False)     # the site as it stood before its first crawl is unknown
         span = change_span(question, self._store) if as_of is None else None
         if span:                                 # "how did it change between June and September?"
             v1, v2 = (self._store.view_for(d.isoformat() if d else None) for d in span)
@@ -124,6 +126,34 @@ def _own_site(store: Store) -> None:
         use_site_words(store.site_words)
     if retrieve.PROPER_NAMES != getattr(store, "proper_names", set()):
         use_proper_names(getattr(store, "proper_names", set()))
+
+
+PRE_CRAWL_TOLERANT = re.compile(r"\b(?:around|about|early|start of|beginning of|first checked|first looked|when i first)\b", re.I)
+PRE_CRAWL_MONTHS = "january february march april may june july august september october november december".split()
+PRE_CRAWL_POINT = re.compile(r"\b(?:on|as of|in|during)\s+(?P<mid>mid-?\s*)?(?P<m>" + "|".join(PRE_CRAWL_MONTHS) +
+                             r")\b\.?\s*(?P<d>\d{1,2})?(?:st|nd|rd|th)?\b,?\s*(?P<y>20\d\d)?", re.I)
+
+
+def point_before_first_crawl(question: str, as_of: str | None, first: date) -> bool:
+    """A question about one day, or the middle of a month, before the first crawl: nothing on the site can say what it
+    said then (a row's own date says when it took effect, not that nothing else was shown). "Around May 11", "early May",
+    "when I first checked in May" are read as the first crawl instead (see moment_asked), as is a date alone from before."""
+    if PRE_CRAWL_TOLERANT.search(question):
+        return False
+    if as_of and as_of < first.isoformat():
+        return True
+    for m in PRE_CRAWL_POINT.finditer(question):
+        if not (m.group("d") or m.group("mid")):
+            continue                                        # a month alone is a period, not a point
+        year = int(m.group("y")) if m.group("y") else first.year
+        month = PRE_CRAWL_MONTHS.index(m.group("m").lower()) + 1
+        day = int(m.group("d")) if m.group("d") else 15
+        try:
+            if date(year, month, day) < first:
+                return True
+        except ValueError:
+            continue
+    return False
 
 
 MAX_SOURCES = 8     # pages that state the values given; the same page is often served under several URL variants

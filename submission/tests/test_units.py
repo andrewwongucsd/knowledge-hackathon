@@ -1209,10 +1209,21 @@ class Rev39(unittest.TestCase):
 
     def test_a_date_before_the_first_crawl_reads_it_only_if_the_rate_was_in_effect(self):
         ks = self._system()
-        self.assertIn("3.15%", ks.answer("What was the 9-month kayak certificate special APY for $5,000 on February 10, 2030?").text)
+        self.assertFalse(ks.answer("What was the 9-month kayak certificate special APY for $5,000 on February 10, 2030?").confident)   # one day before the first crawl
         early = ks.answer("What was the 9-month kayak certificate special APY for $5,000 in January 2030?")
         self.assertFalse(early.confident)                      # those rates took effect on February 1
         self.assertFalse(ks.answer("What was the 9-month kayak certificate special APY for $5,000?", "2030-01-15").confident)
+
+    def test_a_point_before_the_first_crawl_declines_the_same_with_or_without_the_as_of_date(self):
+        from solution import point_before_first_crawl
+        first = date(2030, 5, 12)
+        for q, as_of in (("What was the rate on May 10, 2030?", None), ("What was the rate as of mid-March 2030?", None),
+                         ("What is the rate?", "2030-03-15"), ("What was the rate on May 10, 2030?", "2030-05-10")):
+            self.assertTrue(point_before_first_crawl(q, as_of, first), (q, as_of))
+        for q, as_of in (("It was around May 11, 2030. What was the rate?", None), ("What was the rate when I first checked in May 2030?", None),
+                         ("What was the rate in March?", None), ("What was the rate as of May 2030?", "2030-05-31"),
+                         ("What was the rate on May 19, 2030?", None)):
+            self.assertFalse(point_before_first_crawl(q, as_of, first), (q, as_of))
 
     def test_calendar_phrases(self):
         from solution import calendar_phrases
@@ -1406,7 +1417,8 @@ class Rev41(unittest.TestCase):
                                                 Page("https://example.org/kayak", "Kayak | Example", kayak, "2030-03-01T09:00:00Z")]))
         ks.ingest(Snapshot("s2", "2030-06-15", [Page("https://example.org/fees", "Fees | Example", dated, "2030-06-15T09:00:00Z"),
                                                 Page("https://example.org/kayak", "Kayak | Example", kayak, "2030-06-15T09:00:00Z")]))
-        self.assertIn("$20.00", ks.answer("What was the canoe wire fee as of February 15, 2030?").text)
+        self.assertFalse(ks.answer("What was the canoe wire fee as of February 15, 2030?").confident)       # a point before the first crawl
+        self.assertIn("$20.00", ks.answer("What was the canoe wire fee around March 1, 2030?").text)          # "around" reads the first crawl
         early = ks.answer("What was the canoe wire fee in 2028?")      # a later crawl dates the schedule February 2030
         self.assertFalse(early.confident)
         self.assertEqual(numbers(early.text), set())
@@ -2892,6 +2904,14 @@ class Rev50(unittest.TestCase):
         for name in ("Kayak Loan", "Canoe Loan", "Raft Loan"):
             self.assertIn(name, text)
         self.assertNotIn("Handpicked", text)
+
+    def test_a_yes_no_question_about_what_is_supported_is_answered_with_the_sentence_that_names_the_items(self):
+        pages = [("pay", "# Mobile Pay\n\nAdd your Canoeco cards to your phone's Kayak Pay, Canoe Pay or Raft Pay for fast checkouts.\n\n"
+                         "Visit us at 12 Quay Road, Harbor Town, Ohio or call 800-555-0100.\n"), ("about", Rev47.ABOUT)]
+        ks, _ = self._site(pages)
+        text = ks.answer("Can I add my Canoeco cards to a mobile wallet?").text
+        for item in ("Kayak Pay", "Canoe Pay", "Raft Pay"):
+            self.assertIn(item, text)
 
     # --- vehicle list ----------------------------------------------------------------------------------------------------
     def test_more_model_words_each_name_one_kind_and_the_plain_english_ones_stay_out(self):
