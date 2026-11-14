@@ -429,7 +429,7 @@ PERCENT_ASKED = re.compile(r"\b(?:rate|apy|apr|yield|percent(?:age)?)\b|%", re.I
 # words ("question", "wondering", "curious") become the product the member is asking about and no row carries them.
 LEAD_IN = re.compile(r"^\s*(?:(?:hey|hi|hello|yo|so|ok(?:ay)?|um|well)\b[,!.\s]*)*"
                      r"(?:(?:quick|random|simple|dumb|silly|one)\s+question|i\s+was\s+(?:just\s+)?wondering|just\s+curious|curious|wondering|"
-                     r"basically|btw|by\s+the\s+way)\b[\s,:;!.-]*(?:if|whether|about)?\s*", re.I)
+                     r"basically|btw|by\s+the\s+way)\b[\s,:;!.-]*", re.I)       # a connector after it ("wondering if X") stays: X alone is no question
 
 
 def strip_lead_in(question: str) -> str:

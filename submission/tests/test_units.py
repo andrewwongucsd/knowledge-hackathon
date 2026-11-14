@@ -3114,7 +3114,8 @@ class Rev53(unittest.TestCase):
         self.assertEqual(strip_lead_in("hey quick question, auto loan rates?"), "Auto loan rates?")
         self.assertEqual(strip_lead_in("I was wondering, what is the boat loan rate?"), "What is the boat loan rate?")
         self.assertEqual(strip_lead_in("Hi! Random question: how many branches are there?"), "How many branches are there?")
-        self.assertEqual(strip_lead_in("just curious if you offer a kayak loan"), "You offer a kayak loan")
+        self.assertEqual(strip_lead_in("just curious if you offer a kayak loan"), "If you offer a kayak loan")      # the connector stays
+        self.assertEqual(strip_lead_in("hi! wondering whether Canoeco has an office in Larkspur"), "Whether Canoeco has an office in Larkspur")
         for kept in ("What is a quick question worth?", "Is it basically the same rate?", "How do I ask a question?", "curious", "hey quick question,"):
             self.assertEqual(strip_lead_in(kept), kept, kept)                        # not at the start, or nothing follows
 
