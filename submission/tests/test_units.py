@@ -3105,6 +3105,36 @@ class Rev52(unittest.TestCase):
         self.assertEqual(_MONTHS.index("oct") + 1, 10)
         self.assertIsNone(MONTH_YEAR_ASKED.search("How many members received a payout in 2030?"))
 
+class Rev53(unittest.TestCase):
+    """A chatty lead-in is not the product asked about; a project named beside the generic word "loan" is still a project
+    (synthetic data only)."""
+
+    def test_a_chatty_lead_in_is_stripped_before_the_question_is_read(self):
+        from retrieve import strip_lead_in
+        self.assertEqual(strip_lead_in("hey quick question, auto loan rates?"), "Auto loan rates?")
+        self.assertEqual(strip_lead_in("I was wondering, what is the boat loan rate?"), "What is the boat loan rate?")
+        self.assertEqual(strip_lead_in("Hi! Random question: how many branches are there?"), "How many branches are there?")
+        self.assertEqual(strip_lead_in("just curious if you offer a kayak loan"), "You offer a kayak loan")
+        for kept in ("What is a quick question worth?", "Is it basically the same rate?", "How do I ask a question?", "curious", "hey quick question,"):
+            self.assertEqual(strip_lead_in(kept), kept, kept)                        # not at the start, or nothing follows
+
+    def test_the_lead_in_words_do_not_become_the_product(self):
+        plain = parse_query("auto loan rates?")
+        for lead in ("hey quick question, ", "I was wondering, ", "just curious, ", "so basically, ", "quick question: "):
+            q = parse_query(lead + "auto loan rates?")
+            self.assertEqual((q.descriptors, q.category, q.attribute), (plain.descriptors, plain.category, plain.attribute), lead)
+            self.assertEqual(q.tokens, plain.tokens, lead)
+
+    def test_a_project_is_read_beside_the_generic_word_loan(self):
+        for text in ("I need a loan to fix my roof, about $35k. What APR will I get?",
+                     "how much would a $35k loan cost me in apr to finish my basement?",
+                     "need to redo my roof, probably around $35k. whats the apr and how many months",
+                     "What's the interest rate if I borrow $35,000 to add a deck to my house?"):
+            q = parse_query(text)
+            self.assertEqual((q.attribute, q.descriptors >= {"home", "improvement"}), ("rate", True), text)
+        for text in ("what's the apr on a boat loan for $35k?", "I need a loan for a new car, about $35k. What APR?"):
+            self.assertNotIn("improvement", parse_query(text).descriptors, text)         # a named product line keeps its own rows
+
 
 class Selftest(unittest.TestCase):
     """The kit's synthetic snapshots: as_of, an expired promo, a page that left the crawl, a refusal."""

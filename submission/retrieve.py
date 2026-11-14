@@ -177,6 +177,7 @@ TIME_UNITS = {"day", "days", "week", "weeks", "month", "months", "year", "years"
 RATE_ASKED = re.compile(r"\bwhat(?:['’]?s|\s+is|\s+are|\s+would|\s+will)?\b[^?]{0,30}?\b(?:rates?|apr|apy)\b", re.I)
 # a home project named instead of the product: "need to redo my roof, $35k" asks the rate of the loan for work on a home
 PURPOSE_HOME = re.compile(r"\b(?:roof(?:ing)?|re-?roof\w*|remodel\w*|renovat\w*|kitchen|bathroom|siding|flooring|new\s+windows|"
+                          r"basement|deck|patio|garage|room\s+addition|add(?:ing)?\s+a\s+room|"
                           r"(?:house|home)\s+(?:repairs?|projects?)|repair(?:s|ing)?\s+(?:my|our|the)\s+(?:house|home))\b", re.I)
 NOT_A_RATE = re.compile(r"\bhow long\b|\bhow many (?:days|weeks|months|years)\b|\bcredit score\b|\brequirements?\b|\bqualify\b|\bqualifies\b|"
                         r"\bqualification\b|\beligib\w*\b|\brate lock\b|\block(?:ed|s)? (?:for|until)\b|\block period\b", re.I)
@@ -424,7 +425,23 @@ PAYOUT_AVERAGE = re.compile(r"\baverage\s+(?:\w+\s+){0,2}?(?:dividend|payout|bon
 PERCENT_ASKED = re.compile(r"\b(?:rate|apy|apr|yield|percent(?:age)?)\b|%", re.I)
 
 
+# A chatty lead-in before the question itself ("hey quick question, ...", "I was wondering, ...", "just curious if ..."). Left in, its
+# words ("question", "wondering", "curious") become the product the member is asking about and no row carries them.
+LEAD_IN = re.compile(r"^\s*(?:(?:hey|hi|hello|yo|so|ok(?:ay)?|um|well)\b[,!.\s]*)*"
+                     r"(?:(?:quick|random|simple|dumb|silly|one)\s+question|i\s+was\s+(?:just\s+)?wondering|just\s+curious|curious|wondering|"
+                     r"basically|btw|by\s+the\s+way)\b[\s,:;!.-]*(?:if|whether|about)?\s*", re.I)
+
+
+def strip_lead_in(question: str) -> str:
+    m = LEAD_IN.match(question)
+    if not m or len(question) <= m.end() + 8:
+        return question
+    rest = question[m.end():]
+    return rest[:1].upper() + rest[1:]
+
+
 def parse_query(question: str) -> Query:
+    question = strip_lead_in(question)
     question = written_amounts(question)  # "15k", "fifteen thousand dollars", "between 10k and 25k": dollar amounts
     raw = question                       # the model still sees the member's own words
     if RATE_Q.search(question) and ARM_RE.search(question):
@@ -715,7 +732,9 @@ def _read_make_year(q: Query, low: str) -> None:
 # table's question (it has no such row), not a boat or RV loan's.
 def _read_purpose(q: Query, low: str) -> None:
     """A home project named instead of the loan ("need to redo my roof, around $35k"): the rate of the loan for work on a home."""
-    if q.attribute == "rate" and not q.category and not DEPOSIT_CUE.search(low) and PURPOSE_HOME.search(low):
+    # "a loan to fix my roof": the generic word "loan" is no product line of its own, so it does not hide the project
+    if q.attribute == "rate" and (not q.category or (q.category <= {"loan"} and not q.descriptors)) \
+            and not DEPOSIT_CUE.search(low) and PURPOSE_HOME.search(low):
         q.category.add("loan")
         q.descriptors = set(q.descriptors) | {"home", "improvement"}
         q.tokens = list(dict.fromkeys(q.tokens + [_stem("home"), _stem("improvement")]))
