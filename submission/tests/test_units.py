@@ -96,6 +96,9 @@ class Guardrails(unittest.TestCase):
     network the code names as a product head, calendar names) and bare years."""
     EXEMPT = set("noon first second third fourth fifth sixth seventh eighth ninth tenth avenue lane street "
                  "share visa".split())
+    # The 50 US state names (the system's own table, `solution.US_STATES`) are generic geography, like the calendar names: a branch asked of
+    # a state the pages show none in is declined, and no state is learned from the practice set or the site.
+    GEOGRAPHY = property(lambda self: {w for n in __import__("solution").US_STATES.values() for w in (n.lower(), *n.lower().split())})
     CALENDAR = set("monday tuesday wednesday thursday friday saturday sunday january february march april may "
                    "june july august september october november december mon tue wed thu fri sat sun".split())
 
@@ -110,7 +113,7 @@ class Guardrails(unittest.TestCase):
         banned = {}
         for it in items:
             for t in it.get("must_include", []) + it.get("must_not_include", []):
-                if len(t) >= 3 and t.lower() not in self.EXEMPT and not re.fullmatch(r"(?:19|20)\d\d", t):
+                if len(t) >= 3 and t.lower() not in self.EXEMPT | self.GEOGRAPHY and not re.fullmatch(r"(?:19|20)\d\d", t):
                     banned[t.lower()] = f"practice value ({it['id']})"
             for u in it.get("expected_sources", []):
                 path = url_key(u).partition("/")[2]
@@ -125,7 +128,7 @@ class Guardrails(unittest.TestCase):
             for sentence in re.split(r"(?<=[.?!:;])\s+|\s+-\s+|\(", t):
                 for w in re.findall(r"[A-Za-z][A-Za-z'’$-]*", sentence)[1:]:
                     w = re.sub(r"['’]s$", "", w)
-                    if (w[0].isupper() and len(w) >= 4 and w.lower() not in lower_words | self.EXEMPT
+                    if (w[0].isupper() and len(w) >= 4 and w.lower() not in lower_words | self.EXEMPT | self.GEOGRAPHY
                             and not any(part in self.CALENDAR for part in re.split(r"[-–]", w.lower()))):
                         banned.setdefault(w.lower(), "practice proper name")
         for t in texts:                                  # dollar amounts the practice set states (tier bounds)
@@ -3135,6 +3138,35 @@ class Rev53(unittest.TestCase):
             self.assertEqual((q.attribute, q.descriptors >= {"home", "improvement"}), ("rate", True), text)
         for text in ("what's the apr on a boat loan for $35k?", "I need a loan for a new car, about $35k. What APR?"):
             self.assertNotIn("improvement", parse_query(text).descriptors, text)         # a named product line keeps its own rows
+
+class Rev54(unittest.TestCase):
+    """A branch asked of a state the pages show no branch in is declined; the shared network, ATMs, cards and the served states are
+    not (synthetic data only)."""
+
+    _site = Rev47._site
+    BRANCHES = ("# Canoeco branches\n\nCanoeco branches: Larkspur, OH; Millbrook, OH; Harborview, OH. Visit us at 12 Elm Road, Larkspur, OH 44001.\n")
+    HOURS = ("# Canoeco hours\n\nThe Millbrook, OH branch is open Monday to Friday. Our partner mailing address is in Dover, DE.\n")
+
+    def test_the_served_states_come_from_the_pages(self):
+        from solution import _served_states
+        ks, _ = self._site([("branches", self.BRANCHES), ("hours", self.HOURS)])
+        self.assertEqual(_served_states(ks._indexes[-1]), {"ohio"})                      # Delaware appears on one page only
+        ks2, _ = self._site([("about", "# About\n\nCanoeco has branches and members.\n")])
+        self.assertEqual(_served_states(ks2._indexes[-1]), set())                        # no state on the pages: the rule is off
+
+    def test_a_branch_asked_of_an_unserved_state_is_declined(self):
+        from solution import _asks_a_branch_in_an_unserved_state as asks
+        ks, _ = self._site([("branches", self.BRANCHES), ("hours", self.HOURS)])
+        ix = ks._indexes[-1]
+        for q in ("how many branches does canoeco have in texas", "Is there a Canoeco branch in Nevada?",
+                  "I'm moving to Oregon next month. Is there a Canoeco branch near me?", "does canoeco have an office in delaware"):
+            self.assertTrue(asks(ix, q), q)
+            self.assertFalse(ks.answer(q).confident, q)
+        for q in ("how many branches does canoeco have in ohio", "is there a canoeco branch in ohio?",
+                  "can I use my debit card at shared branches in texas", "how many atms does canoeco have in texas",
+                  "what are the hours of the east washington avenue branch", "what is the rate on a savings account",
+                  "do you have online banking if I live in nevada"):
+            self.assertFalse(asks(ix, q), q)                                              # served, a network or a card, a street, no place
 
 
 class Selftest(unittest.TestCase):

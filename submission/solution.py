@@ -226,6 +226,49 @@ def _with_phone(text: str, cited: list, ev: Evidence) -> str:
     return text
 
 
+US_STATES = {"AL": "Alabama", "AK": "Alaska", "AZ": "Arizona", "AR": "Arkansas", "CA": "California", "CO": "Colorado", "CT": "Connecticut",
+             "DE": "Delaware", "FL": "Florida", "GA": "Georgia", "HI": "Hawaii", "ID": "Idaho", "IL": "Illinois", "IN": "Indiana", "IA": "Iowa",
+             "KS": "Kansas", "KY": "Kentucky", "LA": "Louisiana", "ME": "Maine", "MD": "Maryland", "MA": "Massachusetts", "MI": "Michigan",
+             "MN": "Minnesota", "MS": "Mississippi", "MO": "Missouri", "MT": "Montana", "NE": "Nebraska", "NV": "Nevada", "NH": "New Hampshire",
+             "NJ": "New Jersey", "NM": "New Mexico", "NY": "New York", "NC": "North Carolina", "ND": "North Dakota", "OH": "Ohio", "OK": "Oklahoma",
+             "OR": "Oregon", "PA": "Pennsylvania", "RI": "Rhode Island", "SC": "South Carolina", "SD": "South Dakota", "TN": "Tennessee",
+             "TX": "Texas", "UT": "Utah", "VT": "Vermont", "VA": "Virginia", "WV": "West Virginia", "WI": "Wisconsin", "WY": "Wyoming"}
+STATE_AMBIGUOUS = {"washington"}          # also a street and a city: "the East Washington branch"
+BRANCH_PLACE_ASK = re.compile(r"\b(?:branch(?:es)?|offices?|locations?)\b", re.I)
+EXISTENCE_ASK = re.compile(r"\b(?:how many|is there|are there|any|have|has|near me|nearby|nearest|closest|operate|visit|walk in|open one)\b", re.I)
+# a shared-branch or ATM network, a card, travel or online banking reaches every state: those questions have an answer
+NETWORK_WORDS = re.compile(r"\b(?:shared|co-?op|network|atms?|cards?|travel\w*|vacation|surcharge\w*|deposits?|online|mobile|app)\b", re.I)
+
+
+def _served_states(index: Index) -> set:
+    """The states the credit union has branches in: a state written after a city ("Larkspur, OH") on at least two product pages. One
+    mention (a partner's address, a grant) is no branch. Built once per view; empty when the pages give none (the rule is then off)."""
+    found = getattr(index, "_served_states", None)
+    if found is None:
+        pages: dict = {}
+        for key, vp in index.view.pages.items():
+            if vp.status == "missing" or vp.page.kind != "product":
+                continue
+            text = " ".join(c.text for c in vp.page.chunks)
+            for abbr, name in US_STATES.items():
+                if re.search(rf"\b[A-Z][a-z]+(?: [A-Z][a-z]+)?,\s*{abbr}\b(?!\w)", text):
+                    pages.setdefault(name.lower(), set()).add(key)
+        found = {name for name, keys in pages.items() if len(keys) >= 2}
+        index._served_states = found
+    return found
+
+
+def _asks_a_branch_in_an_unserved_state(index: Index, question: str) -> bool:
+    """"How many branches does it have in <state>?", "is there a branch near me, I'm moving to <state>": a state the pages show no branch in.
+    Never for the shared network, ATMs, cards or online banking (they have answers anywhere), nor a state that is also a street."""
+    served = _served_states(index)
+    if not served or not BRANCH_PLACE_ASK.search(question) or not EXISTENCE_ASK.search(question) or NETWORK_WORDS.search(question):
+        return False
+    low = question.lower()
+    return any(re.search(rf"\b{re.escape(name.lower())}\b", low) for name in US_STATES.values()
+               if name.lower() not in served and name.lower() not in STATE_AMBIGUOUS)
+
+
 def _asked_sentence(q: Query) -> Query:
     """The query as only its last sentence asks it: a lead-in ("My nephew saves in a coffee can. How much does it take to
     open one?") is the member's story, and its words are not the fee asked about. A one-sentence question is unchanged."""
@@ -407,6 +450,8 @@ def _respond_core(index: Index | None, synth: Synthesizer, question: str, search
     if index is None:
         return Answer(text=REFUSAL, confident=False)
     view = index.view
+    if before is None and _asks_a_branch_in_an_unserved_state(index, question):
+        return Answer(text=REFUSAL, confident=False)       # the pages show no branch in that state, and a branch is not an ATM network
     q = parse_query(search or question)       # the model still sees the full question
     q.spelled_counts = synth.enabled          # a count a page spells in words is for the model to read
     if q.attribute == "count" and before is not None and (m := retrieve.MONTH_YEAR_ASKED.search(question)):
