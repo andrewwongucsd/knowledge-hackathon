@@ -1,5 +1,15 @@
 # Hackathon: Build a Knowledge System That Knows What's True *Now*
 
+## Reviewer's guide to this submission
+
+The solution is in [`submission/`](submission/). Everything below this guide is the organizers' assignment text, unchanged.
+
+- **What it does.** `ingest` reads the crawls oldest first and keeps, for each page, the newest copy seen up to each date, cut into table rows, fee lines and paragraphs with their publish, effective and offer-end dates. `answer` reads the question with general English and banking rules and searches those chunks; a clear-cut question is answered straight from the page, and an open one goes to a single model call whose reply is accepted only if every number in it appears in the evidence it was shown. `conflicts()` is deterministic and returns `Conflict` dataclasses.
+- **Where to start.** [`submission/NOTES.md`](submission/NOTES.md) opens with a summary: the approach, how "current" is decided, the API key and the measured results. The entry point is `build()` in [`submission/solution.py`](submission/solution.py); the other modules are `ingest.py`, `retrieve.py`, `synth.py`, `places.py` and `conflicts.py`. [`submission/tests/`](submission/tests/) holds the unit tests; they need neither a key nor the snapshots (`python -m unittest discover -s submission/tests`).
+- **Run it** from the kit root, as the checklist says: `pip install -r requirements.txt`, then `python harness/run_eval.py --submission submission --eval eval/public_eval.jsonl`. The first run unpacks the kit's `snapshots_zip/` into `snapshots/`.
+- **API key.** It uses the paid Anthropic API (`claude-haiku-5-5`, one call only for questions that need one) when `ANTHROPIC_API_KEY` is set. With no key, or with `KH_NO_LLM=1`, it still runs and answers extractively, with lower accuracy on open questions.
+- **Not in this repository** (by the hand-in rules): the website snapshots and any API key.
+
 ## The problem in one minute
 
 Our assistant answers credit-union members' questions ("What's the 6-month certificate rate?", "How much is a lost debit card?") using the credit union's own website.
