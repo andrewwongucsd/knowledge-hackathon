@@ -3168,6 +3168,68 @@ class Rev54(unittest.TestCase):
                   "do you have online banking if I live in nevada"):
             self.assertFalse(asks(ix, q), q)                                              # served, a network or a card, a street, no place
 
+class Rev55(unittest.TestCase):
+    """The no-key answer adds the best-matching sentences of the selected evidence after the answer, never for a row, hours, a fee or a
+    count (synthetic data only)."""
+
+    def _chunks(self):
+        from ingest import Chunk
+        mk = lambda i, t, row=False: Chunk(id=i, key="p", kind="product", text=t, index_text=t, is_row=row)
+        return [mk(1, "Canoeco overdraft protection links your savings to your checking. It is optional."),
+                mk(2, "The grace period before Canoeco charges an overdraft fee is 3 business days. Canoeco waives it once a year. Branches are open weekdays."),
+                mk(3, "Rate | 1.00%", row=True)]
+
+    def _view(self):
+        # how common each word is on a pretend site of 200 paragraphs: "overdraft" and "grace" are rare, "canoeco" is everywhere
+        return SimpleNamespace(df={"canoeco": 190, "overdraft": 6, "grace": 2, "period": 4, "fee": 30, "charg": 20}, nchunks=200)
+
+    def test_the_best_matching_sentences_are_added_after_the_answer(self):
+        import synth
+        from retrieve import Evidence, parse_query
+        chunks = self._chunks(); q = parse_query("How long is the grace period before Canoeco charges an overdraft fee?")
+        ev = Evidence(chunks[:2], [], True, {}, chunks)
+        text, used = synth._with_more_sentences(q, ev, self._view(), "Canoeco overdraft protection links your savings to your checking.", [chunks[0]])
+        self.assertTrue(text.startswith("Canoeco overdraft protection links your savings to your checking. "))        # the answer stays first
+        self.assertIn("grace period before Canoeco charges an overdraft fee is 3 business days", text)
+        self.assertNotIn("Branches are open weekdays", text)                                                         # no word of the question
+        self.assertEqual(used[0], chunks[0])
+        self.assertIn(chunks[1], used)
+
+    def test_nothing_is_added_without_site_statistics_or_a_matching_word(self):
+        import synth
+        from retrieve import Evidence, parse_query
+        chunks = self._chunks(); ev = Evidence(chunks[:2], [], True, {}, chunks)
+        q = parse_query("How long is the grace period?")
+        self.assertEqual(synth._with_more_sentences(q, ev, SimpleNamespace(), "base", [chunks[0]]), ("base", [chunks[0]]))
+        q2 = parse_query("What is the weather like?")
+        self.assertEqual(synth._with_more_sentences(q2, ev, self._view(), "base", [chunks[0]])[0], "base")
+
+    def test_the_budget_and_the_row_rule_hold(self):
+        import synth
+        from retrieve import Evidence, parse_query
+        chunks = self._chunks(); q = parse_query("grace period overdraft fee charges Canoeco")
+        ev = Evidence(chunks, [], True, {}, chunks)
+        text, used = synth._with_more_sentences(q, ev, self._view(), "x" * (synth.EXTRA_CHARS - 5), [chunks[0]])
+        self.assertEqual(text, "x" * (synth.EXTRA_CHARS - 5))                                                       # no room left
+        text, used = synth._with_more_sentences(q, ev, self._view(), "base.", [chunks[0]])
+        self.assertTrue(all(not c.is_row for c in used))                                                             # a table row is never added
+
+    def test_a_row_hours_fee_or_count_answer_keeps_its_own_text(self):
+        import synth
+        from retrieve import Evidence, parse_query
+        chunks = self._chunks(); ev = Evidence(chunks, [], True, {}, chunks)
+        real = synth._extractive_core
+        try:
+            for attr, used in (("hours", [chunks[0]]), ("fee", [chunks[0]]), ("count", [chunks[0]]), (None, [chunks[2]])):
+                synth._extractive_core = lambda q, e, v, used=used: ("answer.", used)
+                q = parse_query("How long is the grace period before Canoeco charges an overdraft fee?"); q.attribute = attr
+                self.assertEqual(synth.extractive(q, ev, self._view())[0], "answer.", attr)
+            synth._extractive_core = lambda q, e, v: ("answer.", [chunks[0]])
+            q = parse_query("How long is the grace period before Canoeco charges an overdraft fee?"); q.attribute = None
+            self.assertIn("3 business days", synth.extractive(q, ev, self._view())[0])
+        finally:
+            synth._extractive_core = real
+
 
 class Selftest(unittest.TestCase):
     """The kit's synthetic snapshots: as_of, an expired promo, a page that left the crawl, a refusal."""

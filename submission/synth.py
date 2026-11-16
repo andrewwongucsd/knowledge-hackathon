@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import math
 import re
 from dataclasses import replace
 from datetime import date
@@ -140,6 +141,7 @@ def _short_header(h: str) -> str:
 
 
 PARAGRAPH_CHARS = 500
+EXTRA_SENTENCES, EXTRA_CHARS, MIN_SENTENCE = 4, 1300, 12     # the no-key answer's added sentences (see _with_more_sentences)
 
 
 # A schedule is a block per facility ("Lobby", "Drive-up") of weekday lines ("Monday-Thursday: 6:45 a.m.-3:15 p.m."). Quoted
@@ -293,7 +295,65 @@ def enumeration_sentence(q: Query, pool: list) -> tuple[str, list] | None:
     return None
 
 
+ANSWER_SPLIT = re.compile(r"(?<=[.!?])\s+(?=[A-Z0-9$*\"“(])|\n+")
+NUMERIC_ASK = re.compile(r"\b(?:how much|how many|what(?:['’]s| is)? the (?:rate|apy|fee|amount|limit|minimum|maximum|max|min)|how long|when|what time|phone|number)\b", re.I)
+_SPLITS: dict = {}
+
+
+def _chunk_sentences(c: Chunk) -> list:
+    got = _SPLITS.get(c.text)            # keyed by the text: chunk ids restart with every parser
+    if got is None:
+        got = _SPLITS[c.text] = [s for s in (x.strip(" -•*") for x in ANSWER_SPLIT.split(c.text)) if len(s) >= MIN_SENTENCE]
+    return got
+
+
+def _with_more_sentences(q: Query, ev: Evidence, view: View, text: str, used: list) -> tuple[str, list[Chunk]]:
+    """The no-key answer is the top paragraph or one sentence of it; the words the question asks for are often a sentence or two away in
+    the evidence already selected. Add the best-matching sentences (question words, weighted by how rare they are on the site; a figure
+    counts more when a figure is asked for), after the answer and never in place of it, up to EXTRA_SENTENCES and EXTRA_CHARS."""
+    df, n = getattr(view, "df", None), getattr(view, "nchunks", 0)
+    if not df or not n:
+        return text, used
+    qt = [t for t in dict.fromkeys(tokenize(q.raw)) if not t.isdigit()]
+    numeric = bool(NUMERIC_ASK.search(q.raw))
+    flat = lambda s: re.sub(r"\W+", " ", s.lower()).strip()
+    have = flat(text)
+    cand = []
+    for ci, c in enumerate((ev.context or ev.chunks)[:12]):
+        if c.is_row:
+            continue
+        for si, s in enumerate(_chunk_sentences(c)):
+            if flat(s) in have:
+                continue
+            words = set(tokenize(s))
+            score = sum(math.log(1 + n / (1 + df.get(t, 0))) for t in qt if t in words)
+            if numeric and re.search(r"[$%]|\d", s):
+                score *= 1.3
+            cand.append((score, -ci, -si, s, c))
+    cand.sort(key=lambda x: (x[0], x[1], x[2]), reverse=True)
+    pick, size = [], len(text)
+    for score, _, _, s, c in cand:
+        if score <= 0 or size + len(s) > EXTRA_CHARS or len(pick) >= EXTRA_SENTENCES:
+            break
+        if s in [p for p, _ in pick]:
+            continue
+        pick.append((s, c))
+        size += len(s)
+    if not pick:
+        return text, used
+    more = " ".join(s if s.endswith((".", "!", "?", ":")) else s + "." for s, _ in pick)
+    return f"{text} {more}", list(used) + [c for _, c in pick]
+
+
 def extractive(q: Query, ev: Evidence, view: View) -> tuple[str, list[Chunk]]:
+    """The no-key answer (see _extractive_core), with the best-matching sentences of the selected evidence added to a prose answer."""
+    text, used = _extractive_core(q, ev, view)
+    if text == REFUSAL or not used or any(c.is_row for c in used) or q.attribute in ("hours", "fee", "count"):
+        return text, used                  # a figure asked for stays the one the question pins down: other sentences bring other years' figures
+    return _with_more_sentences(q, ev, view, text, used)
+
+
+def _extractive_core(q: Query, ev: Evidence, view: View) -> tuple[str, list[Chunk]]:
     pool = [c for c in ev.chunks if supports(c, q)] if q.attribute else ev.chunks
     if _leads_with_other_kind(q, ev):
         # "what's the kayak savings rate?" led by a certificate table under a savings heading: the asked line answers

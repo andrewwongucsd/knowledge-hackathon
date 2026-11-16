@@ -1347,6 +1347,7 @@ class Index:
                 for t, n in c.tf.items():
                     self.postings.setdefault(t, []).append((pos, n))
         self.avgdl = sum(c.length for c in self.chunks) / max(1, len(self.chunks))
+        view.df, view.nchunks = {t: len(p) for t, p in self.postings.items()}, len(self.chunks)   # how common each word is, for the no-key answer's sentence ranking
 
     def search(self, tokens: list[str], top: int = 150) -> list[tuple[float, Chunk]]:
         n_docs, scores = len(self.chunks), {}
