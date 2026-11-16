@@ -1,5 +1,16 @@
 # Notes: a knowledge system that knows what's true *now*
 
+## Summary
+
+**What it does.** `ingest` reads the crawls oldest first and keeps, for every page, the newest copy seen up to each date (pages that left the site are marked removed), cut into table rows, fee lines and paragraphs that carry their publish, effective and offer-end dates. `answer` reads a question with general English and banking rules (term, tier, amount, model year, the date it names) and searches those chunks; a clear-cut question (one row or one fee line) is answered from the page directly, and an open one goes to a single model call whose reply is accepted only if every number in it appears in the evidence it was shown. `conflicts()` lists the places the site disagrees with itself (including a page that contradicts itself, such as two different counts of the same thing) and the value it believes, with the reason.
+
+**How "current" is decided.** The site as it stood on the date asked (the newest crawl when no date is given). Only the same fact competes (same product, term, tier and kind of number: tiers, rate versus APY, standard versus promotional are not conflicts). The winner has the newer effective date, then the newer publish date, then a re-fetched page over a stale copy, then a rate or product page over an article, promotion or calculator. Expired offers are never used, and losing values leave the evidence before answering. If the site does not say, the answer is "That isn't listed on our website" with no figure, so a refusal never adds a number.
+
+**API key.** It uses the **paid Anthropic API** (one `claude-haiku-5-5` call, thinking off, for each question that needs one; about $0.01 per 40 questions): set `ANTHROPIC_API_KEY`. With no key, or with `KH_NO_LLM=1`, everything still runs and answers are extractive (a prose answer then adds the best-matching sentences of the evidence). No other key or network call is used.
+
+**Measured.** With a key: 0.975 on the public set, 30 of 30 on 30 invented refusals. Two sets of questions written by agents that saw only the pages and never the code: 0.935 and 0.751 (v30). Without a key: 0.94 on the public set, 0.61 and 0.63 on unseen sets. Details, limits and every rule are below.
+
+
 **API key.** Set `ANTHROPIC_API_KEY` for grading. This uses the **paid Anthropic API**: one `claude-haiku-5-5` call (thinking off) per question that needs one, about $0.01 per 40 questions. With no key, or with `KH_NO_LLM=1`, answers are extractive and everything still runs. No other keys or network calls.
 
 **Run** from the kit root: `pip install -r requirements.txt`, then `python harness/run_eval.py --submission submission --eval eval/public_eval.jsonl`. Unit tests need no key: `python -m unittest discover -s submission/tests`.
