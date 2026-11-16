@@ -3231,6 +3231,59 @@ class Rev55(unittest.TestCase):
             synth._extractive_core = real
 
 
+class Rev56(unittest.TestCase):
+    """conflicts() also reports one extension given with two phone numbers, and one page stating a vehicle-age limit or a
+    term range two ways; neither reaches the answer path (synthetic data only)."""
+
+    @staticmethod
+    def _site(pages):
+        from contract import Page, Snapshot
+        ks = build()
+        ks.ingest(Snapshot("s1", "2032-01-15", [Page(f"https://canoeco.example.org/{slug}", f"{slug} | Canoeco", md, "2032-01-10T09:00:00Z")
+                                                for slug, md in pages.items()]))
+        return ks
+
+    def test_one_extension_with_two_numbers_is_a_conflict_and_the_number_most_pages_give_wins(self):
+        line = "For available terms, please contact our Harbor Loan Team at {n} ext. 204."
+        ks = self._site({"a": "# A\n\n" + line.format(n="800-555-0100"), "b": "# B\n\n" + line.format(n="1.800.555.0100"),
+                         "c": "# C\n\n" + line.format(n="800-555-0199"),
+                         "d": "# D\n\nCall the card desk at 800-555-0123 ext. 305 or the loan desk at 800-555-0124 ext. 306."})
+        found = [c for c in ks.conflicts() if c.topic.startswith("Phone number")]
+        self.assertEqual(len(found), 1)
+        self.assertEqual((found[0].resolution, sorted(found[0].values)), ("800-555-0100 ext. 204", ["800-555-0100 ext. 204", "800-555-0199 ext. 204"]))
+        self.assertIn("ext. 204", found[0].topic)
+
+    def test_two_desks_or_two_unrelated_sentences_are_not_a_conflict(self):
+        ks = self._site({"a": "# A\n\nContact our Harbor Loan Team at 800-555-0100 ext. 204.",
+                         "b": "# B\n\nQuestions about the regatta? Ring 800-555-0199 ext. 204 for tickets."})
+        self.assertEqual([c for c in ks.conflicts() if c.topic.startswith("Phone number")], [])
+
+    def test_a_page_stating_an_age_limit_or_term_range_two_ways_is_a_conflict(self):
+        md = ("# Canoe Lease\n\nThe lease is available for new or used canoes up to 6 calendar years old, with terms from 36 to 72 months.\n\n"
+              "## Benefits\n\n- New or used canoes up to 5 calendar years old qualify (may vary).\n- Flexible terms: 24 to 72 months (may vary).\n")
+        ks = self._site({"lease": md})
+        found = {c.topic.split(" stated")[0]: c for c in ks.conflicts() if "stated two ways" in c.topic}
+        self.assertEqual(sorted(found), ["Loan term range", "Vehicle age limit"])
+        self.assertTrue(found["Vehicle age limit"].resolution.startswith("up to 6 calendar years old"))
+        self.assertTrue(found["Loan term range"].resolution.startswith("36 to 72 months"))
+        self.assertTrue(all("may vary" in c.reason for c in found.values()))
+
+    def test_one_value_or_many_products_on_a_page_are_not_a_conflict(self):
+        same = "# Lease\n\nCanoes up to 6 calendar years old qualify, with terms from 36 to 72 months.\n\n- Canoes up to 6 calendar years old.\n"
+        many = ("# Loans\n\nCanoe loans have terms from 36 to 72 months.\n\nKayak loans have terms from 24 to 60 months.\n\n"
+                "Raft loans have terms from 12 to 48 months.\n\nA canoe up to 6 calendar years old, a kayak up to 4 calendar years old, a raft up to 2 calendar years old.\n")
+        ks = self._site({"same": same, "many": many, "days": "# Rules\n\nYou have up to 60 days to report it and up to 30 days to repay.\n"})
+        self.assertEqual([c for c in ks.conflicts() if "stated two ways" in c.topic], [])
+
+    def test_the_answer_path_does_not_see_the_new_conflicts(self):
+        import conflicts
+        ks = self._site({"a": "# A\n\nContact our Harbor Loan Team at 800-555-0100 ext. 204.", "b": "# B\n\nContact our Harbor Loan Team at 800-555-0199 ext. 204."})
+        self.assertTrue([c for c in ks.conflicts() if c.topic.startswith("Phone number")])
+        view = ks._indexes[-1].view
+        self.assertEqual([f for f in conflicts.statement_conflicts(view) if "Phone" in str(f["topic"])], [])
+        self.assertTrue(all(isinstance(c, Conflict) for c in ks.conflicts()))
+
+
 class Selftest(unittest.TestCase):
     """The kit's synthetic snapshots: as_of, an expired promo, a page that left the crawl, a refusal."""
 

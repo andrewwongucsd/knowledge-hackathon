@@ -50,6 +50,13 @@ QUANTITY_WORDS = {"over", "nearly", "more", "than", "about", "approximately", "a
 FIGURE_LEAD = QUANTITY_WORDS | {"exceeding", "exceeds", "totaling", "totals", "total", "grown", "grew", "reached", "serving", "serves",
                                 "has", "have", "over", "than", "to", "approximately"}
 MAX_PCT_GAP = 2.0       # rows further apart than this are different products, not a stale copy
+# A phone number given with an extension ("our <Team> at 800-555-0100 ext. 204"): one extension is one desk, so it has one number.
+PHONE_EXT_RE = re.compile(r"(?<!\d)(?:1[ .-])?\(?(8\d\d)\)?[ .-]?(\d{3})[ .-]?(\d{4})\s*,?\s*(?:ext\.?|extension|x)\s*(\d{2,4})\b", re.I)
+MIN_SHARED_WORDS = 2     # words the two sentences naming one extension must share ("mortgage team"): the same desk, not two firms
+# One page stating a limit two ways: an eligibility age ("up to 6 calendar years old") or a term range ("terms from 36 to 72 months").
+AGE_LIMIT_RE = re.compile(r"\b(up\s+to|under|less\s+than|no\s+older\s+than)\s+(\d{1,2})\s+((?:calendar\s+)?years?)\s+old\b", re.I)
+TERM_RANGE_RE = re.compile(r"\bterms?\b[^.\n]{0,25}?\b(?:from\s+)?(\d{1,3})\s*(?:to|-|–)\s*(\d{1,3})\s+(months?|years?)\b", re.I)
+HEDGE_RE = re.compile(r"\b(?:may\s+vary|varies|vary|subject\s+to\s+change)\b", re.I)
 
 
 def _first_pct(c) -> float:
@@ -292,6 +299,101 @@ def statement_conflicts(view: View) -> list[dict]:
     return out
 
 
+def _sentence_words(text: str) -> set:
+    """Content words of a sentence, without numbers: what two statements must share to be about the same thing."""
+    return {_stem(w) for w in re.findall(r"[a-z]+", text.lower()) if w not in GENERIC and len(w) > 2}
+
+
+def contact_conflicts(view: View) -> list[dict]:
+    """One extension given with two different phone numbers on live pages ("contact our <Team> at A ext. 204" and
+    "... at B ext. 204"). Reported by conflicts() only. The number most live pages give wins, then the better-ranked page."""
+    by_ext: dict = defaultdict(lambda: defaultdict(list))      # extension -> number -> [(chunk, sentence)]
+    for vp in view.pages.values():
+        if vp.status == "missing":
+            continue
+        for c in vp.page.chunks:
+            if c.is_row:
+                continue
+            for m in PHONE_EXT_RE.finditer(c.text):               # not split into sentences: "ext." ends in a full stop
+                context = c.text[max(0, m.start() - 120):m.start()].replace("\n", " ")
+                by_ext[m.group(4)][f"{m.group(1)}-{m.group(2)}-{m.group(3)} ext. {m.group(4)}"].append((c, context.split(". ")[-1]))
+    out = []
+    for ext, by_num in by_ext.items():
+        if len(by_num) < 2:
+            continue
+        words = {n: [_sentence_words(PHONE_EXT_RE.sub(" ", s)) for _, s in uses] for n, uses in by_num.items()}
+        if any(not any(len(x & y) >= MIN_SHARED_WORDS for x in words[a] for y in words[b])
+               for a in by_num for b in by_num if a < b):
+            continue                                            # no two sentences name the same desk
+        pages = {n: {c.key for c, _ in uses} for n, uses in by_num.items()}
+        best = {n: min((c for c, _ in uses), key=lambda c: _rank(c, view)) for n, uses in by_num.items()}
+        win_num = min(by_num, key=lambda n: (-len(pages[n]), _rank(best[n], view, len(pages[n]))))
+        losers = sorted((best[n] for n in by_num if n != win_num), key=lambda c: _rank(c, view))
+        lose_nums = [n for n in by_num if n != win_num]
+        out.append({
+            "topic": f"Phone number given with ext. {ext}",
+            "values": sorted(by_num, key=lambda n: (len(pages[n]), n)),
+            "sources": [(view.pages[c.key].page.url, view.pages[c.key].snapshot_id) for c in [best[win_num]] + losers][:6],
+            "resolution": win_num,
+            "reason": (f"{len(pages[win_num])} live pages give {win_num} for ext. {ext}, "
+                       + ", ".join(f"{len(pages[n])} give {n}" for n in lose_nums) + "; the number most pages agree on is used"),
+            "_strength": 1, "_count": False, "_phrases": {}, "_streaks": [],
+        })
+    return out
+
+
+def _page_limit_claims(page) -> dict:
+    """attribute -> [(value text, hedged, chunk, sentence)] for the limits a page states about eligibility age and term."""
+    claims: dict = defaultdict(list)
+    for c in page.chunks:
+        if c.is_row:
+            continue
+        for sent in re.split(r"(?<=[.!?])\s+|\n", c.text):
+            hedged = bool(HEDGE_RE.search(sent))
+            for m in AGE_LIMIT_RE.finditer(sent):
+                claims[("age", m.group(3).lower())].append((" ".join(m.group(0).lower().split()), hedged, c, sent.strip()))
+            for m in TERM_RANGE_RE.finditer(sent):
+                claims[("term", m.group(3).lower().rstrip("s"))].append((f"{m.group(1)} to {m.group(2)} {m.group(3).lower()}", hedged, c, sent.strip()))
+    return claims
+
+
+def same_page_limit_conflicts(view: View) -> list[dict]:
+    """One page giving two different numbers for the same limit (a vehicle-age limit, a term range), the kind of
+    contradiction two pages never show. Only a page with exactly two distinct values for the limit is reported: a page
+    that lists many products legitimately gives many. The value not marked "may vary" wins, else the one stated first."""
+    found: dict = defaultdict(lambda: {"pages": [], "quotes": {}})       # (attribute, values) -> pages
+    for vp in view.pages.values():
+        if vp.status == "missing":
+            continue
+        for attr, claims in _page_limit_claims(vp.page).items():
+            values = {v for v, _, _, _ in claims}
+            if len(values) != 2:
+                continue
+            win = next((v for v, hedged, _, _ in claims if not hedged), claims[0][0])
+            entry = found[(attr, tuple(sorted(values)))]
+            entry["pages"].append((vp, win))
+            for v, _, _, sent in claims:
+                entry["quotes"].setdefault(v, " ".join(sent.split()).lstrip(" -*#>|")[:120])
+    out = []
+    for (attr, values), entry in found.items():
+        wins = Counter(w for _, w in entry["pages"])
+        win_val = max(wins, key=lambda v: (wins[v], v == values[0]))
+        lose_val = next(v for v in values if v != win_val)
+        label = "Vehicle age limit" if attr[0] == "age" else "Loan term range"
+        out.append({
+            "topic": f"{label} stated two ways on one page",
+            "values": [lose_val, win_val],
+            "sources": [(vp.page.url, vp.snapshot_id) for vp, _ in entry["pages"]][:6],
+            "resolution": win_val,
+            "reason": (f"the same page states both: {win_val} in its description and {lose_val} elsewhere"
+                       + (" (marked \"may vary\")" if any(h for _, h, _, _ in _page_limit_claims(entry["pages"][0][0].page).get(attr, []))
+                          else "") + "; the unhedged statement is used"),
+            "_strength": 1, "_count": False, "_streaks": [],
+            "_phrases": {v: [q] for v, q in entry["quotes"].items()},
+        })
+    return out
+
+
 # A page that is now only a notice that an offer ended ("Sorry ... this offer has ended."), and what it used to say.
 ENDED_RE = re.compile(r"\b(?:this\s+offer\s+(?:has\s+)?(?:ended|expired)|offer\s+(?:has\s+)?(?:ended|expired)|"
                       r"promotion\s+(?:has\s+)?(?:ended|expired)|no\s+longer\s+available)\b", re.I)
@@ -438,7 +540,7 @@ def find_conflicts(view: View, earlier: list = ()) -> list[dict]:
     are exactly what this method is meant to report (see NOTES.md). `earlier`: the previous views,
     oldest first (an ended offer is known from what its page said before)."""
     found = (table_conflicts(view) + statement_conflicts(view) + article_rate_conflicts(view)
-             + ended_offer_conflicts(view, list(earlier)))
+             + ended_offer_conflicts(view, list(earlier)) + contact_conflicts(view) + same_page_limit_conflicts(view))
     # Most certain first, then the most specific (fewest values): the scorer matches greedily, so a
     # broad entry listed early could take a key entry meant for a narrower one.
     found.sort(key=lambda f: (-f["_strength"], len(f["values"])))
